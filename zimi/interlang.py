@@ -6,6 +6,7 @@ and cross-ZIM URL resolution. Extracted from server.py.
 Dependencies: imports from zimi.server for core state (locks, pools, config).
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -458,6 +459,283 @@ def _qid_has_index(zim_name):
     return _get_qid_db(zim_name) is not None
 
 
+# ---------------------------------------------------------------------------
+# Almanac deep-links: batch Q-ID → installed-article resolution
+# ---------------------------------------------------------------------------
+#
+# The almanac ships a curated, CLOSED SET of Wikidata Q-IDs (see
+# static/almanac-links.js). On open it asks the server, in one batch, which of
+# those Q-IDs resolve to an article in the user's installed encyclopedia ZIMs.
+# Resolution is authoritative: a Q-ID either maps to a real article (direct
+# link) or it doesn't (plain text).
+#
+# Resolution order per Q-ID:
+#   (a) Q-ID index / on-demand cache of a preferred-language ZIM — authoritative
+#       and instant when a built index exists (pure SQLite, no libzim).
+#   (b) EXACT-TITLE fallback — the curated map carries each entity's English
+#       article title, and in a Wikipedia ZIM a title maps deterministically to
+#       the entry path (Title_With_Underscores + redirect resolution). This
+#       rescues libraries whose only encyclopedia is a huge full Wikipedia with
+#       no prebuilt Q-ID index (a full scan is ~tens of hours). English-family
+#       candidates only — the strict-language rule stays. Exact title only:
+#       never fuzzy, never a title SEARCH — a wrong link is worse than no link.
+#   (c) miss → absent (the entity renders as plain text).
+#
+# The whole resolved batch is memoized server-side keyed by (batch signature,
+# langs, library generation), so a repeat almanac open is a single dict hit and
+# any library change transparently invalidates it.
+
+# Valid Wikidata Q-ID token (e.g. "Q42").
+_ALMANAC_QID_RE = re.compile(r"^Q\d+$")
+
+# Hard cap on a single batch. The curated set is ~250 entries; this bounds
+# work (and memory) if a client sends a padded or hostile list.
+ALMANAC_QID_BATCH_MAX = 400
+
+# Only wikipedia/vikidia-family archives carry the encyclopedia articles the
+# almanac's entity Q-IDs point at. Mirrors _ENC_RE in almanac-links.js.
+_ALMANAC_ENC_RE = re.compile(r"^(wikipedia|vikidia)", re.IGNORECASE)
+
+# Server-side memo of resolved almanac batches. Keyed by (batch signature, langs,
+# library generation) so a repeat almanac open with an unchanged library + query
+# is a single dict hit ("one time and quick"), and any library change (load_cache
+# force → _cache_generation bump) transparently invalidates every entry. Bounded:
+# only a handful of (langs, library-state) combinations ever coexist.
+_almanac_resolve_cache = {}  # {key: {qid: {"zim", "path", "title"}}}
+_almanac_resolve_cache_lock = threading.Lock()
+_ALMANAC_RESOLVE_CACHE_MAX = 32
+
+
+def _almanac_cache_key(qids, langs, titles):
+    """Stable key for the resolved-batch memo: (payload hash, langs, gen).
+
+    Order-independent in the Q-IDs (the result is a dict, so a reordered but
+    equivalent request is the same answer). Returns None if the library
+    generation can't be read — then the caller skips caching rather than risk a
+    stale hit.
+    """
+    try:
+        gen = _srv._cache_generation
+    except Exception:
+        return None
+    h = hashlib.sha1()
+    items = sorted(
+        (q, (titles.get(q) if titles else None)) for q in qids if isinstance(q, str)
+    )
+    for q, t in items:
+        h.update(q.encode("utf-8", "replace"))
+        h.update(b"\x00")
+        if isinstance(t, str):
+            h.update(t.encode("utf-8", "replace"))
+        h.update(b"\x01")
+    return (h.hexdigest(), ",".join(langs) if langs else "", gen)
+
+
+def _almanac_cache_get(key):
+    """Return a COPY of the cached batch for `key`, or None."""
+    if key is None:
+        return None
+    with _almanac_resolve_cache_lock:
+        hit = _almanac_resolve_cache.get(key)
+        return dict(hit) if hit is not None else None
+
+
+def _almanac_cache_store(key, result):
+    """Memoize a resolved batch under `key` (stores a copy)."""
+    if key is None:
+        return
+    with _almanac_resolve_cache_lock:
+        # Simple bound: clear wholesale when it grows past the cap. The key
+        # already encodes library generation, so entries only accumulate across
+        # distinct language sets — a clear is cheap and rare.
+        if len(_almanac_resolve_cache) >= _ALMANAC_RESOLVE_CACHE_MAX:
+            _almanac_resolve_cache.clear()
+        _almanac_resolve_cache[key] = dict(result)
+
+
+def _almanac_title_from_path(path):
+    """Derive a human title from a ZIM article path.
+
+    Strips the 'A/' namespace, percent-decodes, and turns underscores into
+    spaces (e.g. 'A/Mercury_(planet)' → 'Mercury (planet)'). Purely lexical so
+    it never touches libzim — the reader only needs a header label, and the
+    real title is embedded in the article anyway.
+    """
+    p = path[2:] if path.startswith("A/") else path
+    return unquote(p).replace("_", " ")
+
+
+def _almanac_candidate_zims(langs):
+    """Ordered encyclopedia ZIMs for almanac Q-ID resolution.
+
+    Preference order: the user's languages (in the order given) → English →
+    everything else. Within a language the best-quality / largest archive wins
+    (reuses _zim_quality_score). Only wikipedia/vikidia-family archives take
+    part. Computed once per batch, not per Q-ID.
+    """
+    order = []
+    for lang in langs or []:
+        if lang and lang != "multi" and lang not in order:
+            order.append(lang)
+    if "en" not in order:
+        order.append("en")
+
+    def sort_key(z):
+        lang = z.get("language", "")
+        rank = order.index(lang) if lang in order else len(order)
+        count = z.get("entry_count") or z.get("article_count") or 0
+        return (rank, -_zim_quality_score(z.get("name", "")), -count)
+
+    # Strictly the user's languages + English — never "any installed
+    # wikipedia". A Hebrew article behind an English UI's Jupiter link is
+    # worse than no link (Eric's spec: match the right language; no match →
+    # plain text). Libraries whose preferred-language wikipedia lacks a
+    # built Q-ID index simply get fewer links.
+    enc = [
+        z
+        for z in (_srv._zim_list_cache or [])
+        if _ALMANAC_ENC_RE.match(z.get("name", ""))
+        and z.get("language", "") in order
+        and _srv.zim_allowed(z.get("name", ""))
+    ]
+    enc.sort(key=sort_key)
+    return enc
+
+
+def resolve_almanac_qids(qids, langs=None, titles=None):
+    """Batch-resolve a closed set of Wikidata Q-IDs to installed articles.
+
+    Per Q-ID, in order:
+      (a) Q-ID index / on-demand cache of a candidate ZIM, in language-preference
+          order — pure SQLite (both are sqlite tables with check_same_thread=False
+          connections and SQLite serializes internally), so it needs neither
+          libzim nor _zim_lock and stays fast for a ~250-Q-ID batch.
+      (b) EXACT-TITLE fallback for Q-IDs (a) missed, using the curated English
+          title supplied in `titles`: in a Wikipedia ZIM a title maps
+          deterministically to the entry path, so a direct get_entry_by_path
+          (with redirect resolution) resolves it with no index. English-family
+          candidates only — the strict-language rule stays. This touches libzim,
+          so the whole fallback batch runs under a single _zim_lock hold.
+      (c) miss → absent (rendered as plain text; a wrong link is worse than none).
+
+    The whole resolved batch is memoized keyed by (payload hash, langs, library
+    generation), so a repeat open is one dict hit and any library change
+    invalidates it. Exact title only — never fuzzy, never a title SEARCH.
+
+    Args:
+        qids: iterable of Q-ID strings (e.g. ["Q308", "Q2"]). Malformed or
+            duplicate entries are skipped.
+        langs: preferred language codes, most-preferred first.
+        titles: optional {qid: english_title} for the exact-title fallback.
+
+    Returns:
+        {qid: {"zim", "path", "title"}} for HITS ONLY. Unmatched Q-IDs are
+        simply absent — the caller renders those entities as plain text.
+    """
+    out = {}
+    if not qids:
+        return out
+    cache_key = _almanac_cache_key(qids, langs, titles)
+    cached = _almanac_cache_get(cache_key)
+    if cached is not None:
+        return cached
+    cands = _almanac_candidate_zims(langs)
+    if not cands:
+        _almanac_cache_store(cache_key, out)
+        return out
+    seen = set()
+    misses = []  # [(qid_str, english_title)] deferred to the title fallback
+    for q in qids:
+        if not isinstance(q, str):
+            continue
+        q = q.strip()
+        if q in seen or not _ALMANAC_QID_RE.match(q):
+            continue
+        seen.add(q)
+        qid_int = int(q[1:])
+        found = False
+        for z in cands:
+            name = z.get("name", "")
+            path = _qid_find_in_zim(name, qid_int)
+            if path:
+                out[q] = {
+                    "zim": name,
+                    "path": path,
+                    "title": _almanac_title_from_path(path),
+                }
+                found = True
+                break
+        if not found and titles:
+            t = titles.get(q)
+            if isinstance(t, str) and t.strip():
+                misses.append((q, t.strip()))
+    if misses:
+        _resolve_almanac_titles(misses, cands, out)
+    _almanac_cache_store(cache_key, out)
+    return out
+
+
+def _resolve_almanac_titles(misses, cands, out):
+    """Exact-title fallback for Q-IDs no index resolved (mutates `out`).
+
+    English-family candidate ZIMs only: the curated title we carry is the English
+    article title, and matching it against a non-English ZIM would risk the wrong
+    article behind an English label (Eric's strict-language rule). For each miss,
+    try the ZIM's namespace path variants for Title_With_Underscores, following a
+    single redirect hop to the canonical entry; first hit wins.
+
+    Touches libzim (get_entry_by_path / get_redirect_entry), which is NOT
+    thread-safe, so the ENTIRE batch of ≤400 direct lookups runs under one
+    _zim_lock hold on the open pooled archives (each lookup is a memory-mapped
+    B-tree probe — microseconds).
+    """
+    en_zims = [z.get("name", "") for z in cands if z.get("language") == "en"]
+    en_zims = [n for n in en_zims if n]
+    if not en_zims:
+        return
+    with _srv._zim_lock:
+        for q, title in misses:
+            for name in en_zims:
+                resolved = _almanac_title_entry_path(name, title)
+                if resolved:
+                    out[q] = {
+                        "zim": name,
+                        "path": resolved,
+                        "title": _almanac_title_from_path(resolved),
+                    }
+                    break
+
+
+def _almanac_title_entry_path(zim_name, title):
+    """Exact-title → canonical entry path in one ZIM, or None. _zim_lock HELD.
+
+    Tries the ZIM's path-namespace variants (bare and 'A/'-prefixed) for the
+    title with spaces turned to underscores — Wikipedia's on-disk path form —
+    following a single redirect hop to the canonical article. A KeyError just
+    means 'no such article' (a miss); this never searches or guesses.
+    """
+    archive = _srv.get_archive(zim_name)
+    if archive is None:
+        return None
+    underscored = title.replace(" ", "_")
+    for try_path in (underscored, "A/" + underscored):
+        try:
+            entry = archive.get_entry_by_path(try_path)
+        except KeyError:
+            continue
+        except Exception as e:
+            log.debug("almanac title lookup %r in %s: %s", try_path, zim_name, e)
+            continue
+        try:
+            if entry.is_redirect:
+                entry = entry.get_redirect_entry()
+            return entry.path
+        except Exception as e:
+            log.debug("almanac redirect follow %r in %s: %s", try_path, zim_name, e)
+            return try_path
+    return None
+
+
 def _check_one_article_for_qid(zim_path):
     """Sample random HTML articles from a ZIM and check for Wikidata Q-IDs.
 
@@ -512,7 +790,7 @@ def _persist_qid_flags(qid_flags):
     the 'name' field, then saves atomically.
     """
     try:
-        with open(_srv._cache_file_path()) as f:
+        with open(_srv._cache_file_path(), encoding="utf-8") as f:
             data = json.load(f)
         files = data.get("files", {})
         for _filename, meta in files.items():
@@ -892,6 +1170,11 @@ def get_article_languages(zim_name, article_path):
     if archive is None:
         return {"languages": []}
 
+    # Single-page docs (devdocs): 'index#anchor' is entry 'index' + a fragment.
+    # Drop the fragment so translation lookups target the real base entry.
+    base_path, _fragment = _srv.split_entry_fragment(article_path)
+    article_path = base_path
+
     # Get article title from path
     title = article_path
     if title.startswith("A/"):
@@ -934,8 +1217,8 @@ def get_article_languages(zim_name, article_path):
         if qid is not None:
             _qid_cache_store(zim_name, article_path, qid)
 
-    log.info(
-        "  interlang %s/%s: qid=%s src_project=%s",
+    log.debug(
+        "interlang %s/%s: qid=%s src_project=%s",
         zim_name,
         article_path,
         qid,
@@ -950,6 +1233,12 @@ def get_article_languages(zim_name, article_path):
                 continue
             n = zi.get("name", "")
             if n == zim_name:
+                continue
+            # This strategy answers purely from the Q-ID SQLite index, never
+            # through get_archive(), so it has to consult the allowlist itself
+            # or a restricted user learns the names and article paths of ZIMs
+            # they can't open.
+            if not _srv.zim_allowed(n):
                 continue
             if src_project and _zim_project_name(n) != src_project:
                 continue

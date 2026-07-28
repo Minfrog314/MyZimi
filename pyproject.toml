@@ -4,17 +4,35 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "zimi"
-version = "1.7.4"
-description = "Offline knowledge server for ZIM files"
+version = "1.8.0"
+description = "Offline knowledge server for ZIM files — search and read Wikipedia, Stack Overflow and 50+ sources with no internet"
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.9"
+authors = [{name = "Eric Pheterson"}]
+keywords = ["zim", "kiwix", "offline", "wikipedia", "search", "knowledge-base", "rag", "mcp", "self-hosted"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Web Environment",
+    "Intended Audience :: End Users/Desktop",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Internet :: WWW/HTTP :: HTTP Servers",
+    "Topic :: Text Processing :: Indexing",
+]
 dependencies = [
     "libzim>=3.1.0",
     "certifi>=2024.1.1",
     # LAN peer discovery (mDNS/Zeroconf). Pure-Python; the peer ZIM-sharing
-    # transport runs over plain HTTP so it needs no extra binary. aria2
-    # (optional BitTorrent accelerator) is bundled only in the Docker image.
+    # transport runs over plain HTTP so it needs no extra binary. libtorrent
+    # (the optional in-process BitTorrent accelerator) is bundled in the
+    # Docker image and desktop builds; a bare pip install uses it if present.
     "zeroconf>=0.130.0",
 ]
 
@@ -28,6 +46,9 @@ zimi = "zimi.server:main"
 
 [project.urls]
 Homepage = "https://github.com/epheterson/Zimi"
+Repository = "https://github.com/epheterson/Zimi"
+Issues = "https://github.com/epheterson/Zimi/issues"
+Changelog = "https://github.com/epheterson/Zimi/blob/main/CHANGELOG.md"
 
 [tool.setuptools.packages.find]
 include = ["zimi*"]
@@ -42,5 +63,5 @@ zimi = ["templates/**", "static/**", "assets/**"]
 # Run it explicitly with `pytest tests/test_article_languages.py` when needed.
 addopts = "--ignore=tests/test_article_languages.py"
 markers = [
-    "real_aria2: opts a test out of the autouse find_aria2c=None guard (may spawn a live aria2c sidecar)",
+    "real_engine: opts a test out of the autouse libtorrent guard (may start a live libtorrent session)",
 ]

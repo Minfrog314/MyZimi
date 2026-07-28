@@ -897,7 +897,8 @@ class TestDiskStats(unittest.TestCase):
         self.assertEqual(len(stats["tmp_files"]), 0)
 
     def test_detects_tmp_files(self):
-        # Create a .zim.tmp file
+        # A bare .zim.tmp with no active/queued/pending download record is an
+        # orphaned partial, so it's surfaced for cleanup regardless of age.
         tmp_path = os.path.join(self.tmpdir, "test_download.zim.tmp")
         with open(tmp_path, "wb") as f:
             f.write(b"x" * 1024)
@@ -1957,6 +1958,123 @@ class TestPasswordlessManageGate(unittest.TestCase):
     def test_public_client_blocked(self):
         self.assertTrue(self._check(private=False))
 
+    def test_public_client_returns_public_locked_sentinel(self):
+        # The block is distinguishable from a genuine password requirement so
+        # the SPA can explain rather than prompt for a nonexistent password (#36).
+        import zimi.manage as manage
+
+        self.assertEqual(self._check(private=False), manage.PUBLIC_LOCKED)
+
+    def _challenge(self, private, stored_pw=None, auth=None, api_token=""):
+        from unittest.mock import patch as _patch
+
+        import zimi.manage as manage
+
+        h = self._FakeHandler(private)
+        if auth is not None:
+            h.headers = {"Authorization": auth}
+        with (
+            _patch.object(manage, "_get_manage_password_hash", return_value=stored_pw),
+            _patch.object(manage, "_get_api_token", return_value=api_token),
+            _patch.object(manage, "_verify_password", return_value=False),
+        ):
+            return manage._manage_auth_challenge(h)
+
+    def test_challenge_passwordless_private_authorized(self):
+        self.assertIsNone(self._challenge(private=True))
+
+    def test_challenge_passwordless_public_is_403_public_locked(self):
+        status, body = self._challenge(private=False)
+        self.assertEqual(status, 403)
+        self.assertEqual(body["error"], "public_locked")
+        self.assertFalse(body["needs_password"])
+
+    def test_challenge_wrong_password_is_401_needs_password(self):
+        status, body = self._challenge(
+            private=False, stored_pw="salt$hash", auth="Bearer wrong"
+        )
+        self.assertEqual(status, 401)
+        self.assertTrue(body["needs_password"])
+
+
+class TestSetPasswordAuthGate(unittest.TestCase):
+    """/manage/set-password is dispatched before the shared manage gate, so it
+    carries its own auth. Initial setup (no password yet) must be LAN-only —
+    otherwise a public client on an internet-exposed passwordless instance
+    could POST a password and lock the owner out. Once a password exists, the
+    current-password check governs and a credential holder may change it from
+    any hop."""
+
+    class _FakeHandler:
+        def __init__(self, private):
+            self._private = private
+            self.headers = {}
+            self.responses = []
+
+        def _is_private_client(self):
+            return self._private
+
+        def _json(self, status, body):
+            self.responses.append((status, body))
+            return (status, body)
+
+    def _post(self, private, data, stored_pw=None, api_token=""):
+        import urllib.parse
+        from unittest.mock import patch as _patch
+
+        import zimi.manage as manage
+
+        h = self._FakeHandler(private)
+        set_calls = []
+        with (
+            _patch.object(manage._srv, "ZIMI_MANAGE", True, create=True),
+            _patch.dict(manage.os.environ, {}, clear=False),
+            _patch.object(manage, "_get_manage_password_hash", return_value=stored_pw),
+            _patch.object(manage, "_get_api_token", return_value=api_token),
+            _patch.object(
+                manage,
+                "_verify_password",
+                side_effect=lambda cand, stored: cand == "right",
+            ),
+            _patch.object(
+                manage,
+                "_set_manage_password",
+                side_effect=lambda pw, username=None: set_calls.append(pw),
+            ),
+        ):
+            manage.os.environ.pop("ZIMI_MANAGE_PASSWORD", None)
+            parsed = urllib.parse.urlparse("/manage/set-password")
+            manage.handle_manage_post(h, parsed, data)
+        return h.responses[-1], set_calls
+
+    def test_passwordless_private_sets_password(self):
+        (status, _body), set_calls = self._post(True, {"password": "newpw"})
+        self.assertEqual(status, 200)
+        self.assertEqual(set_calls, ["newpw"])
+
+    def test_passwordless_public_is_403_public_locked(self):
+        (status, body), set_calls = self._post(False, {"password": "newpw"})
+        self.assertEqual(status, 403)
+        self.assertEqual(body["error"], "public_locked")
+        self.assertFalse(body["needs_password"])
+        self.assertEqual(set_calls, [])  # takeover prevented
+
+    def test_password_set_correct_current_public_allowed(self):
+        # A credential holder is a credential holder — a correct current
+        # password changes it regardless of hop.
+        (status, _body), set_calls = self._post(
+            False, {"current": "right", "password": "newpw"}, stored_pw="salt$hash"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(set_calls, ["newpw"])
+
+    def test_password_set_wrong_current_rejected(self):
+        (status, _body), set_calls = self._post(
+            False, {"current": "wrong", "password": "newpw"}, stored_pw="salt$hash"
+        )
+        self.assertEqual(status, 401)
+        self.assertEqual(set_calls, [])
+
 
 class TestRateClass(unittest.TestCase):
     """Which endpoints ride which rate bucket. /snippet on the content
@@ -2099,6 +2217,59 @@ class TestClientIPResolution(unittest.TestCase):
         self.assertEqual(
             self._ip("172.17.0.1", {"CF-Connecting-IP": "192.168.5.5"}), "172.17.0.1"
         )
+
+    def test_cgnat_direct_client_is_private_tier(self):
+        # Tailscale/CGNAT (100.64.0.0/10) direct peer must classify private —
+        # the #36 fix. Python's is_private is False for this range, so without
+        # the CGNAT extension the client would be locked out as public.
+        self.assertTrue(self._private("100.100.1.1"))
+        self.assertEqual(self._ip("100.100.1.1"), "100.100.1.1")
+
+    def test_cgnat_forwarded_claim_is_rejected(self):
+        # Symmetry: a forwarded header claiming a 100.x address from a trusted
+        # hop must be REFUSED (same as a private/loopback claim), else a spoofed
+        # header could borrow the trusted tier. Falls back to the direct hop.
+        self.assertEqual(
+            self._ip("192.168.1.1", {"X-Forwarded-For": "100.100.1.1"}),
+            "192.168.1.1",
+        )
+        self.assertEqual(
+            self._ip("172.17.0.1", {"CF-Connecting-IP": "100.64.5.5"}),
+            "172.17.0.1",
+        )
+
+    def test_cgnat_hop_is_trusted_forwarder(self):
+        # A 100.x direct hop (Tailscale exit-node style) is trusted enough to
+        # forward a genuine public client.
+        self.assertEqual(
+            self._ip("100.64.0.1", {"CF-Connecting-IP": "8.8.8.8"}), "8.8.8.8"
+        )
+
+    def test_cgnat_opt_out_makes_it_public_again(self):
+        # ZIMI_TRUST_CGNAT=0 disables the extension: 100.x is public once more.
+        import zimi.http as zhttp
+
+        saved = zhttp._TRUST_CGNAT
+        try:
+            zhttp._TRUST_CGNAT = False
+            self.assertFalse(self._private("100.100.1.1"))
+            # And as a forwarded claim it's now honored (it's public).
+            self.assertEqual(
+                self._ip("192.168.1.1", {"X-Forwarded-For": "100.100.1.1"}),
+                "100.100.1.1",
+            )
+        finally:
+            zhttp._TRUST_CGNAT = saved
+
+    def test_tailscale_v6_ula_already_private(self):
+        # Tailscale's IPv6 range fd7a:115c:a1e0::/48 falls under fd00::/8, which
+        # Python's ipaddress already treats as private. Pin it so a stdlib
+        # change (or a regression) would surface here rather than silently
+        # locking out Tailscale-over-v6 clients.
+        import ipaddress as _ip
+
+        self.assertTrue(_ip.ip_address("fd7a:115c:a1e0::1").is_private)
+        self.assertTrue(self._private("fd7a:115c:a1e0::1"))
 
     def test_allowlist_missing_header_fails_closed(self):
         # With an explicit allowlist the hop is only ever a proxy, so a request

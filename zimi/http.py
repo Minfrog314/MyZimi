@@ -20,11 +20,12 @@ import threading
 import time
 import traceback
 from http.server import BaseHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs, unquote
+from urllib.parse import urlparse, parse_qs, unquote, quote
 
 import zimi.server as _srv
+from zimi import users as _users
 from zimi.manage import (
-    _check_manage_auth,
+    _manage_auth_challenge,
     handle_manage_get,
     handle_manage_post,
 )
@@ -59,6 +60,48 @@ def _load_trusted_proxy_cidrs():
 
 _TRUSTED_PROXY_CIDRS = _load_trusted_proxy_cidrs()
 
+# Carrier-grade NAT / overlay-network shared address space (RFC 6598). Tailscale
+# hands every node a 100.64.0.0/10 address (and ZeroTier-style overlays live in
+# comparable private-by-convention ranges); the block is deliberately excluded
+# from the public routing table. Python's ipaddress.is_private is False for it,
+# so without this Zimi classifies Tailscale peers as PUBLIC and locks management
+# on them (#36 — the lock "came and went" as the reporter switched between LAN
+# and Tailscale).
+CGNAT_NET = ipaddress.ip_network("100.64.0.0/10")
+
+# Default on. An inbound TCP connection with a 100.64/10 source cannot complete a
+# handshake from the public internet — the return path to that range is
+# unroutable — so such a connection means genuine membership in a shared/overlay
+# network (Tailscale, ZeroTier), which is a private-tier peer. Residual risk: a
+# host whose OWN uplink sits inside a carrier's CGNAT could in theory see other
+# subscribers of that carrier in the same range; operators in that situation set
+# a management password (and ZIMI_TRUST_CGNAT=0) to opt out.
+_TRUST_CGNAT = os.environ.get("ZIMI_TRUST_CGNAT", "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+    "",
+)
+
+
+def _is_trusted_net(ip):
+    """True when an ipaddress object is on a private-tier network: RFC1918/ULA
+    private, loopback, link-local, or (unless ZIMI_TRUST_CGNAT=0) the
+    100.64.0.0/10 CGNAT/overlay range Tailscale and similar mesh VPNs use.
+
+    This is the single source of truth for "trusted tier" so the direct-client
+    check, the proxy-hop check, and the forwarded-claim refusal stay symmetric:
+    any address this trusts as a direct peer is equally refused when merely
+    *claimed* in a forwarded header from a trusted hop.
+    """
+    if ip.is_private or ip.is_loopback or ip.is_link_local:
+        return True
+    if _TRUST_CGNAT and ip in CGNAT_NET:
+        return True
+    return False
+
+
 RATE_LIMIT = int(
     os.environ.get("ZIMI_RATE_LIMIT", "60")
 )  # API requests per minute per IP (0 = disabled)
@@ -72,8 +115,13 @@ RATE_LIMIT_CONTENT = (
 RATE_LIMIT_TRUSTED = int(
     os.environ.get("ZIMI_RATE_LIMIT_TRUSTED", str(RATE_LIMIT * 10))
 )
+# Credential checks get their own much tighter budget. /login is the one
+# unauthenticated endpoint that runs PBKDF2 (600k iterations), so the same cap
+# defends against both password guessing and CPU exhaustion.
+RATE_LIMIT_LOGIN = int(os.environ.get("ZIMI_RATE_LIMIT_LOGIN", "10"))
 _rate_buckets = {}  # {ip: [timestamps]} — API endpoints
 _rate_buckets_content = {}  # {ip: [timestamps]} — /w/ content
+_rate_buckets_login = {}  # {ip: [timestamps]} — POST /login
 _rate_lock = threading.Lock()
 
 # Verified Bearer credentials, keyed by digest so the PBKDF2 check runs once
@@ -81,12 +129,24 @@ _rate_lock = threading.Lock()
 _authed_cache = {}  # {sha256(bearer): expiry_ts}
 _AUTHED_CACHE_TTL = 300.0
 
+# "Remember me" user-session cookie lifetime (seconds). 30 days — long enough
+# for a kid's device to stay logged in, short enough to age out abandoned tokens.
+SESSION_COOKIE_MAX_AGE = 30 * 24 * 3600
+
 
 # Snippets ride the content bucket: one search fans out to ~10 snippet
 # fetches, which burned the whole API budget in a few searches (#30's
 # cousin). Pinned by tests — moving /snippet back to the API bucket is a
 # regression, not a cleanup.
-_RATE_LIMITED_API_PATHS = ("/search", "/read", "/suggest", "/random")
+_RATE_LIMITED_API_PATHS = (
+    "/search",
+    "/read",
+    "/suggest",
+    "/random",
+    "/chunks",
+    "/openapi.json",
+    "/almanac-links",
+)
 
 # High-frequency read-only manage polls. While a download runs the manage UI
 # keeps three independent timers alive — downloads+seeding every 2s, activity
@@ -106,6 +166,8 @@ _POLL_PATHS = frozenset(
         "/manage/bt-status",
         "/manage/status",
         "/manage/mirror",
+        "/manage/health",
+        "/manage/export-bookmarks",
     )
 )
 
@@ -119,13 +181,14 @@ def _rate_class(path):
     return limited, is_content
 
 
-def _check_rate_limit(ip, content=False, limit=None):
+def _check_rate_limit(ip, content=False, limit=None, buckets=None):
     """Check if IP has exceeded rate limit. Returns seconds to wait, or 0 if OK."""
     if limit is None:
         limit = RATE_LIMIT_CONTENT if content else RATE_LIMIT
     if limit <= 0:
         return 0
-    buckets = _rate_buckets_content if content else _rate_buckets
+    if buckets is None:
+        buckets = _rate_buckets_content if content else _rate_buckets
     now = time.time()
     window = 60.0  # 1 minute window
     with _rate_lock:
@@ -147,6 +210,31 @@ def _check_rate_limit(ip, content=False, limit=None):
         if len(buckets) > 10000:
             buckets.clear()
     return 0
+
+
+def _almanac_links_response(handler, qids, langs, titles=None):
+    """Shared GET/POST handler body for /almanac-links.
+
+    Validates the batch shape/size, then batch-resolves the closed set of
+    Wikidata Q-IDs to installed articles (hits only). Q-ID format validation
+    lives in resolve_almanac_qids, so a malformed token is silently skipped,
+    not an error. `titles` is an optional {qid: english_title} map (POST only)
+    powering the exact-title fallback for ZIMs without a prebuilt Q-ID index.
+    Returns {"links": {qid: {zim, path, title}}}.
+    """
+    if not isinstance(qids, list):
+        return handler._json(400, {"error": "'qids' must be a list"})
+    if len(qids) > _srv.ALMANAC_QID_BATCH_MAX:
+        return handler._json(
+            400,
+            {"error": f"too many qids (max {_srv.ALMANAC_QID_BATCH_MAX})"},
+        )
+    if langs is not None and not isinstance(langs, list):
+        return handler._json(400, {"error": "'langs' must be a list"})
+    if titles is not None and not isinstance(titles, dict):
+        return handler._json(400, {"error": "'titles' must be an object"})
+    links = _srv.resolve_almanac_qids(qids, langs, titles)
+    return handler._json(200, {"links": links})
 
 
 # ============================================================================
@@ -282,23 +370,12 @@ def _get_disk_usage():
             for f in os.listdir(_srv.ZIM_DIR)
             if f.endswith(".zim")
         )
-        # List partial (.tmp) downloads
-        tmp_files = []
-        for f in os.listdir(_srv.ZIM_DIR):
-            if f.endswith(".zim.tmp"):
-                try:
-                    fpath = os.path.join(_srv.ZIM_DIR, f)
-                    tmp_files.append(
-                        {
-                            "filename": f,
-                            "size_bytes": os.path.getsize(fpath),
-                            "age_hours": round(
-                                (time.time() - os.path.getmtime(fpath)) / 3600, 1
-                            ),
-                        }
-                    )
-                except OSError:
-                    pass
+        # Only surface genuinely orphaned partials for cleanup — an active,
+        # queued, or resumable-with-progress .zim.tmp is still wanted and must
+        # never be offered for deletion.
+        from zimi import library as _lib
+
+        _protected, tmp_files = _lib.classify_partials()
         return {
             "zim_dir": _srv.ZIM_DIR,
             "data_dir": _srv.ZIMI_DATA_DIR,
@@ -328,7 +405,7 @@ COMPRESSIBLE_TYPES = {
 
 _TEMPLATE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates")
 try:
-    with open(os.path.join(_TEMPLATE_DIR, "index.html")) as f:
+    with open(os.path.join(_TEMPLATE_DIR, "index.html"), encoding="utf-8") as f:
         SEARCH_UI_HTML = f.read()
 except FileNotFoundError:
     SEARCH_UI_HTML = "<html><body><h1>Zimi</h1><p>UI template not found. API endpoints are still available.</p></body></html>"
@@ -357,7 +434,7 @@ if os.path.isdir(_STATIC_DIR):
     _app_js_path = os.path.join(_STATIC_DIR, "app.js")
     APP_JS_REWRITTEN = None
     if os.path.exists(_app_js_path):
-        with open(_app_js_path, "r") as _f:
+        with open(_app_js_path, "r", encoding="utf-8") as _f:
             _app_js_src = _f.read()
         _rewritten = re.sub(
             r"/static/([\w./-]+)\?v=\d+", _replace_static_ver, _app_js_src
@@ -449,31 +526,27 @@ class ZimHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def _client_ip(self):
-        """Resolve the real client IP, honoring a forwarded header only from a
-        proxy on a private network.
+        """Resolve the real client IP. Drives /dl/ whole-ZIM serving and the
+        trusted rate tier, so a spoofable answer here opens both to the internet.
 
-        The old version trusted X-Forwarded-For from a hardcoded bridge-IP set
-        and read its (client-spoofable) leftmost value. On a host-networked
-        deploy behind a containerized tunnel, the connection reaches Zimi from
-        the docker bridge gateway — a *private* IP not in that set and with no
-        real client IP propagated — so every WAN request resolved to a private
-        address and was misclassified "private" (open /dl/ whole-ZIM serving to
-        the internet + the trusted rate tier).
+        Rules, in order:
 
-        Fix: (1) prefer Cloudflare's CF-Connecting-IP — it's the true client and
-        Cloudflare strips any client-supplied copy at its edge, so it can't be
-        forged through the tunnel; (2) otherwise take X-Forwarded-For's leftmost;
-        (3) trust either only from a trusted proxy hop — an explicit
-        ZIMI_TRUSTED_PROXIES CIDR allowlist if set, else any private/loopback/
-        link-local hop (the origin is never directly WAN-reachable, so a
-        forwarding hop is always private) — covering the bridge gateway on any
-        subnet without a hardcoded list; (4) reject a forwarded value that
-        itself claims a trusted-tier address (private/loopback/link-local), so a
-        permitted forwarder (or a LAN client) can't spoof one to borrow that
-        trust; (5) with no usable forwarded header, fail closed to public when
-        an explicit ZIMI_TRUSTED_PROXIES allowlist marks the hop as only-ever-a-
-        proxy, else return the direct peer (heuristic mode can't tell a direct
-        LAN client from a header-stripping proxy)."""
+        1. A forwarded header counts only from a trusted proxy hop — the
+           ZIMI_TRUSTED_PROXIES CIDR allowlist if set, else any trusted-tier
+           address (private/loopback/link-local + CGNAT/overlay). The origin is
+           never directly WAN-reachable, so a forwarding hop is always one of
+           those; the heuristic covers a docker bridge gateway on any subnet
+           without hardcoding one.
+        2. Prefer CF-Connecting-IP over X-Forwarded-For's leftmost value:
+           Cloudflare strips any client-supplied copy at its edge, so it can't
+           be forged through the tunnel, whereas XFF's leftmost can.
+        3. Reject a forwarded value that itself claims a trusted-tier address,
+           so a permitted forwarder (or a LAN client) can't spoof one to borrow
+           that trust.
+        4. With no usable forwarded value, fail closed to public when an
+           explicit allowlist marks the hop as only-ever-a-proxy. In heuristic
+           mode keep the direct peer — it can't distinguish a direct LAN client
+           from a header-stripping proxy."""
         direct_ip = self.client_address[0]
         try:
             dip = ipaddress.ip_address(direct_ip)
@@ -482,7 +555,7 @@ class ZimHandler(BaseHTTPRequestHandler):
         if _TRUSTED_PROXY_CIDRS is not None:
             hop_trusted = any(dip in net for net in _TRUSTED_PROXY_CIDRS)
         else:
-            hop_trusted = dip.is_private or dip.is_loopback or dip.is_link_local
+            hop_trusted = _is_trusted_net(dip)
         if not hop_trusted:
             return direct_ip
         fwd = self.headers.get("CF-Connecting-IP")
@@ -493,11 +566,12 @@ class ZimHandler(BaseHTTPRequestHandler):
             try:
                 fip = ipaddress.ip_address(fwd)
                 # A real forwarded external client is public. Refuse a claim of
-                # ANY trusted-tier address (private/loopback/link-local — the
-                # same set _is_private_client trusts) so a spoofed header can't
-                # borrow that trust; a genuine internal client still falls back
-                # to the (private, trusted) direct hop below.
-                if not (fip.is_private or fip.is_loopback or fip.is_link_local):
+                # ANY trusted-tier address (private/loopback/link-local + CGNAT/
+                # overlay — the same set _is_private_client trusts via
+                # _is_trusted_net) so a spoofed header can't borrow that trust; a
+                # genuine internal client still falls back to the (private,
+                # trusted) direct hop below.
+                if not _is_trusted_net(fip):
                     return fwd
             except ValueError:
                 pass
@@ -518,6 +592,11 @@ class ZimHandler(BaseHTTPRequestHandler):
 
         def param(key, default=None):
             return params.get(key, [default])[0]
+
+        # Multi-user: restrict this request's ZIM view to the logged-in user's
+        # allowlist (None = admin/anonymous/all-access). Set FIRST so a kept-alive
+        # connection re-sets it per request; cleared in the finally for hygiene.
+        _srv.set_request_allow(_users.request_allow(self))
 
         # Rate limit: API endpoints at RATE_LIMIT (10x for trusted clients),
         # /w/ content and /snippet at 20x.
@@ -574,6 +653,7 @@ class ZimHandler(BaseHTTPRequestHandler):
                         z["name"]
                         for z in (_srv._zim_list_cache or [])
                         if z.get("language", "") == lang_filter
+                        and _srv.zim_allowed(z["name"])
                     ]
                     if not lang_zims:
                         return self._json(
@@ -619,7 +699,10 @@ class ZimHandler(BaseHTTPRequestHandler):
                     if isinstance(filter_zim, list)
                     else (filter_zim or "")
                 )
-                cache_key = (q.lower().strip(), zim_scope_str, limit, fast)
+                # Key includes the request's allowlist identity (see
+                # _search_cache_key) so a restricted user never receives another
+                # session's broader results.
+                cache_key = _srv._search_cache_key(q, zim_scope_str, limit, fast)
                 cached = _srv._search_cache_get(cache_key)
                 if cached is not None:
                     _record_metric("/search", 0)
@@ -674,6 +757,32 @@ class ZimHandler(BaseHTTPRequestHandler):
                 _record_usage("read", zim)
                 return self._json(200, result)
 
+            elif parsed.path == "/chunks":
+                zim = param("zim")
+                path = param("path")
+                if not zim or not path:
+                    return self._json(
+                        400, {"error": "missing ?zim= and ?path= parameters"}
+                    )
+                # Out-of-range size/overlap are clamped in chunk_article, not
+                # rejected; only unparseable values fall back to the defaults.
+                try:
+                    size = int(param("size", str(_srv.CHUNK_SIZE_DEFAULT)))
+                except (ValueError, TypeError):
+                    size = _srv.CHUNK_SIZE_DEFAULT
+                try:
+                    overlap = int(param("overlap", str(_srv.CHUNK_OVERLAP_DEFAULT)))
+                except (ValueError, TypeError):
+                    overlap = _srv.CHUNK_OVERLAP_DEFAULT
+                t0 = time.time()
+                with _srv._zim_lock:
+                    result = _srv.chunk_article(zim, path, size=size, overlap=overlap)
+                _record_metric("/chunks", time.time() - t0)
+                if result.get("error") == "not_found":
+                    return self._json(404, {"error": "not found"})
+                _record_usage("read", zim)
+                return self._json(200, result)
+
             elif parsed.path == "/suggest":
                 q = param("q")
                 if not q:
@@ -711,16 +820,48 @@ class ZimHandler(BaseHTTPRequestHandler):
                 _record_metric("/suggest", time.time() - t0)
                 return self._json(200, result)
 
+            elif parsed.path == "/almanac-links":
+                # Closed-set Q-ID → installed-article batch resolution for the
+                # almanac. GET form: ?qids=Q1,Q2,...&langs=en,fr (POST carries
+                # the same shape as JSON, for large batches).
+                qids = [q for q in param("qids", "").split(",") if q]
+                langs = [x for x in param("langs", "").split(",") if x]
+                return _almanac_links_response(self, qids, langs)
+
             elif parsed.path == "/list":
                 result = _srv.list_zims()
+                # Per-ZIM category overrides win over the _categorize_zim
+                # heuristic (#37). Applied here, not baked into the disk cache,
+                # so clearing an override instantly reverts to the heuristic.
+                layout = _srv._load_library_layout()
+                overrides = layout.get("overrides", {})
+                if overrides:
+                    result = [
+                        {**z, "category": overrides.get(z["name"], z.get("category"))}
+                        for z in result
+                    ]
+                # Additive envelope: ?layout=1 carries the top-level section_order
+                # alongside the ZIMs. The bare array shape stays the default so
+                # existing API consumers are unaffected.
+                if param("layout"):
+                    return self._json(
+                        200,
+                        {
+                            "zims": result,
+                            "section_order": layout.get("section_order", []),
+                        },
+                    )
                 return self._json(200, result)
+
+            elif parsed.path == "/whoami":
+                return self._handle_whoami()
 
             elif parsed.path == "/languages":
                 # Installed language summary with native names and ZIM counts
                 lang_zims = {}  # {lang_code: [zim_name, ...]}
                 for z in _srv._zim_list_cache or []:
                     lang = z.get("language", "")
-                    if lang:
+                    if lang and _srv.zim_allowed(z["name"]):
                         lang_zims.setdefault(lang, []).append(z["name"])
                 result = []
                 for lang, zim_names in sorted(lang_zims.items()):
@@ -878,6 +1019,11 @@ class ZimHandler(BaseHTTPRequestHandler):
                 data = _srv._load_collections()
                 return self._json(200, data)
 
+            elif parsed.path == "/openapi.json":
+                from zimi.openapi import build_openapi
+
+                return self._json(200, build_openapi())
+
             elif parsed.path == "/health":
                 zim_count = len(_srv.get_zim_files())
                 return self._json(
@@ -901,7 +1047,9 @@ class ZimHandler(BaseHTTPRequestHandler):
                     eligible = [
                         z
                         for z in (_srv._zim_list_cache or [])
-                        if isinstance(z.get("entries"), int) and z["entries"] > 100
+                        if isinstance(z.get("entries"), int)
+                        and z["entries"] > 100
+                        and _srv.zim_allowed(z["name"])
                     ]
                     if not eligible:
                         return self._json(200, {"error": "no ZIMs available"})
@@ -1028,6 +1176,13 @@ class ZimHandler(BaseHTTPRequestHandler):
                     "path": best_result["path"],
                     "title": best_result["title"],
                 }
+                # On-this-day: carry the date-anchored event context to the card
+                # so it can show "July 27, 1777 — <event>" even when the target
+                # article never restates the date.
+                if best_result.get("event_year"):
+                    chosen["event_year"] = best_result["event_year"]
+                if best_result.get("event_text"):
+                    chosen["event_text"] = best_result["event_text"]
                 if best_preview:
                     # Use extracted title if the entry title looks like a slug
                     if best_preview.get("title"):
@@ -1147,6 +1302,7 @@ class ZimHandler(BaseHTTPRequestHandler):
                         "endpoints": [
                             "/search",
                             "/read",
+                            "/chunks",
                             "/suggest",
                             "/list",
                             "/catalog",
@@ -1159,9 +1315,12 @@ class ZimHandler(BaseHTTPRequestHandler):
         except Exception as e:
             traceback.print_exc()
             return self._json(500, {"error": "Internal server error"})
+        finally:
+            _srv.clear_request_allow()
 
     def do_POST(self):
         parsed = urlparse(self.path)
+        _srv.set_request_allow(_users.request_allow(self))
         try:
             content_len = int(self.headers.get("Content-Length", "0"))
             if content_len > _srv.MAX_POST_BODY:
@@ -1180,16 +1339,25 @@ class ZimHandler(BaseHTTPRequestHandler):
             if parsed.path.startswith("/manage/"):
                 return handle_manage_post(self, parsed, data)
 
+            if parsed.path == "/login":
+                retry_after = _check_rate_limit(
+                    self._client_ip(),
+                    limit=RATE_LIMIT_LOGIN,
+                    buckets=_rate_buckets_login,
+                )
+                if retry_after > 0:
+                    return self._json_rate_limited(retry_after)
+                return self._handle_login(data)
+
+            if parsed.path == "/logout":
+                return self._handle_logout()
+
             if parsed.path == "/resolve":
                 retry_after = _check_rate_limit(
                     self._client_ip(), limit=self._rate_limit_for_request()
                 )
                 if retry_after > 0:
-                    with _metrics_lock:
-                        _metrics["rate_limited"] += 1
-                    return self._json(
-                        429, {"error": "rate limited", "retry_after": retry_after}
-                    )
+                    return self._json_rate_limited(retry_after)
                 # Batch cross-ZIM URL resolution: POST {"urls": [...]} → {"results": {...}}
                 urls = data.get("urls", [])
                 if not isinstance(urls, list) or len(urls) > 100:
@@ -1210,13 +1378,27 @@ class ZimHandler(BaseHTTPRequestHandler):
                         results[url_str] = {"found": False}
                 return self._json(200, {"results": results})
 
+            elif parsed.path == "/almanac-links":
+                # Batch Q-ID resolution (closed set) — same public, rate-limited
+                # read as /suggest; the almanac POSTs its full ~250-Q-ID set.
+                retry_after = _check_rate_limit(
+                    self._client_ip(), limit=self._rate_limit_for_request()
+                )
+                if retry_after > 0:
+                    return self._json_rate_limited(retry_after)
+                return _almanac_links_response(
+                    self,
+                    data.get("qids", []),
+                    data.get("langs"),
+                    data.get("titles"),
+                )
+
             elif parsed.path == "/collections":
                 # Auth: only enforce password when manage mode is on (collections are
                 # user-facing features that work without manage mode enabled)
-                if _srv.ZIMI_MANAGE and _check_manage_auth(self):
-                    return self._json(
-                        401, {"error": "unauthorized", "needs_password": True}
-                    )
+                challenge = _manage_auth_challenge(self) if _srv.ZIMI_MANAGE else None
+                if challenge:
+                    return self._json(*challenge)
                 name = data.get("name", "").strip()[:64]
                 label = data.get("label", "").strip()[:128]
                 # Auto-generate name from label if not provided
@@ -1242,10 +1424,9 @@ class ZimHandler(BaseHTTPRequestHandler):
 
             elif parsed.path == "/favorites":
                 # Auth: same as collections — only when manage mode is on
-                if _srv.ZIMI_MANAGE and _check_manage_auth(self):
-                    return self._json(
-                        401, {"error": "unauthorized", "needs_password": True}
-                    )
+                challenge = _manage_auth_challenge(self) if _srv.ZIMI_MANAGE else None
+                if challenge:
+                    return self._json(*challenge)
                 zim_name = data.get("zim", "").strip()
                 if not zim_name:
                     return self._json(400, {"error": "missing 'zim' field"})
@@ -1281,6 +1462,8 @@ class ZimHandler(BaseHTTPRequestHandler):
         except Exception as e:
             traceback.print_exc()
             return self._json(500, {"error": "Internal server error"})
+        finally:
+            _srv.clear_request_allow()
 
     def do_DELETE(self):
         parsed = urlparse(self.path)
@@ -1290,20 +1473,15 @@ class ZimHandler(BaseHTTPRequestHandler):
             self._client_ip(), limit=self._rate_limit_for_request()
         )
         if retry_after > 0:
-            with _metrics_lock:
-                _metrics["rate_limited"] += 1
-            return self._json(
-                429, {"error": "rate limited", "retry_after": retry_after}
-            )
+            return self._json_rate_limited(retry_after)
         try:
             if parsed.path == "/collections":
                 name = params.get("name", [None])[0]
                 if not name:
                     return self._json(400, {"error": "missing ?name= parameter"})
-                if _srv.ZIMI_MANAGE and _check_manage_auth(self):
-                    return self._json(
-                        401, {"error": "unauthorized", "needs_password": True}
-                    )
+                challenge = _manage_auth_challenge(self) if _srv.ZIMI_MANAGE else None
+                if challenge:
+                    return self._json(*challenge)
                 with _srv._collections_lock:
                     cdata = _srv._load_collections()
                     if name not in cdata.get("collections", {}):
@@ -1376,6 +1554,24 @@ class ZimHandler(BaseHTTPRequestHandler):
                     except KeyError:
                         continue
             if entry is None:
+                # Single-page docs (devdocs): 'index#backslash' is entry 'index'
+                # plus an in-page fragment. If the base entry exists, redirect so
+                # the browser keeps the raw '#fragment' and scrolls to the section.
+                base_path, fragment = _srv.split_entry_fragment(entry_path)
+                if fragment:
+                    try:
+                        archive.get_entry_by_path(base_path)
+                    except KeyError:
+                        base_path = None
+                    if base_path is not None:
+                        quoted = "/".join(quote(seg) for seg in base_path.split("/"))
+                        self.send_response(302)
+                        self.send_header(
+                            "Location", f"/w/{quote(zim_name)}/{quoted}#{fragment}"
+                        )
+                        self.send_header("Content-Length", "0")
+                        self.end_headers()
+                        return
                 return self._json(
                     404, {"error": f"Entry '{entry_path}' not found in {zim_name}"}
                 )
@@ -1536,12 +1732,13 @@ class ZimHandler(BaseHTTPRequestHandler):
         self.wfile.write(content)
 
     def _is_private_client(self):
-        """True when _client_ip() is on a private/loopback/link-local network."""
+        """True when _client_ip() is on a private-tier network (private/
+        loopback/link-local, plus CGNAT/overlay per _is_trusted_net)."""
         try:
             ip = ipaddress.ip_address(self._client_ip())
         except ValueError:
             return False
-        return ip.is_private or ip.is_loopback or ip.is_link_local
+        return _is_trusted_net(ip)
 
     def _peer_share_allowed(self):
         """True if this client may pull whole ZIMs from /dl/.
@@ -1926,6 +2123,137 @@ class ZimHandler(BaseHTTPRequestHandler):
             json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode(),
             "application/json",
         )
+
+    def _json_rate_limited(self, retry_after):
+        """429 body for the POST/DELETE write paths."""
+        with _metrics_lock:
+            _metrics["rate_limited"] += 1
+        return self._json(429, {"error": "rate limited", "retry_after": retry_after})
+
+    # ── Multi-user login / logout / whoami ──────────────────────────────────
+    def _json_cookie(self, code, data, set_cookie):
+        """Send a small JSON auth response carrying a Set-Cookie header. Kept
+        separate from _send (no gzip, always no-store) so the ~200 _json call
+        sites stay untouched. Auth responses must never be cached."""
+        body = json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Cache-Control", "no-store")
+        if set_cookie:
+            self.send_header("Set-Cookie", set_cookie)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _session_cookie(self, token, remember):
+        """Build the zimi_session cookie. HttpOnly + SameSite=Lax always;
+        Secure only behind an HTTPS proxy (so plain-http LAN keeps working);
+        Max-Age only when 'remember' (else a session cookie, cleared on close)."""
+        parts = ["zimi_session=" + token, "Path=/", "HttpOnly", "SameSite=Lax"]
+        if remember:
+            parts.append("Max-Age=" + str(SESSION_COOKIE_MAX_AGE))
+        if self.headers.get("X-Forwarded-Proto", "").lower() == "https":
+            parts.append("Secure")
+        return "; ".join(parts)
+
+    def _expire_cookie(self):
+        return "zimi_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"
+
+    def _handle_login(self, data):
+        """POST /login — username + password. A named user gets a session
+        (cookie + Bearer token); admin credentials return role=admin (the
+        client keeps using the header token). Failures are generic: the same
+        401 whether the username or the password is wrong (no enumeration)."""
+        username = (data.get("username") or "").strip()
+        password = data.get("password") or ""
+        remember = bool(data.get("remember"))
+        if not username or not password:
+            return self._json(400, {"error": "username and password required"})
+        # Named user first.
+        name = _users.authenticate(username, password)
+        if name:
+            _users.record_login(name)
+            token = _users.create_session(name)
+            rec = _users.get_user(name)
+            allowlist = rec.get("allowlist") if rec else None
+            # A SECONDARY admin (role=admin) logs in through the same modal but
+            # gets the admin chrome + manage powers: their session token is what
+            # _check_manage_auth accepts, so hand it back as role=admin so the
+            # client uses it as the manage Bearer token (never hides the gear).
+            if _users.is_admin_user(name):
+                log.info("Secondary-admin login: %s", name)
+                return self._json_cookie(
+                    200,
+                    {"role": "admin", "name": name, "token": token, "secondary": True},
+                    self._session_cookie(token, remember),
+                )
+            log.info("User login: %s", name)
+            return self._json_cookie(
+                200,
+                {
+                    "role": "user",
+                    "name": name,
+                    "token": token,
+                    "restricted": isinstance(allowlist, list),
+                    "allowlist": allowlist if isinstance(allowlist, list) else [],
+                },
+                self._session_cookie(token, remember),
+            )
+        # Admin account (the existing password account).
+        from zimi import manage as _manage
+
+        if _manage.verify_admin_credentials(username, password):
+            return self._json(200, {"role": "admin"})
+        return self._json(401, {"error": "invalid credentials"})
+
+    def _handle_logout(self):
+        """POST /logout — drop the current session + expire the cookie."""
+        token = _users._bearer_token(self) or _users._cookie_token(self)
+        _users.drop_session(token)
+        return self._json_cookie(200, {"status": "ok"}, self._expire_cookie())
+
+    def _handle_whoami(self):
+        """GET /whoami — the current identity for the client to shape its UI.
+        role ∈ {user, admin, anonymous}. Server-side filtering is independent
+        of this — it keys off the cookie/token, not the client's belief."""
+        from zimi import manage as _manage
+
+        name = _users.resolve_request_user(self)
+        if name:
+            # A SECONDARY admin keeps the admin chrome on reload (their session
+            # token is restored from storage as the manage Bearer token).
+            if _users.is_admin_user(name):
+                return self._json(
+                    200, {"role": "admin", "name": name, "secondary": True}
+                )
+            rec = _users.get_user(name)
+            allowlist = rec.get("allowlist") if rec else None
+            return self._json(
+                200,
+                {
+                    "role": "user",
+                    "name": name,
+                    "restricted": isinstance(allowlist, list),
+                },
+            )
+
+        if (
+            _srv.ZIMI_MANAGE
+            and _manage._get_manage_password_hash()
+            and _manage._check_manage_auth(self) is None
+        ):
+            return self._json(
+                200,
+                {"role": "admin", "name": _manage._get_manage_user() or "admin"},
+            )
+        # Anonymous. Expose a first-login hint ONLY when the default username
+        # applies — no custom username AND no named users configured. This is
+        # not an info leak: "the default username is admin" is in the docs.
+        resp = {"role": "anonymous"}
+        if not _manage._get_manage_user() and not _users.list_users():
+            resp["default_username"] = "admin"
+        return self._json(200, resp)
 
     def log_message(self, format, *args):
         # Light logging: errors + slow requests. Suppress 200/304 noise.

@@ -5,7 +5,402 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [1.8.0] - Unreleased — the Community Edition
+
+A release shaped by the people using Zimi: the open issues, the long-standing
+asks from the wider ZIM ecosystem, and a week of field testing on real phones.
+Reader View, read-aloud, word lookup, "did you mean", library organization,
+filter pills — and the almanac now deep-links its stars, planets and people
+straight into your installed encyclopedias, with a skeuomorphic time machine
+that flies the whole sky to any date. Multiple named accounts with per-user
+library allowlists arrive alongside a native Windows build, and under the hood
+the torrent engine is finally in-process, with a real agent-facing API and
+delta updates on top.
+
+### Added
+
+- **`GET /chunks`** — deterministic, embedding-free chunking of any article,
+  built for RAG clients. Paragraph-aware packing to a `size` budget
+  (200–4000 chars, default 1200) with a configurable `overlap` (default 120),
+  `start`/`end` char offsets, and stable content-addressed chunk IDs: the same
+  ZIM and parameters produce identical IDs on every server, and a ZIM update
+  rolls them (cache invalidation for free). Text is capped by `CHUNK_MAX_TEXT`
+  with a `truncated` flag so a giant article can't blow up a client. 404 for an
+  unknown ZIM or path, 400 for bad params, rate-limited like `/search`.
+- **MCP `get_chunks` tool** wrapping the same logic, so an agent can pull an
+  article in ready-to-embed pieces without leaving the MCP surface.
+- **`GET /openapi.json`** — a hand-authored OpenAPI 3.1 description of the read
+  API (`/search`, `/suggest`, `/read`, `/w/{zim}/{path}`, `/list`, `/random`,
+  `/health`, `/chunks`) with real parameter and response schemas. `info.version`
+  tracks the running server version.
+- **`docs/api-stability.md`** — which endpoints are stable, the additive-only
+  JSON policy, and the one-minor-release deprecation notice. Plus an honest
+  agent-cycle benchmark and methodology in `docs/benchmarks/2026-07-agent-api.md`.
+- **"Did you mean?" spelling correction.** When a search turns up almost
+  nothing, Zimi offers a correction drawn from a title-word vocabulary built
+  from the ZIMs you actually have — fully offline, bounded so it never slows a
+  search down. Surfaced as an additive `did_you_mean` field on `/search`, passed
+  through MCP search, and rendered as a clickable line in the UI.
+- **Read-aloud in the reader.** A speak/stop control uses the browser's offline
+  speech synthesis to read the current article; it hides itself where the API
+  isn't available.
+- **Reader View.** A toggle re-renders the current article as a single
+  distraction-free reading column inside the reader — ZIM chrome (navboxes,
+  infoboxes, edit links, TOC) stripped, wide tables wrapped to scroll, Zimi's
+  dark palette by default — with no reload or server round-trip. A settings
+  palette adds designed Dark/Light/Sepia themes, serif/sans fonts, an A−/A+
+  text-size control (85–130%), and an AUTO mode that opens eligible articles
+  straight into Reader View without the raw white page flashing first.
+  Preferences stick across article navigation and between sessions; PDFs and
+  thin pages skip it silently.
+- **Word lookup.** Select or double-tap a word in the reader and a Define
+  popover pulls the first definition from the best installed Wiktionary ZIM —
+  one suggest, one fetch, fully offline. It follows your language preference,
+  works in the normal reader and Reader View, and stays dormant with zero UI
+  when no Wiktionary is installed.
+- **Tap-to-zoom images.** A scaled-down image in an article opens to full size
+  in a lightbox on tap, and closes on tap-out or Escape.
+- **Almanac deep-links into your library.** Entities across the almanac — the
+  planets and interstellar probes in the orrery, the stars, planets and Moon in
+  the star chart, and the named people, places and events in the panels —
+  resolve against your installed Wikipedia/Vikidia ZIMs by Wikidata Q-ID in one
+  batch when the almanac opens. A match becomes a direct tap-through to the
+  installed article (canvas taps included, via hit-testing); anything
+  unresolved stays plain text, so a link is never wrong. The resolver is pure
+  SQLite over each ZIM's Q-ID index — no title guessing, no per-tap fetch, no
+  miss toast.
+- **The almanac's time machine.** The velocity scrubber and destination panel
+  are replaced by a skeuomorphic instrument: a three-row time circuit (amber
+  displayed date, neutral destination, dimmed now) beside a side-mounted brass
+  lever you throw — ease it for minutes, throw it for centuries — with a single
+  large readout while travelling and a transform-only landing shake (disabled
+  under reduced motion). The sky, orrery, moon and every calendar move with the
+  chosen moment. Type any year from −270000 to 270000; at extreme epochs, a
+  panel whose calendar math runs out shows a quiet "beyond this calendar's
+  range" note while the sky, orrery and deep-time carry on. 13 new i18n keys,
+  parity across all ten locales.
+- **Multiple user accounts.** Named accounts (on top of the existing password
+  admin) with per-user ZIM allowlists that filter the whole read surface —
+  search, read, suggest, random, list, chunks and almanac-links — for a
+  signed-in user. Login mints an HttpOnly session cookie (so iframe reads carry
+  it) and a Bearer token; users are auto-rejected from `/manage/*`. Admin and
+  anonymous visitors are unchanged (all-access), and single-password installs
+  need zero migration. A management username is now an optional, case-insensitive
+  second factor for admin login (env var or a second line in the password file);
+  the login field prefills `admin`. The search cache is keyed by allowlist
+  identity so one user's results can never surface another's restricted ZIMs.
+  The Users panel leads with Your Account (Change password / Log out as plain
+  buttons) and lists only other users below — a solo admin sees no list.
+- **Library health report.** A check in Manage → library opens each installed
+  ZIM in turn and reports a per-ZIM ✓/⚠ table — main page, entry count,
+  title/Q-ID index status, size against the catalog, age — with a summary line,
+  flagging broken (0-entry or unopenable) sources.
+- **Save your bookmarks to a ZIM.** A button in the bookmarks panel exports your
+  local bookmarks to a standalone, portable `.zim` (one article per bookmark
+  plus an index page) that any ZIM reader can open. Disabled when you have no
+  bookmarks.
+- **Print, Save as PDF, and Share.** A new row in the Reader palette prints or
+  saves the current article as a PDF through the browser, and offers the native
+  Share sheet where the platform supports it.
+- **Seeding goals.** Each seed card shows lifetime uploaded bytes against its
+  goal (ratio cap × file size) with a progress bar — e.g. "1.2 GB of 4.0 GB" —
+  while a mirror-mode seed shows "shared · mirror ∞" and no cap. The uploaded
+  total is read from the seed ledger, so it survives restarts.
+- **Manage view: storage and download controls.** A caches bar breaks down
+  Zimi's data directory by category (title indexes, Q-ID indexes, catalog
+  caches, staging) with the top per-ZIM contributors, so you can see what's
+  using disk without ever scanning the ZIM library. A per-download "switch to
+  direct" button drops a stuck BitTorrent transfer to a plain HTTP pull, and the
+  settings panel now prefetches so it opens instantly.
+- **Keyboard-navigable card menu.** The right-click / ⋯ card context menu is now
+  fully operable from the keyboard — arrow keys, Enter and Escape — with proper
+  focus handling and ARIA roles.
+- **Download-this-ZIM buttons** — on the source header and on every row in
+  Manage, pointing at the existing `/dl/` peer endpoint. Each button is gated by
+  a capability probe, so it only appears where the raw file can actually be
+  pulled and the public WAN never sees a dead control.
+- **Library filter pills** — the home library view gains All · Recently added ·
+  Recently updated pills (30-day window, newest first), so a new ZIM is easy to
+  find in a big library without searching (#34). Recent-search chips bring back
+  your last searches with one tap, and language pills filter a multilingual
+  library the same way the other views already could.
+- **Organize your library** — right-click any ZIM (or use the ⋯ control on its
+  row in Manage) to move it into another category, including brand-new custom
+  ones, and reorder the home sections — default categories and collections
+  alike — from a new Reorder panel in Manage preferences (#37).
+- **Windows portable build** — a one-dir `Zimi-windows-x64.zip` (Edge WebView2
+  backend, in-process libtorrent when a wheel is available) built by the desktop
+  release CI alongside the macOS DMGs and Linux AppImage/snap. The Windows
+  desktop app also self-updates via WinSparkle — a per-user Inno Setup installer
+  (no UAC) shipped beside the zip, verified with the same signed appcast key as
+  the macOS Sparkle path.
+- **Delta updates over BitTorrent.** When updating a ZIM that has a torrent,
+  Zimi copies the previous version into staging under the new name first, so
+  libtorrent's hash check salvages every unchanged piece and only the changed
+  pieces download. Wikipedia monthlies overlap heavily, so an update can pull a
+  fraction of the full size. The download shows how much was reused; if there's
+  no room to copy or anything goes wrong, it falls back to a normal full
+  download. Zero new infrastructure.
+
+### Changed
+
+- BitTorrent engine: the bundled aria2c sidecar is replaced by in-process
+  libtorrent. Real per-torrent stats, fast-resume across restarts, no more
+  RPC ports or orphaned sidecar processes. Where libtorrent isn't available
+  (e.g. bare `pip install zimi`), downloads simply use HTTP as always.
+- **Cards show the real article count** — libzim's `article_count` rather than
+  the raw entry count, which includes images, redirects and metadata. It's an
+  additive cache field that fills in on the next natural metadata refresh;
+  sources with a stale cache keep showing the entry count until then.
+- The almanac's daylight labels read "Evening" and "Morning" (capitalized),
+  matching the rest of the panel.
+- **The Catalog renders instantly.** It now paints from its cached copy and
+  refreshes in the background (stale-while-revalidate), and reuses the fetched
+  feed for the rest of the session instead of re-downloading it.
+- On smaller screens the home library's filter pills (recent searches,
+  languages, recency) collapse into a single filter dropdown, so the header
+  stays clean in a big multilingual library. Recency pills filter the home
+  sections in place, the same way language pills do.
+- **Everything user-visible is translated.** A full i18n audit closed English
+  leaks across all ten locales, removed orphaned keys, and tightened Chinese
+  typography — every string a user sees now has a translation in every language.
+- **Checking for updates is fast again.** The Kiwix catalog has grown past
+  3,600 entries; a cold update check used to fetch its OPDS pages one at a
+  time (~16 s of "Loading…"). Pages now download concurrently and a warm
+  cache still answers instantly.
+- **One pill, everywhere.** Filter, language, source and category pills share
+  a single geometry across search, home and management, and each filter row
+  starts with an "All" pill — two clicks resets every search filter.
+- **Language badges.** Home tiles and rows show a two-letter language badge
+  on non-English ZIMs, and download/seed rows name their language — six
+  same-named Wikipedias are finally tellable apart. Search-result source pills
+  get the same treatment: when two share a display title (wikipedia and
+  wikipedia_de both read "Wikipedia"), each colliding pill carries its language
+  code while unique titles stay clean. Tiles got wider titles, the inactive
+  favorite star stays hidden until hover, and the New/Updated badge moved off
+  the source icon.
+- **The sky-scene moon glides on time travel.** A focus-time jump — scrub,
+  wheel/key step, Go, or Back to Now — now eases the moon to its new altitude
+  and azimuth over ~500 ms inside the existing sky loop, retargeting from
+  wherever it is on screen so rapid scrubbing glides instead of snapping and
+  re-launching. Illumination updates on arrival; live loads and resizes are
+  unchanged.
+- **Calmer article header.** On desktop the reader controls (Reader View,
+  text size, read-aloud) fold into the ⋯ menu like on mobile, and close is
+  always the far-right button.
+- **Section reorder grew its own view** — rows drag (keyboard arrows still
+  work), collections sit in their own group, and ZIM row menus keep just
+  "Move to…". The health report now spells out its badges ("Title index",
+  "Q-ID index") and adds thousands separators to entry counts.
+
+### Removed
+
+- aria2 backend and bundling (Docker package, desktop sidecar binaries,
+  `ZIMI_BT_BACKEND` selection). `ZIMI_BT` configuration is unchanged.
+
+### Security
+
+- On an internet-exposed Zimi with no management password set, the initial
+  password-setup endpoint was reachable by public clients — a stranger could
+  claim the instance before its owner. Initial setup now works only from
+  private (LAN) addresses, like the rest of management; changing an existing
+  password with the current password keeps working from anywhere.
+- **Login is rate-limited.** `POST /login` — the one unauthenticated endpoint
+  that runs PBKDF2 (600k rounds) — now has its own bucket
+  (`ZIMI_RATE_LIMIT_LOGIN`, default 10/min), checked before any credential
+  work, so it can no longer be used for unlimited password guessing or CPU
+  exhaustion.
+- **Allowlist leaks closed for limited accounts.** `GET /languages` read the
+  raw ZIM cache, letting a `limited` user enumerate every installed ZIM by
+  name; and the Q-ID interlanguage lookup answered from the SQLite index
+  without the fail-closed allowlist check the other resolution strategies run,
+  leaking ZIM names and article paths outside the user's allowlist. Both now
+  filter to what the signed-in user is allowed to see.
+- **Sessions expire.** Session tokens now carry a 30-day server-side TTL
+  (`SESSION_TTL_S`), checked on every resolve and swept at login. A captured
+  token is no longer a permanent credential, and `sessions.json` stops growing
+  one entry per login forever.
+
+### Fixed
+
+- **"Did you mean?" actually fires now.** The spelling vocabulary was being
+  built from whichever title indexes sorted first alphabetically inside a
+  2-second budget — on a large library it never reached Wikipedia, and the
+  trigger threshold was so strict that typo-matching junk results silenced
+  it. The vocabulary now scans the biggest indexes first with room to
+  finish, suggestions appear alongside weak result sets, and a typo that
+  happens to exist in a few titles ("einstien") is still corrected when the
+  real word vastly outweighs it.
+- The almanac's Messages Across Time inscriptions (Rosetta Stone, Golden
+  Record, Pioneer plaque, …) deep-link into your installed encyclopedias
+  like the rest of the almanac — ten entities, verified both directions
+  against Wikidata.
+- **Almanac deep-links were silently dead on a full library.** The curated
+  entity set had grown to 406 Q-IDs while `/almanac-links` rejects any batch
+  over 400, so the client sent the whole set in one request, the endpoint
+  400'd, and every almanac entity fell back to plain text — zero links even
+  with a full English Wikipedia installed. The client now splits the set into
+  chunks under the cap and merges the responses; a failed chunk retries on the
+  next open while whatever resolved still renders, and a test pins the client
+  chunk size against the server cap so the two can't drift back into the cliff.
+- **Region-aware holidays and season names follow the map again.** After
+  location storage moved to session storage this release, the holiday-region
+  and hemisphere-season readers still read the old localStorage key, so
+  clicking a country on the almanac map never changed which national holidays
+  or season names rendered — it silently fell back to browser locale. Both now
+  read through the shared session-storage getter.
+- The search box has a clear (×) button, and the Updates line no longer
+  strands on "Checking…" — one summary line that always reflects the
+  result, with detail only when there are updates.
+
+- **Interrupted downloads pick up where they left off.** Quitting or crashing
+  mid-download no longer turns the partial file into "junk to clean up" —
+  Retry resumes from the bytes already on disk (HTTP Range, with a size check
+  so a changed remote file restarts clean), and the cleanup offer only lists
+  genuinely orphaned partials, never anything a download still wants.
+- **A failed partial-download cleanup can't spin forever.** When a mirror
+  reports a different total size than the partial on disk, the download
+  discards the partial and restarts clean — but if the delete failed (read-only
+  mount, NFS lock, Windows sharing violation) the retry re-sent the same Range,
+  got the same mismatched response, and recursed until the stack blew. It now
+  fails the download with a generic message and the real reason logged, instead
+  of dying with a RecursionError.
+- **The update check can't hang.** A wedged connection to the Kiwix catalog
+  used to spin "Loading…" forever (most visibly in the desktop app); the
+  whole check is now bounded, and a failed catalog page is skipped instead
+  of sinking the rest.
+- The desktop reading ⋯ menu no longer lists Random and Language twice, the
+  reader's serif font choice now applies to headings too, and the settings
+  gear shows a single activity badge instead of stacking two.
+- Orrery hover cards stay put while you mouse over to click their article
+  link, and the Sun and the heliopause now link out like the planets do.
+  The night sky also got real depth: a few hundred faint background stars,
+  seeded deterministically and cached instead of re-rolled every frame.
+- A passwordless Zimi asked non-local visitors for a password that didn't
+  exist. Management is local-network-only until a password is set — the UI
+  now says exactly that instead of showing a password prompt, and library
+  data readers degrade gracefully on unreadable data directories instead of
+  erroring (#36).
+- Tailscale (and other CGNAT/overlay) clients are no longer treated as public,
+  so management no longer locks when reaching Zimi over the tailnet. The
+  100.64.0.0/10 range now counts as your private network by default; set
+  `ZIMI_TRUST_CGNAT=0` to opt out (#36).
+- LAN peer ZIM pulls now work over Tailscale/CGNAT (100.64.0.0/10) peers: the
+  outbound pull gate honors the same `ZIMI_TRUST_CGNAT` knob as inbound trust,
+  so tailnet peer-sharing no longer silently fails to pull.
+- The almanac's meteor-shower list no longer jams the peak marker onto the
+  line ("🌕 Poor Peak!"). Peak night now gets its own localized badge, styled
+  like the other meteor labels and translated across all ten locales (#23).
+- In-page `#fragment` links in single-page docs (devdocs) scroll to the right
+  anchor instead of 404'ing — `/w/devdocs_en_markdown/index%23backslash` used
+  to report `Entry 'index#backslash' not found`; the path is now split so the
+  entry loads and the browser scrolls to the fragment (#38). Stray
+  `<name>.zim.torrent` companions left in the ZIM directory by the old aria2
+  era are migrated into the cache directory at startup and flagged as "not a
+  ZIM" by the health report, so they stop showing up as broken sources (#38).
+- Almanac Q-ID resolution never falls back to a wrong-language Wikipedia
+  article — an entity resolves to your preferred language or stays plain text.
+- **Windows crashes fixed.** All text file I/O is forced to UTF-8 (a cp1252
+  decode crash on non-ASCII data), and the atomic JSON writer guards
+  `os.fchmod`, which doesn't exist on Windows.
+- New/Updated badges no longer light up an entire existing library as "New":
+  `first_seen` is honest on a cache rebuild (backfilled from file mtime), and a
+  mass badge-in no longer swallows a whole slow scan (#34).
+- Saving the management password to the keychain and "remember me" now survive
+  a password change.
+- Reader palette meets AA contrast, Escape no longer dead-ends inside it, and
+  the filter pills carry proper ARIA roles.
+- Map ZIMs (Kiwix `maps_en_*`) render more reliably — vector-tile and GeoJSON
+  responses now carry correct MIME types (`application/x-protobuf`,
+  `application/geo+json`) so a tile loader gets protobuf, not octet-stream.
+
+### Notes
+
+- **Downgrade caveat:** once a management username is set, the password file
+  gains a second line holding that username. A pre-1.8 server can't read the
+  two-line format — if you roll back, delete the username line (or the whole
+  file) so the older server reads it as a plain single-line hash again.
+
+## [1.7.4] - 2026-07-20
+
+A polish drop that closes the two live issues the post-1.7.3 code audit
+surfaced, and grows the almanac up: an accurate Chinese calendar, a real
+high-res moon, and a solar system you can travel out to. The moon finally
+looks like the Moon.
+
+### Almanac
+
+- **Accurate Chinese calendar.** Replaced the mean-lunation approximation with
+  real astronomy — month boundaries are true new moons in China Standard Time,
+  leap months placed by the solar-term rule against the winter solstice.
+  Verified against the Hong Kong Observatory (New Year dates and leap months
+  2014–2033). It's a browsable calendar system again, with the 闰 leap-month
+  marker and the correct zodiac animal.
+- **Holidays land on every calendar.** Worldwide days, regional holidays, the
+  Easter cycle, solstices, meteor showers and Hindu/Sikh festivals are now
+  projected onto whatever calendar you're viewing (Hebrew, Islamic, Chinese…)
+  instead of vanishing when you switch away from Gregorian.
+- **A real high-resolution moon**, reprojected from NASA's seamless lunar
+  albedo map — genuine crater detail and subtle true colour. The animated sky
+  moon shares the hero's shading now, earthshine dark side and all.
+- **Travel the solar system.** The interstellar probes — Voyager 1 & 2,
+  Pioneer 10 & 11, New Horizons — are plotted at their real bearings out past
+  Neptune and creep outward as the clock runs, framed by labelled asteroid,
+  Kuiper and heliopause markers.
+- **Easier location picking** — the world map cycles through overlapping
+  cities on repeated clicks, and search reaches 354 cities.
+
+### Security
+
+- **`/dl/` no longer serves whole ZIMs to the public internet.** On a
+  host-networked deploy behind a containerized reverse proxy, every WAN
+  request reached Zimi from the docker bridge gateway — a private IP with no
+  real client IP propagated — so the whole internet was classified "private"
+  and could pull raw `.zim` files (public content, so not a data breach, but
+  unmetered use of the operator's uplink) and got the trusted rate tier.
+  Zimi now honours Cloudflare's un-forgeable `CF-Connecting-IP`, trusts a
+  forwarded client only from a private proxy hop (optionally an explicit
+  `ZIMI_TRUSTED_PROXIES` allowlist), and refuses a forwarded value that claims
+  loopback. WAN clients resolve to their real IP again.
+
+### Fixed
+
+- **A libzim segfault under normal use.** Opening an article kicked off a
+  background thread that read a shared libzim archive with no lock, while the
+  request read the same archive — two threads in a non-thread-safe library, a
+  silent crash. It now uses its own handle. Added a real-ZIM concurrency
+  stress test so this class of bug can't hide behind mocked archives again.
+- Search results could silently drop a ZIM under concurrent load (an archive
+  published before its lock); the setup order is fixed.
+- LAN peer discovery advertised the wrong BitTorrent port when a custom port
+  was set; it now advertises the real one.
+- Malformed HTTP Range headers no longer 500 the download endpoint.
+- The almanac topbar showed the underlying ZIM's icon; the breadcrumb is now
+  just "Zimi" while the almanac is open (you reach it only from home).
+- Picking a location on the almanac's world map no longer rebuilds the whole
+  panel — it refreshes the location-dependent pieces in place, so the page
+  stops jumping and flashing on each click.
+
+### Changed
+
+- **The moon is beautiful now.** The hero and Today-card moon are rendered as
+  a single physically-shaded sphere — a soft terminator, gentle limb
+  darkening, the maria showing through, and a faint earthshine glow on the
+  dark side of a crescent. Gone are the hard light/dark edge, the seam down
+  the middle at the quarters, and the flat too-bright disc. The hero moon now
+  renders at the display's device resolution (up to 512px) so its shading
+  stays crisp when you lean in.
+- **Country holidays get their own colour** on the calendar, apart from the
+  worldwide observances (#33).
+
+### Added
+
+- **"New" and "Updated" badges** on ZIM cards, so fresh or changed sources
+  stand out in a large library instead of being lost in the grid (#34). A
+  fresh install gets a solid "New" pill; a source whose file changed on an
+  update gets a quieter "Updated" pill. A badge clears the moment you open
+  that ZIM, and auto-expires after a week even if you never do — so it never
+  lingers.
 
 ## [1.7.4] - 2026-07-20
 
@@ -748,11 +1143,11 @@ mini), and delivers the Reach track: P2P distribution + accessibility.
       input → exits source/manage view, in that order, never trapping
     - Two-step Esc on search (1st: hide dropdown, 2nd: clear input)
       is intentional so users can see results before discarding
-  - **Two-machine LAN test** — spun up a second Zimi instance on the
-    Mac (`10.0.0.229:9000`), bound to 0.0.0.0 with 3 ZIMs. Verified:
+  - **Two-machine LAN test** — spun up a second Zimi instance on a
+    LAN host (`:9000`), bound to 0.0.0.0 with 3 ZIMs. Verified:
     - `dns-sd -B _zimi._tcp local.` from a third device on the LAN
       sees both instances simultaneously
-    - NAS `/manage/peers` lists `zimi-Erics-iMac` with the right
+    - NAS `/manage/peers` lists the second host with the right
       host/port/zim-count
     - Mac `/manage/peers` lists `zimi-elpnas` (69 ZIMs)
     - 8 catalog cards on the Mac show clickable "📡 elpnas" pills

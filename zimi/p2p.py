@@ -1,18 +1,16 @@
-"""BitTorrent backend abstraction + bundled aria2c sidecar.
-
-Two backends share the same interface:
+"""BitTorrent engine: a single in-process libtorrent session.
 
   BTBackend (abstract)
-    Aria2Backend       — bundled aria2c subprocess via JSON-RPC
-    QBittorrentBackend — talks to an existing qBittorrent instance
-    TransmissionBackend, DelugeBackend — TBD, same interface
+    LibtorrentBackend — in-process libtorrent 2.0 session, no sidecar
 
-Selected via ZIMI_BT_BACKEND env var; default 'aria2'. BT-first
-downloads are ON by default so the install base shares distribution
-load with the Kiwix mirrors; ZIMI_TORRENT=0 opts out entirely.
+The interface stays abstract because the test fakes subclass it, but
+there is now exactly one real engine. BT-first downloads are ON by
+default so the install base shares distribution load with the Kiwix
+mirrors; ZIMI_TORRENT=0 opts out entirely.
 
-Smart defaults: if aria2c isn't on PATH, we log + skip silently rather
-than crashing. The HTTP path keeps working unchanged.
+Smart defaults: if libtorrent isn't importable on this install, we log
++ skip silently rather than crashing. The HTTP path keeps working
+unchanged — HTTP is the universal transport underneath.
 """
 
 from __future__ import annotations
@@ -20,12 +18,9 @@ from __future__ import annotations
 import json
 import logging
 import os
-import secrets
 import shutil
-import subprocess
 import threading
 import time
-import urllib.error
 import urllib.request
 from abc import ABC, abstractmethod
 from typing import Any
@@ -40,32 +35,6 @@ log = logging.getLogger(__name__)
 DEFAULT_BT_PORT = 6881
 DEFAULT_RATIO_CAP = 2.0
 DEFAULT_SEED_BANDWIDTH_KB = 2048  # 2 MB/s
-
-
-def find_aria2c() -> str | None:
-    """Locate aria2c. Desktop builds ship their own sidecar (checked
-    first, so a bundled aria2 wins over whatever's on the machine). GUI
-    apps on macOS launch with a bare PATH that misses Homebrew, so fall
-    back to the standard install locations after PATH."""
-    import sys as _sys
-
-    bundle_base = getattr(_sys, "_MEIPASS", None)
-    if bundle_base:
-        for name in ("aria2c", "aria2c.exe"):
-            cand = os.path.join(bundle_base, name)
-            if os.path.isfile(cand) and os.access(cand, os.X_OK):
-                return cand
-    found = shutil.which("aria2c")
-    if found:
-        return found
-    for candidate in (
-        "/usr/local/bin/aria2c",  # Homebrew (Intel)
-        "/opt/homebrew/bin/aria2c",  # Homebrew (Apple Silicon)
-        "/usr/bin/aria2c",  # Linux distro packages
-    ):
-        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
-            return candidate
-    return None
 
 
 def _bool_env(key: str, default: bool = False) -> bool:
@@ -134,7 +103,7 @@ def _read_pref(key: str, default):
     if not _prefs_path:
         return default
     try:
-        with open(_prefs_path) as f:
+        with open(_prefs_path, encoding="utf-8") as f:
             return json.load(f).get(key, default)
     except (OSError, ValueError):
         return default
@@ -148,7 +117,7 @@ def set_pref(key: str, value) -> bool:
     with _prefs_lock:
         prefs = {}
         try:
-            with open(_prefs_path) as f:
+            with open(_prefs_path, encoding="utf-8") as f:
                 prefs = json.load(f)
         except (OSError, ValueError):
             pass
@@ -156,7 +125,7 @@ def set_pref(key: str, value) -> bool:
         try:
             os.makedirs(os.path.dirname(_prefs_path), exist_ok=True)
             tmp = _prefs_path + ".tmp"
-            with open(tmp, "w") as f:
+            with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(prefs, f)
             os.replace(tmp, _prefs_path)
         except OSError as e:
@@ -174,7 +143,7 @@ def is_torrent_enabled() -> bool:
     """BT-first downloads are ON by default (v1.7.0) — every Zimi that can
     torrent takes load off the Kiwix mirrors. ZIMI_BT (or legacy
     ZIMI_TORRENT) wins and locks the UI switch; otherwise the persisted
-    UI preference. Installs without aria2c silently use HTTP."""
+    UI preference. Installs without libtorrent silently use HTTP."""
     conf = _bt_conf()
     if "enabled" in conf:
         return bool(conf["enabled"])
@@ -215,14 +184,6 @@ def get_staging_dir(data_dir: str) -> str:
     if explicit:
         return explicit
     return os.path.join(data_dir, "staging")
-
-
-def get_backend_name() -> str:
-    """Which BT backend to use. Default 'aria2'."""
-    conf = _bt_conf()
-    if conf.get("backend"):
-        return str(conf["backend"]).lower()
-    return os.environ.get("ZIMI_BT_BACKEND", "aria2").strip().lower()
 
 
 # ============================================================================
@@ -267,10 +228,10 @@ def is_seed_ratio_env_locked() -> bool:
     return "ratio" in _bt_conf() or _env_explicitly_set("ZIMI_SEED_RATIO")
 
 
-# Global BitTorrent bandwidth caps in KB/s, 0 = unlimited (aria2's default).
-# Applied to the whole aria2 process — downloads AND seeds, mirror included —
-# so one pair of numbers governs all sharing speed. ZIMI_BT's up=/down= fields
-# lock the UI field when set.
+# Global BitTorrent bandwidth caps in KB/s, 0 = unlimited. Applied to the
+# whole libtorrent session — downloads AND seeds, mirror included — so one
+# pair of numbers governs all sharing speed. ZIMI_BT's up=/down= fields lock
+# the UI field when set.
 def get_bt_up_limit_kb() -> int:
     raw = _bt_conf().get("up") or os.environ.get("ZIMI_BT_UP_KB")
     if raw in (None, ""):
@@ -300,7 +261,7 @@ def is_bt_down_env_locked() -> bool:
 
 
 def apply_rate_limits() -> None:
-    """Push the current up/down caps to a running sidecar (live, no respawn)."""
+    """Push the current up/down caps to the running session (live, no restart)."""
     backend = peek_backend()
     if backend is not None and hasattr(backend, "set_global_rate_limits"):
         try:
@@ -328,26 +289,8 @@ def get_disk_pressure_pct() -> int | None:
         return None
 
 
-def seed_options(*, ratio_cap: float, max_upload_kb: int) -> dict:
-    """aria2 per-torrent options for seeding behaviour.
-
-    ratio_cap=0 means leech-only (don't seed at all).
-    """
-    if ratio_cap <= 0:
-        return {
-            "seed-ratio": "0",
-            "seed-time": "0",
-            "bt-stop-timeout": "0",
-        }
-    return {
-        "seed-ratio": f"{ratio_cap:.1f}",
-        "seed-time": "0",  # cap by ratio, not time
-        "max-upload-limit": f"{int(max_upload_kb)}K",
-    }
-
-
 # ============================================================================
-# Mirror mode (W3.6) — opt-in "I'm an active mirror" flag that lifts the
+# Mirror mode — opt-in "I'm an active mirror" flag that lifts the
 # 2× ratio cap and raises upload bandwidth. Personal users keep the
 # default conservative caps; people running an actual public mirror
 # flip ZIMI_MIRROR=1 and accept they'll seed indefinitely.
@@ -463,18 +406,6 @@ def _mirror_progress_snapshot() -> dict:
         return {"phase": None, "done": 0, "total": 0}
 
 
-def effective_seed_options() -> dict:
-    """Per-torrent seed options: just the ratio cap (mirror lifts it).
-
-    Speed is NOT capped per-torrent — the global up/down limits
-    (get_bt_up_limit_kb / get_bt_down_limit_kb) govern total bandwidth for
-    downloads and seeds alike, so one BT-section control covers personal
-    seeding AND mirror. max_upload_kb=0 means per-torrent unlimited.
-    """
-    ratio = get_mirror_ratio_cap() if is_mirror_enabled() else get_seed_ratio_cap()
-    return seed_options(ratio_cap=ratio, max_upload_kb=0)
-
-
 def should_pause_for_disk_pressure(zim_dir: str) -> bool:
     """Pause all seeds when free space is critically low: below the
     absolute DISK_FLOOR_BYTES, or below ZIMI_SEED_DISK_PCT percent when
@@ -497,16 +428,16 @@ def should_pause_for_disk_pressure(zim_dir: str) -> bool:
 
 
 class BTBackend(ABC):
-    """Common surface across aria2 / qBittorrent / Transmission / Deluge.
+    """The engine surface the rest of Zimi knows about.
 
-    The rest of zimi only knows about this interface. Each backend
-    implementation is opt-in via ZIMI_BT_BACKEND.
+    Kept abstract so the test fakes can subclass a stable contract, but
+    LibtorrentBackend is the only real implementation.
     """
 
     @abstractmethod
     def available(self) -> bool:
-        """Is this backend usable? aria2 → binary on PATH; qBT → API
-        reachable. Called at startup to fail-soft to HTTP."""
+        """Is this backend usable? (libtorrent importable and its session
+        starts.) Called at startup to fail-soft to HTTP."""
 
     @abstractmethod
     def add_torrent(
@@ -557,353 +488,515 @@ class BTBackend(ABC):
 
 
 # ============================================================================
-# aria2 sidecar — the bundled default
+# libtorrent — the in-process engine (v1.8+)
 # ============================================================================
 
+_lt_module = None
+_lt_import_failed = False
 
-class Aria2Backend(BTBackend):
-    """Manages a long-lived `aria2c` subprocess via its JSON-RPC interface.
+# .torrent metadata fetches: bounded so a hostile/misbehaving URL can't
+# balloon memory. Real Kiwix .torrent files are tens of KB.
+TORRENT_FETCH_TIMEOUT_S = 30
+TORRENT_FETCH_MAX_BYTES = 10 * 1024 * 1024
 
-    Lifecycle:
-      ensure_running()         start subprocess if not already up
-      _rpc(method, params)     thin client with bounded retries
-      stop()                   graceful shutdown on Zimi exit
+# How long the alert pump blocks per iteration. Also the unit the fastresume
+# checkpoint cadence counts in, so the two must be read together.
+ALERT_TICK_S = 1.0
+# Fastresume checkpoint cadence, in alert-loop ticks. Without a periodic save,
+# resume data is only written on a clean stop(); a hard kill (power loss,
+# `docker kill`) would then force a full re-hash/re-download of every in-flight
+# torrent. At the default tick that is about a minute of at-most-lost progress.
+RESUME_SAVE_TICKS = 60
 
-    Survives aria2 crashes via session-file resume. Listens only on
-    localhost — never expose the RPC port externally.
+
+def _lt():
+    """Import libtorrent lazily; None when unavailable (→ HTTP floor).
+
+    Not a hard dependency: the PyPI package has patchy wheel coverage
+    (nothing for 3.13+/some platforms). Docker installs it; pip installs
+    of zimi work without it and simply don't torrent.
+    """
+    global _lt_module, _lt_import_failed
+    if _lt_module is not None:
+        return _lt_module
+    if _lt_import_failed:
+        return None
+    try:
+        import libtorrent
+
+        _lt_module = libtorrent
+    except ImportError:
+        _lt_import_failed = True
+        log.info("libtorrent not importable — BT off, downloads use HTTP")
+        return None
+    return _lt_module
+
+
+class LibtorrentBackend(BTBackend):
+    """In-process libtorrent session. One engine, no sidecar. Torrent ids are
+    v1 info-hash hex.
+
+    list_managed() entries are the contract library.py and manage.py parse:
+    gid/status/files/completedLength/uploadLength/totalLength/infoHash/seeder.
+    The string-typed values are load-bearing for those parsers — `seeder` is
+    "true"/"false" and `completedLength` is a str byte count.
     """
 
-    def __init__(
-        self,
-        *,
-        bt_port: int,
-        rpc_port: int = 6800,
-        data_dir: str,
-        staging_dir: str,
-    ) -> None:
+    def __init__(self, *, bt_port: int, data_dir: str, staging_dir: str) -> None:
         self.bt_port = bt_port
-        self.rpc_port = rpc_port
         self.data_dir = data_dir
         self.staging_dir = staging_dir
         self.bt_dir = os.path.join(data_dir, "bt")
-        self.session_path = os.path.join(self.bt_dir, "session")
-        self.torrents_dir = os.path.join(self.bt_dir, "torrents")
-        # 32 hex chars; localhost-only but still nice to require it
-        self.rpc_secret = secrets.token_hex(16)
-        self._proc: subprocess.Popen | None = None
+        self.resume_dir = os.path.join(self.bt_dir, "resume")
+        self._ses = None
+        self._handles: dict[str, Any] = {}
         self._lock = threading.Lock()
+        self._alert_stop = threading.Event()
+        self._alert_thread: threading.Thread | None = None
 
-    # ── availability check ────────────────────────────────────────────────
+    # ── availability / lifecycle ──────────────────────────────────────────
 
     def available(self) -> bool:
-        """True if `aria2c` is on PATH and we can reach its RPC."""
-        if not find_aria2c():
+        if _lt() is None:
             return False
         try:
-            self._spawn_with_fallback()
-            # Round-trip the RPC to confirm it actually responds
-            self._rpc("aria2.getVersion", [])
+            self._ensure_session()
             return True
         except Exception as e:
-            log.warning("aria2 not available: %s", e)
+            log.warning("libtorrent session failed to start: %s", e)
             return False
 
-    # ── lifecycle ─────────────────────────────────────────────────────────
+    def is_alive(self) -> bool:
+        return self._ses is not None
 
     def ensure_running(self) -> None:
+        self._ensure_session()
+
+    def _ensure_session(self) -> None:
         with self._lock:
-            if self._proc and self._proc.poll() is None:
-                return  # already running
-            os.makedirs(self.bt_dir, exist_ok=True)
-            os.makedirs(self.torrents_dir, exist_ok=True)
-            os.makedirs(self.staging_dir, exist_ok=True)
-            args = [
-                find_aria2c() or "aria2c",
-                "--enable-rpc",
-                "--rpc-listen-all=false",
-                f"--rpc-listen-port={self.rpc_port}",
-                f"--rpc-secret={self.rpc_secret}",
-                f"--listen-port={self.bt_port}",
-                f"--dht-listen-port={self.bt_port}",
-                # Seed-cap policy comes via per-torrent options on add_torrent.
-                f"--enable-dht={'true' if is_dht_enabled() else 'false'}",
-                # Persisted routing table: rejoining swarms after a restart
-                # doesn't depend on bootstrap nodes being reachable.
-                f"--dht-file-path={os.path.join(self.bt_dir, 'dht.dat')}",
-                "--enable-peer-exchange=true",
-                f"--dir={self.staging_dir}",
-                f"--save-session={self.session_path}",
-                "--save-session-interval=30",
-                # Resume from session file on restart
-                *(
-                    ["--input-file", self.session_path]
-                    if os.path.exists(self.session_path)
-                    else []
-                ),
-                "--continue=true",
-                "--max-connection-per-server=4",
-                "--seed-ratio=0",  # default no auto-seed; per-torrent overrides
-                "--bt-stop-timeout=0",
-                "--summary-interval=0",
-                "--quiet=true",
-                # Global bandwidth caps (0 = unlimited). One pair governs all
-                # traffic — downloads, seeds, mirror — changeable live via RPC.
-                f"--max-overall-upload-limit={get_bt_up_limit_kb()}K",
-                f"--max-overall-download-limit={get_bt_down_limit_kb()}K",
-            ]
-            log.info("Starting aria2c on rpc:%d, bt:%d", self.rpc_port, self.bt_port)
-            # Bundled aria2c (desktop builds): its relocated libcrypto must
-            # load OpenSSL provider modules from the bundle, not from a
-            # Homebrew path baked in at build time (absent on user machines
-            # -> "OSSL_PROVIDER_load 'legacy' failed" and instant death).
-            env = None
-            binary = args[0]
-            modules_dir = os.path.join(os.path.dirname(binary), "ossl-modules")
-            if os.path.isdir(modules_dir):
-                env = dict(os.environ, OPENSSL_MODULES=modules_dir)
-            self._proc = subprocess.Popen(
-                args, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, env=env
-            )
-            # Wait briefly for RPC to come up. Deadline-based with short
-            # probe timeouts: a squatted RPC port (half-dead aria2 from
-            # another process) must fail here in seconds, not stretch into
-            # 30 probes x 5s default timeout — that once blocked startup
-            # for minutes before READY.
-            deadline = time.monotonic() + 5.0
-            last_err: Exception | None = None
-            while time.monotonic() < deadline:
-                if self._proc.poll() is not None:
-                    err = b""
-                    try:
-                        if self._proc.stderr:
-                            err = self._proc.stderr.read()
-                    except OSError:
-                        pass
-                    raise RuntimeError(
-                        f"aria2c exited at startup (rpc port {self.rpc_port} "
-                        f"or bt port {self.bt_port} in use?): "
-                        f"{err.decode(errors='replace').strip()[:300]}"
-                    )
-                try:
-                    self._rpc("aria2.getVersion", [], timeout=0.5)
-                    log.info("aria2c ready on port %d", self.rpc_port)
-                    return
-                except Exception as e:
-                    last_err = e
-                    time.sleep(0.1)
-            raise RuntimeError(f"aria2c failed to start within 5s: {last_err}")
-
-    def _spawn_with_fallback(self) -> None:
-        """ensure_running, walking alternate RPC ports when the default is
-        squatted. One retry wasn't enough on real desktops: a desktop app
-        plus a docker instance plus a dev server is three sidecars, and
-        orphans from crashed quits squat ports too."""
-        last: RuntimeError | None = None
-        for attempt in range(5):
-            if attempt:
-                with self._lock:
-                    if self._proc is not None:
-                        try:
-                            self._proc.terminate()
-                        except Exception:
-                            pass
-                        self._proc = None
-                self.rpc_port += 13
-                log.info("aria2 RPC port busy; retrying on %d", self.rpc_port)
-            try:
-                self.ensure_running()
+            if self._ses is not None:
                 return
-            except RuntimeError as e:
-                last = e
-        raise last if last else RuntimeError("aria2 spawn failed")
-
-    def is_alive(self) -> bool:
-        """Non-spawning liveness check. A crashed/killed aria2 left the cached
-        singleton in place, so the status view reported 'sidecar_running' from
-        mere object existence and painted a green dot over a dead engine. Poll
-        the process handle instead — never starts aria2."""
-        proc = self._proc
-        return proc is not None and proc.poll() is None
+            lt = _lt()
+            if lt is None:
+                raise RuntimeError("libtorrent not importable")
+            os.makedirs(self.resume_dir, exist_ok=True)
+            os.makedirs(self.staging_dir, exist_ok=True)
+            settings = {
+                "listen_interfaces": f"0.0.0.0:{self.bt_port},[::]:{self.bt_port}",
+                "enable_dht": is_dht_enabled(),
+                "enable_upnp": is_upnp_enabled(),
+                "enable_natpmp": is_upnp_enabled(),
+                "upload_rate_limit": get_bt_up_limit_kb() * 1024,
+                "download_rate_limit": get_bt_down_limit_kb() * 1024,
+                # port_mapping category surfaces UPnP/NAT-PMP success or
+                # failure — the single most useful signal for "why is BT slow":
+                # a node that never maps its port is not connectable and starves
+                # on a thin swarm. The enum's name varies across libtorrent
+                # versions (and the test double omits it), so resolve it
+                # defensively — 0 is a harmless no-op when it's absent.
+                "alert_mask": (
+                    lt.alert.category_t.status_notification
+                    | lt.alert.category_t.error_notification
+                    | lt.alert.category_t.storage_notification
+                    | getattr(lt.alert.category_t, "port_mapping_notification", 0)
+                    | getattr(lt.alert.category_t, "port_mapping", 0)
+                ),
+            }
+            self._ses = lt.session(settings)
+            log.info("libtorrent session up (bt port %d)", self.bt_port)
+            self._load_resume_files(lt)
+            self._alert_stop.clear()
+            self._alert_thread = threading.Thread(
+                target=self._alert_loop, name="lt-alerts", daemon=True
+            )
+            self._alert_thread.start()
 
     def stop(self) -> None:
+        # Snapshot and clear handles under the same lock that takes the
+        # session, so a concurrent add_torrent() can't start a fresh
+        # session and then have its handle wiped by an unlocked clear().
+        # (A post-stop add_torrent re-runs _ensure_session() cleanly.)
         with self._lock:
-            if not self._proc:
-                return
+            ses, self._ses = self._ses, None
+            handles = dict(self._handles)
+            self._handles.clear()
+        if ses is None:
+            return
+        self._alert_stop.set()
+        if self._alert_thread is not None:
+            self._alert_thread.join(timeout=2)
+        # Ask every handle for resume data, then drain the alerts that
+        # carry it — this is what makes restarts not re-download.
+        pending = 0
+        for h in handles.values():
             try:
-                self._rpc("aria2.shutdown", [])
-                self._proc.wait(timeout=5)
+                if h.is_valid():
+                    h.save_resume_data()
+                    pending += 1
             except Exception:
-                self._proc.terminate()
-                try:
-                    self._proc.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    self._proc.kill()
-            self._proc = None
+                pass
+        deadline = time.monotonic() + 5.0
+        while pending > 0 and time.monotonic() < deadline:
+            for alert in ses.pop_alerts():
+                name = alert.what()
+                if name == "save_resume_data":
+                    self._write_resume_file(alert)
+                    pending -= 1
+                elif name == "save_resume_data_failed":
+                    pending -= 1
+            time.sleep(0.05)
 
-    # ── RPC client ────────────────────────────────────────────────────────
+    # ── resume persistence ────────────────────────────────────────────────
 
-    def _rpc(self, method: str, params: list, timeout: float = 5.0) -> Any:
-        """Single JSON-RPC call. Raises on transport or RPC error."""
-        body = json.dumps(
-            {
-                "jsonrpc": "2.0",
-                "id": secrets.token_hex(4),
-                "method": method,
-                "params": [f"token:{self.rpc_secret}", *params],
-            }
-        ).encode("utf-8")
-        req = urllib.request.Request(
-            f"http://127.0.0.1:{self.rpc_port}/jsonrpc",
-            data=body,
-            headers={"Content-Type": "application/json"},
-        )
+    def _resume_path(self, tid: str) -> str:
+        return os.path.join(self.resume_dir, tid + ".fastresume")
+
+    def _write_resume_file(self, alert) -> None:
+        lt = _lt()
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                data = json.loads(resp.read())
-        except (urllib.error.URLError, ConnectionError, OSError) as e:
-            raise RuntimeError(f"aria2 RPC transport error: {e}") from e
-        if "error" in data:
-            raise RuntimeError(f"aria2 RPC error: {data['error']}")
-        return data.get("result", {})
+            tid = str(alert.params.info_hashes.v1)
+            buf = lt.write_resume_data_buf(alert.params)
+            tmp = self._resume_path(tid) + ".tmp"
+            with open(tmp, "wb") as f:
+                f.write(buf)
+            os.replace(tmp, self._resume_path(tid))
+        except Exception as e:
+            log.debug("resume-data write failed: %s", e)
+
+    def _load_resume_files(self, lt) -> None:
+        try:
+            names = os.listdir(self.resume_dir)
+        except OSError:
+            return
+        for name in names:
+            if not name.endswith(".fastresume"):
+                continue
+            path = os.path.join(self.resume_dir, name)
+            try:
+                with open(path, "rb") as f:
+                    atp = lt.read_resume_data(f.read())
+                h = self._ses.add_torrent(atp)
+                self._handles[str(atp.info_hashes.v1)] = h
+            except Exception as e:
+                log.warning("stale resume file %s dropped: %s", name, e)
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+
+    # ── alert pump ────────────────────────────────────────────────────────
+
+    def _alert_loop(self) -> None:
+        ticks = 0
+        while not self._alert_stop.wait(ALERT_TICK_S):
+            ticks += 1
+            try:
+                self._pump_alerts_once()
+                # Checkpoint fastresume periodically, not just on stop(),
+                # so a hard kill costs at most RESUME_SAVE_TICKS of progress
+                # instead of a full re-hash on next start.
+                if ticks % RESUME_SAVE_TICKS == 0:
+                    self._request_resume_saves()
+            except Exception as e:
+                log.debug("alert pump error: %s", e)
+
+    def _request_resume_saves(self) -> None:
+        """Ask libtorrent to emit resume-data alerts for handles that
+        changed since their last save. The alerts are picked up by the
+        normal pump and written to disk — this method only requests.
+
+        Extracted from the loop so tests can drive one checkpoint without
+        waiting a real minute for the tick."""
+        lt = _lt()
+        if lt is None:
+            return
+        # save_info_dict rewrites the (rarely-changing) torrent metadata
+        # too; absent on older builds, in which case a plain save is fine.
+        flags = getattr(lt.torrent_handle, "save_info_dict", 0)
+        with self._lock:
+            handles = list(self._handles.values())
+        for h in handles:
+            try:
+                if not h.is_valid():
+                    continue
+                # need_save_resume_data() is the state gate: it skips
+                # handles with nothing new to persist (and metadata-less
+                # magnets whose save would just fail). Older APIs lack it —
+                # save unconditionally there.
+                if (
+                    hasattr(h, "need_save_resume_data")
+                    and not h.need_save_resume_data()
+                ):
+                    continue
+                h.save_resume_data(flags)
+            except Exception as e:
+                log.debug("periodic resume save skipped for a handle: %s", e)
+
+    def _pump_alerts_once(self) -> None:
+        ses = self._ses
+        if ses is None:
+            return
+        for alert in ses.pop_alerts():
+            name = alert.what()
+            if name == "save_resume_data":
+                self._write_resume_file(alert)
+            elif name == "portmap":
+                # UPnP/NAT-PMP mapped our port — we're now connectable.
+                log.info("BT port mapped (connectable): %s", alert.message())
+            elif name == "portmap_error":
+                # Mapping failed — inbound peers can't reach us; expect slow
+                # peer acquisition on thin swarms. Surface it so it's diagnosable.
+                log.warning(
+                    "BT port mapping failed (not connectable): %s", alert.message()
+                )
 
     # ── BTBackend impl ────────────────────────────────────────────────────
 
     def add_torrent(
         self, source: str, *, dest_dir: str, options: dict | None = None
     ) -> str:
-        """source can be a URL to a .torrent, a magnet, or http(s) URL.
+        lt = _lt()
+        self._ensure_session()
+        if source.startswith("magnet:"):
+            atp = lt.parse_magnet_uri(source)
+        elif source.startswith(("http://", "https://")):
+            atp = lt.load_torrent_buffer(self._fetch_torrent_bytes(source))
+        else:
+            atp = lt.load_torrent_file(source)
+        atp.save_path = dest_dir
+        # No auto_managed: Zimi is the manager (ledger enforces caps,
+        # policy passes stop seeds). Auto-management would resurrect
+        # paused torrents behind our back.
+        atp.flags &= ~lt.torrent_flags.auto_managed
+        # Default add_torrent_params flags set BOTH auto_managed AND paused;
+        # libtorrent's auto-manager is what normally unpauses. With auto_managed
+        # stripped, nothing unpauses it, so an added torrent would sit paused
+        # forever (never downloads, never seeds). Clear paused so it starts;
+        # Zimi drives pause()/resume() explicitly from here on.
+        atp.flags &= ~lt.torrent_flags.paused
+        tid = str(atp.info_hashes.v1)
+        with self._lock:
+            if tid in self._handles and self._handles[tid].is_valid():
+                return tid  # duplicate add — already managed
+            self._handles[tid] = self._add_resolving_duplicate(atp, dest_dir)
+        return tid
 
-        For .torrent URLs, aria2.addUri pulls the metadata then starts the
-        BT swarm. dest_dir is where the final file lands (we use staging
-        and rename later — aria2 writes here directly).
-        """
-        opts = {"dir": dest_dir, "allow-overwrite": "false"}
-        if options:
-            opts.update(options)
-        return self._rpc("aria2.addUri", [[source], opts])
+    # A staging seed that was just remove()d still holds its info-hash for a
+    # brief window: libtorrent's remove_torrent is async, so re-adding the
+    # same hash at the library path (post-download reseed, library.py) raises
+    # "duplicate" while find_torrent still returns the STILL-REMOVING staging
+    # handle — whose save_path points at staging, not the library dir. Adopting
+    # it means the file silently never seeds until the next restart. Wait the
+    # removing handle out instead, adopting only a handle that already sits at
+    # the destination.
+    _DUP_RETRY_ATTEMPTS = 20
+    _DUP_RETRY_SLEEP_S = 0.1
+
+    def _add_resolving_duplicate(self, atp, dest_dir: str):
+        """Add atp, tolerating the async-remove duplicate window.
+
+        Retries the add until it succeeds (the removing handle finally
+        clears) or a found handle is confirmed to already live at dest_dir.
+        Caller holds self._lock."""
+        want = os.path.realpath(dest_dir)
+        last_exc: Exception | None = None
+        for _ in range(self._DUP_RETRY_ATTEMPTS):
+            try:
+                return self._ses.add_torrent(atp)
+            except Exception as e:
+                last_exc = e
+                existing = self._ses.find_torrent(atp.info_hashes.v1)
+                if existing is not None and existing.is_valid():
+                    save_path = os.path.realpath(existing.status().save_path)
+                    if save_path == want:
+                        return existing  # genuinely already managed at dest
+                # No valid handle yet, or a stale removing handle at the wrong
+                # save_path — let the async remove finish, then retry the add.
+                time.sleep(self._DUP_RETRY_SLEEP_S)
+        # Window never closed. Adopt only if the survivor sits at dest.
+        existing = self._ses.find_torrent(atp.info_hashes.v1)
+        if (
+            existing is not None
+            and existing.is_valid()
+            and os.path.realpath(existing.status().save_path) == want
+        ):
+            return existing
+        raise last_exc if last_exc is not None else RuntimeError("add_torrent failed")
+
+    def _fetch_torrent_bytes(self, url: str) -> bytes:
+        """Bounded .torrent metadata fetch, done before the torrent joins the
+        session. Holding the full metadata up front is what makes 'complete'
+        unambiguously mean the *content* is complete — a two-phase add can
+        report complete on metadata alone and hand back a truncated ZIM."""
+        req = urllib.request.Request(url, headers={"User-Agent": "zimi"})
+        with urllib.request.urlopen(req, timeout=TORRENT_FETCH_TIMEOUT_S) as resp:
+            data = resp.read(TORRENT_FETCH_MAX_BYTES + 1)
+        if len(data) > TORRENT_FETCH_MAX_BYTES:
+            raise RuntimeError(f".torrent metadata too large from {url}")
+        return data
 
     def pause(self, tid: str) -> None:
-        self._rpc("aria2.pause", [tid])
+        h = self._handles.get(tid)
+        if h is not None and h.is_valid():
+            h.pause()
 
     def resume(self, tid: str) -> None:
-        self._rpc("aria2.unpause", [tid])
+        h = self._handles.get(tid)
+        if h is not None and h.is_valid():
+            h.resume()
 
     def remove(self, tid: str, *, delete_files: bool = False) -> None:
-        # aria2.remove only accepts active/waiting/paused GIDs — errored
-        # or completed ones raise. The result cleanup below is what
-        # actually clears those, so a failed remove must not abort it.
-        try:
-            self._rpc("aria2.remove", [tid])
-        except Exception:
-            pass
-        if delete_files:
+        """delete_files only ever deletes payload under the staging dir.
+
+        libtorrent's delete_files flag REALLY deletes, and mirror seeds point
+        at library ZIMs — passing it straight through would let
+        stop_mirror_seeds() erase the library. Staging partials are ours to
+        clean; library files never."""
+        lt = _lt()
+        with self._lock:
+            h = self._handles.pop(tid, None)
+        if h is not None and h.is_valid() and self._ses is not None:
+            in_staging = False
             try:
-                self._rpc("aria2.removeDownloadResult", [tid])
+                # realpath, not normpath: a symlink textually under staging
+                # but physically pointing outside must NOT count as staging,
+                # or it would defeat the library-payload delete guard.
+                save_path = os.path.realpath(h.status().save_path)
+                staging = os.path.realpath(self.staging_dir)
+                in_staging = save_path == staging or save_path.startswith(
+                    staging + os.sep
+                )
             except Exception:
                 pass
-
-    def get_options(self, tid: str) -> dict:
-        """Per-download options (seed-ratio etc.). Empty dict on error."""
+            flags = lt.session.delete_files if (delete_files and in_staging) else 0
+            try:
+                self._ses.remove_torrent(h, flags)
+            except Exception as e:
+                log.debug("remove_torrent failed for %s: %s", tid, e)
         try:
-            return self._rpc("aria2.getOption", [tid]) or {}
-        except Exception:
-            return {}
-
-    def change_options(self, tid: str, options: dict) -> bool:
-        """aria2.changeOption on a live transfer. seed-ratio is on aria2's
-        changeable-options list, so a running seed picks a new cap up
-        immediately (and stops itself if it's already past it)."""
-        try:
-            self._rpc(
-                "aria2.changeOption", [tid, {k: str(v) for k, v in options.items()}]
-            )
-            return True
-        except Exception:
-            return False
+            os.unlink(self._resume_path(tid))
+        except OSError:
+            pass
 
     def status(self, tid: str) -> dict:
-        raw = self._rpc("aria2.tellStatus", [tid])
-        # A .torrent-URL download is two-phase in aria2: the GID addUri
-        # returns is the tiny metadata fetch, and the content transfer
-        # continues under a followedBy GID. Report the followed transfer —
-        # otherwise the caller sees "complete" the moment the .torrent file
-        # lands and installs a preallocated, mostly-empty staging file.
-        # (This exact bug shipped corrupt ZIMs; see test_bt_followed_gid.)
-        depth = 0
-        while raw.get("status") == "complete" and raw.get("followedBy") and depth < 4:
-            raw = self._rpc("aria2.tellStatus", [raw["followedBy"][0]])
-            depth += 1
-        # aria2 keeps a finished torrent 'active' while it seeds — the
-        # download itself is done. Report 'complete' so the caller installs
-        # the file instead of waiting out the seed ratio; seeding continues
-        # inside aria2 either way.
-        raw_state = raw.get("status", "")
-        if raw_state == "active" and raw.get("seeder") in ("true", True):
-            raw_state = "complete"
-        state_map = {
-            "active": "downloading",
-            "waiting": "waiting",
-            "paused": "paused",
-            "error": "error",
-            "complete": "complete",
-            "removed": "removed",
-        }
-        completed = int(raw.get("completedLength", 0))
-        total = int(raw.get("totalLength", 0))
+        lt = _lt()
+        h = self._handles.get(tid)
+        if h is None or not h.is_valid():
+            return {
+                "state": "removed",
+                "gid": tid,
+                "completed_bytes": 0,
+                "total_bytes": 0,
+                "down_speed": 0,
+                "up_speed": 0,
+                "peers": 0,
+                "seeders": 0,
+                "ratio": 0.0,
+                "info_hash": tid,
+                "error_code": "",
+                "error_message": "",
+            }
+        s = h.status()
+        if s.errc.value() != 0:
+            state = "error"
+        elif bool(s.flags & lt.torrent_flags.paused):
+            state = "paused"
+        elif s.state in (lt.torrent_status.seeding, lt.torrent_status.finished):
+            # Content is done — the caller installs the file while seeding
+            # continues on the live handle.
+            state = "complete"
+        else:
+            # checking_files / downloading_metadata / downloading /
+            # checking_resume_data all present as in-progress.
+            state = "downloading"
+        total = int(s.total_wanted)
+        # Distinct from "downloading" so the delta-update path can wait for the
+        # hash check to finish before snapshotting the salvaged (reused) bytes.
+        # status() collapses checking into "downloading" for the progress UI;
+        # this flag exposes it without changing that contract.
+        checking = s.state in (
+            lt.torrent_status.checking_files,
+            lt.torrent_status.checking_resume_data,
+        )
         return {
-            "state": state_map.get(raw_state, "unknown"),
-            # Callers must rebind to this GID — pause/cancel/remove on the
-            # original metadata GID would not touch the content transfer.
-            "gid": raw.get("gid", tid),
-            "completed_bytes": completed,
+            "state": state,
+            "checking": checking,
+            "gid": tid,
+            "completed_bytes": int(s.total_done),
             "total_bytes": total,
-            "down_speed": int(raw.get("downloadSpeed", 0)),
-            "up_speed": int(raw.get("uploadSpeed", 0)),
-            "peers": int(raw.get("connections", 0)),
-            "seeders": int(raw.get("numSeeders", 0)) if "numSeeders" in raw else 0,
-            "ratio": float(raw.get("uploadLength", 0)) / max(total, 1),
-            "info_hash": raw.get("infoHash", ""),
-            "error_code": raw.get("errorCode", ""),
-            "error_message": raw.get("errorMessage", ""),
+            "down_speed": int(s.download_payload_rate),
+            "up_speed": int(s.upload_payload_rate),
+            "peers": int(s.num_peers),
+            "seeders": int(s.num_seeds),
+            "ratio": float(s.all_time_upload) / max(total, 1),
+            "info_hash": tid,
+            "error_code": str(s.errc.value()) if s.errc.value() else "",
+            "error_message": s.errc.message() if s.errc.value() else "",
         }
 
     def list_managed(self) -> list[dict]:
-        active = self._rpc("aria2.tellActive", [])
-        waiting = self._rpc("aria2.tellWaiting", [0, 1000])
-        stopped = self._rpc("aria2.tellStopped", [0, 1000])
-        return list(active) + list(waiting) + list(stopped)
+        lt = _lt()
+        out = []
+        for tid, h in list(self._handles.items()):
+            if not h.is_valid():
+                continue
+            try:
+                s = h.status()
+            except Exception:
+                continue
+            if s.errc.value() != 0:
+                status = "error"
+            elif bool(s.flags & lt.torrent_flags.paused):
+                status = "paused"
+            else:
+                status = "active"
+            ti = h.torrent_file()
+            files = []
+            total = int(s.total_wanted)
+            if ti is not None:
+                fs = ti.files()
+                files = [
+                    {"path": os.path.join(s.save_path, fs.file_path(i))}
+                    for i in range(fs.num_files())
+                ]
+                total = int(ti.total_size())
+            done = int(s.total_done)
+            wanted = int(s.total_wanted)
+            # Has all the data? Mirror status()'s completion test: the engine
+            # flags it seeding/finished, or the payload is fully in hand.
+            is_seeder = s.state in (
+                lt.torrent_status.seeding,
+                lt.torrent_status.finished,
+            ) or (wanted > 0 and done >= wanted)
+            out.append(
+                {
+                    "gid": tid,
+                    "status": status,
+                    "files": files,
+                    "completedLength": str(done),
+                    "uploadLength": str(int(s.all_time_upload)),
+                    "totalLength": str(total),
+                    "infoHash": tid,
+                    # manage.py tests `seeder in ("true", True)` — keep the
+                    # string form or seeding rows silently read as leechers.
+                    "seeder": "true" if is_seeder else "false",
+                }
+            )
+        return out
 
     def set_global_rate_limits(self, up_kb: int, down_kb: int) -> None:
-        """Change the overall up/down caps on the fly (0 = unlimited)."""
-        self._rpc(
-            "aria2.changeGlobalOption",
-            [
-                {
-                    "max-overall-upload-limit": f"{max(0, int(up_kb))}K",
-                    "max-overall-download-limit": f"{max(0, int(down_kb))}K",
-                }
-            ],
+        self._ensure_session()
+        self._ses.apply_settings(
+            {
+                "upload_rate_limit": max(0, int(up_kb)) * 1024,
+                "download_rate_limit": max(0, int(down_kb)) * 1024,
+            }
         )
 
     def purge_stopped(self, keep_errors: bool = True) -> None:
-        """Clear finished download results from aria2's session.
-
-        Completed/removed results are noise; errored ones are SIGNAL (a
-        snagged seed the user should see) and stay visible by default —
-        the seeding panel renders them as errors instead of hiding them.
-        Active seeds are never touched."""
-        try:
-            stopped = self._rpc("aria2.tellStopped", [0, 1000])
-        except Exception:
-            return
-        for raw in stopped:
-            status = raw.get("status", "")
-            if keep_errors and status == "error":
-                continue
-            try:
-                self._rpc("aria2.removeDownloadResult", [raw.get("gid", "")])
-            except Exception:
-                pass
+        """No-op: libtorrent has no stopped-results ledger to groom.
+        Finished downloads keep seeding on their live handle; policy
+        passes remove() them when a cap is hit."""
 
 
 # ============================================================================
@@ -916,48 +1009,31 @@ _backend_lock = threading.Lock()
 
 
 def get_backend(*, data_dir: str) -> BTBackend | None:
-    """Return the configured backend if available; None when off or unusable.
+    """Return the libtorrent backend, or None (→ HTTP floor).
 
-    Calls .available() exactly once on first access. If it fails (no aria2
-    on PATH, qBT unreachable), returns None and the HTTP path runs as
-    before. Smart-default behavior: never crashes Zimi for a BT problem.
+    None when: BT disabled, libtorrent unimportable on this install, or
+    the session fails to start. Never crashes Zimi for a BT problem —
+    HTTP is the universal transport underneath.
     """
     global _backend_singleton
     with _backend_lock:
-        # Checked before the singleton so the UI switch takes effect
-        # immediately — an already-running sidecar stops being used (and
-        # the toggle handler shuts it down).
         if not is_torrent_enabled():
             return None
         if _backend_singleton is not None:
             return _backend_singleton
-        name = get_backend_name()
-        bt_port = get_bt_port()
-        staging = get_staging_dir(data_dir)
-        if name == "aria2":
-            backend: BTBackend = Aria2Backend(
-                bt_port=bt_port,
-                data_dir=data_dir,
-                staging_dir=staging,
-            )
-        else:
-            log.warning("ZIMI_BT_BACKEND=%r not yet implemented; HTTP-only.", name)
-            return None
+        backend = LibtorrentBackend(
+            bt_port=get_bt_port(),
+            data_dir=data_dir,
+            staging_dir=get_staging_dir(data_dir),
+        )
         if not backend.available():
-            # available() may have spawned a sidecar before failing the RPC
-            # round-trip — reap it or it lingers and squats the RPC port
-            # for every later start (tests leaked these for exactly this
-            # reason and wedged CI smoke runs).
-            if isinstance(backend, Aria2Backend):
-                backend.stop()
-            log.warning(
-                "BT backend %r unavailable; downloads will use HTTP fallback. "
-                "(aria2c on PATH? port %d free?)",
-                name,
-                bt_port,
-            )
+            log.info("BT unavailable (libtorrent missing?) — HTTP downloads only")
             return None
-        log.info("BT backend %r ready on port %d (staging=%s)", name, bt_port, staging)
+        log.info(
+            "BT engine libtorrent ready on port %d (staging=%s)",
+            backend.bt_port,
+            backend.staging_dir,
+        )
         _backend_singleton = backend
         return backend
 
@@ -966,17 +1042,20 @@ def peek_backend() -> "BTBackend | None":
     """Return the already-running backend, or None — never starts one.
 
     Status views and ambient polls must use this instead of get_backend():
-    with BT on by default, get_backend() would spawn the sidecar (or retry
-    a missing binary) on every poll tick.
+    with BT on by default, get_backend() would start the session on every
+    poll tick.
     """
     with _backend_lock:
         return _backend_singleton
 
 
 def shutdown_backend() -> None:
-    """Stop the running sidecar (if any). Safe to call repeatedly."""
+    """Stop the running engine (if any). Safe to call repeatedly."""
     global _backend_singleton
     with _backend_lock:
-        if _backend_singleton and isinstance(_backend_singleton, Aria2Backend):
-            _backend_singleton.stop()
+        if _backend_singleton is not None:
+            try:
+                _backend_singleton.stop()
+            except Exception:
+                pass
         _backend_singleton = None

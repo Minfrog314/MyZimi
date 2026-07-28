@@ -13,10 +13,29 @@ function _jdToJulianCentury(JD) { return (JD - JD_J2000) / JULIAN_CENTURY; }
 
 var _ALM_LOC_KEY = 'zimi_almanac_location';
 
+// The almanac is EPHEMERAL: a chosen location lives for the session only, never
+// across a refresh. Purge any location persisted by an older build on load —
+// this also permanently retires the corrupted-longitude value the v1.7 hero-time
+// bug could have written to localStorage.
+try { localStorage.removeItem(_ALM_LOC_KEY); } catch (e) {}
+
+// A finite lat/lon inside its real range. A click-math slip or a legacy
+// corrupted value is rejected so it can never drive the sun/moon/timezone math.
+function _almValidLatLon(lat, lon) {
+  return typeof lat === 'number' && isFinite(lat) && lat >= -90 && lat <= 90 &&
+    typeof lon === 'number' && isFinite(lon) && lon >= -180 && lon <= 180;
+}
+
 function _getLocation() {
-  var stored = localStorage.getItem(_ALM_LOC_KEY);
+  var stored = null;
+  try { stored = sessionStorage.getItem(_ALM_LOC_KEY); } catch (e) {}
   if (stored) {
-    try { var loc = JSON.parse(stored); return { lat: loc.lat, lon: loc.lon, name: loc.name || '', stored: true }; } catch(e) {}
+    try {
+      var loc = JSON.parse(stored);
+      if (_almValidLatLon(loc.lat, loc.lon)) {
+        return { lat: loc.lat, lon: loc.lon, name: loc.name || '', stored: true };
+      }
+    } catch(e) {}
   }
   // Synthetic default: mid-northern latitude at the device offset's rough
   // meridian. Good enough for sun/moon shapes — but callers formatting TIMES
@@ -36,9 +55,11 @@ function _almDisplayTz(loc) {
 }
 
 function _saveLocation(lat, lon, name) {
+  if (!_almValidLatLon(lat, lon)) return; // reject a bad click/geolocate outright
   var data = { lat: lat, lon: lon };
   if (name) data.name = name;
-  localStorage.setItem(_ALM_LOC_KEY, JSON.stringify(data));
+  // Session-only: a chosen location never survives a refresh (see _ALM_LOC_KEY).
+  try { sessionStorage.setItem(_ALM_LOC_KEY, JSON.stringify(data)); } catch (e) {}
   // Keep the timezone city list in sync with the new location — otherwise a
   // map click changes the sun/moon math while a stale city stays highlighted.
   _almSelectedTz = _almTzForLocation(lat, lon);
@@ -69,8 +90,30 @@ function _showerName(s) {
 var _CONST_KEYS = {'Pisces':'pisces','Aries':'aries','Taurus':'taurus','Gemini':'gemini','Cancer':'cancer','Leo':'leo','Virgo':'virgo','Libra':'libra','Scorpius':'scorpius','Sagittarius':'sagittarius','Capricornus':'capricornus','Aquarius':'aquarius','Bo\u00f6tes':'bootes','Lyra':'lyra','Perseus':'perseus','Draco':'draco','Orion':'orion','Ursa Minor':'ursa_minor'};
 function _tc(name) { var k = _CONST_KEYS[name]; return k ? _tLookup('alm_const_' + k, name) : name; }
 
+// Deep-link wrappers \u2014 turn a localized label into a tappable encyclopedia
+// link when the library has a matching ZIM (fail-soft: plain text otherwise).
+// Only call these at DOM (innerHTML) render sites, never inside canvas draws.
+function _alLink(key, html) {
+  return window.AlmanacLinks ? window.AlmanacLinks.wrap(key, html) : html;
+}
+function _lp(name) { var s = _tp(name); return _alLink('planet:' + name.toLowerCase(), s); }
+function _lc(name) { var s = _tc(name); var k = _CONST_KEYS[name]; return k ? _alLink('const:' + k, s) : s; }
+// Link an astronomy/timekeeping TERM by its map suffix (key = 'term:<suffix>').
+// `html` is the already-localized, already-escaped display text.
+function _lterm(suffix, html) { return _alLink('term:' + suffix, html); }
+// Link a season by its article key ('winter'|'spring'|'summer'|'autumn').
+function _lseason(key, html) { return key ? _alLink('season:' + key, html) : html; }
+// Link a Messages Across Time inscription by its manifest id (key = 'rosetta:<id>').
+function _lrosetta(id, html) { return id ? _alLink('rosetta:' + id, html) : html; }
+
 function _dayOfYear(date) {
-  var start = new Date(date.getFullYear(), 0, 1);
+  // setFullYear, not new Date(year,…): the constructor folds years 0–99 into
+  // 1900–1999, which turns Jan 1 of an ancient/typed year into a date ~2000
+  // years off and makes day-of-year wildly negative. Reachable now that the
+  // time machine travels to arbitrary years.
+  var start = new Date(0);
+  start.setFullYear(date.getFullYear(), 0, 1);
+  start.setHours(0, 0, 0, 0);
   return Math.floor((date - start) / MS_PER_DAY) + 1;
 }
 
@@ -108,6 +151,12 @@ document.addEventListener('visibilitychange', function() {
   }
 });
 
+// When an in-almanac deep link opens an article, we suspend the almanac (hide
+// it so the reader shows) but KEEP its #almanac history entry, and stash the
+// scroll offset here so Back — browser or in-app — returns to the same spot.
+// null means "the open reader did not originate in the almanac".
+var _almReturnScroll = null;
+
 function _openAlmanacInner(replaceState) {
   _almanacOpen = true;
   document.body.classList.add('almanac-mode');
@@ -116,6 +165,8 @@ function _openAlmanacInner(replaceState) {
   else history.pushState({ mode: 'almanac' }, '', url);
   var el = document.getElementById('almanac-view');
   el.classList.add('open');
+  // Deep-links: fresh library check per open, and one delegated tap handler.
+  if (window.AlmanacLinks) { window.AlmanacLinks.reset(); window.AlmanacLinks.bind(el); }
   var mv = document.getElementById('main-view');
   if (mv) mv.classList.add('hidden');
   _setWindowTitle('Almanac');
@@ -126,8 +177,10 @@ function _openAlmanacInner(replaceState) {
   _renderAlmanacContent();
 }
 
-function closeAlmanac() {
-  if (!_almanacOpen) return;
+// Shared visual/animation teardown for leaving the almanac. Does NOT touch
+// history — the caller decides whether to strip the #almanac entry (a real
+// close) or preserve it (a deep-link suspend that Back should return to).
+function _almanacTeardown() {
   _almanacOpen = false;
   document.body.classList.remove('almanac-mode');
   _cancelAllRAF();
@@ -142,14 +195,58 @@ function closeAlmanac() {
   document.getElementById('almanac-view').classList.remove('open');
   var mv = document.getElementById('main-view');
   if (mv) mv.classList.remove('hidden');
-  // Remove #almanac hash without adding history entry
-  if (location.hash === '#almanac') {
-    history.replaceState(history.state, '', location.pathname + location.search);
-  }
   _setWindowTitle('Zimi');
   if (typeof updateTopbar === 'function') updateTopbar();
   var qEl = document.getElementById('q');
   if (qEl) qEl.placeholder = t('search_placeholder');
+}
+
+function closeAlmanac() {
+  if (!_almanacOpen) return;
+  _almReturnScroll = null; // an explicit close cancels any pending return
+  _almanacTeardown();
+  // Remove #almanac hash without adding history entry
+  if (location.hash === '#almanac') {
+    history.replaceState(history.state, '', location.pathname + location.search);
+  }
+}
+
+// Suspend the almanac to open a deep-linked article: tear down the visuals but
+// leave the #almanac history entry intact so a Back returns here. Returns the
+// scroll offset to restore on return (the caller stamps it into _almReturnScroll
+// AFTER openArticle, since openArticle clears the flag for normal opens).
+function _suspendAlmanacForLink() {
+  var content = document.getElementById('almanac-content');
+  var sc = content ? content.scrollTop : 0;
+  if (_almanacOpen) _almanacTeardown();
+  return sc;
+}
+
+// Reopen the almanac after a Back from a deep-linked article and restore the
+// scroll offset. The current history entry is already the #almanac one, so we
+// reuse it (replaceState) rather than pushing a new one.
+function _reopenAlmanacFromLink() {
+  var target = _almReturnScroll;
+  _almReturnScroll = null;
+  _openAlmanacInner(true);
+  if (!target) return;
+  var content = document.getElementById('almanac-content');
+  if (!content) return;
+  // The drift bug: a fixed-delay restore could fire while the content was still
+  // short (canvases sizing, images decoding), so scrollTop clamped to a smaller
+  // maxScroll and landed a few pixels above the saved spot — and each round trip
+  // re-saved that drifted value. Instead, re-assert the offset every frame the
+  // content height is still changing, then once more when it settles. Bounded to
+  // ~1s so it never fights a later user scroll.
+  content.scrollTop = target;
+  var lastH = -1, stableFrames = 0, frames = 0;
+  (function settle() {
+    var h = content.scrollHeight;
+    if (h !== lastH) { lastH = h; stableFrames = 0; content.scrollTop = target; }
+    else { stableFrames++; }
+    if (++frames < 60 && stableFrames < 4) requestAnimationFrame(settle);
+    else content.scrollTop = target; // final assert once the height has settled
+  })();
 }
 
 // ── Timezone formatting ──
@@ -173,103 +270,103 @@ function _formatTimezone(lang, tz) {
 // "MM-DD" (1-based month, zero-padded). Purely static data so it works forever
 // with no network. Kept deliberately tight: iconic, verifiable events only.
 var _ON_THIS_DAY = {
-  '01-01': [{ y: 1801, t: 'Giuseppe Piazzi discovers Ceres from Palermo — the first asteroid, now a dwarf planet.' }],
-  '01-02': [{ y: 1959, t: 'The Soviet Luna 1 becomes the first spacecraft to escape Earth’s gravity.' }],
-  '01-03': [{ y: 2019, t: 'China’s Chang’e 4 makes the first-ever soft landing on the Moon’s far side.' }],
-  '01-04': [{ y: 1643, t: 'Isaac Newton is born in Lincolnshire (New Style calendar).' }],
-  '01-05': [{ y: 2005, t: 'Eris is discovered — the find that got Pluto reclassified as a dwarf planet.' }],
-  '01-07': [{ y: 1610, t: 'Galileo sees four points of light beside Jupiter — the first moons found around another planet.' }],
-  '01-14': [{ y: 2005, t: 'ESA’s Huygens probe lands on Titan, the most distant landing ever made.' }],
-  '01-23': [{ y: 1907, t: 'Hideki Yukawa is born in Tokyo; he predicted the meson and won Japan’s first Nobel Prize.' }],
-  '01-28': [{ y: 1986, t: 'Space Shuttle Challenger breaks apart 73 seconds after launch, killing all seven crew.' }],
-  '01-31': [{ y: 1958, t: 'Explorer 1 launches and discovers the Van Allen radiation belts.' }],
-  '02-07': [{ y: 1984, t: 'Bruce McCandless makes the first untethered spacewalk, flying free on a jetpack.' }],
-  '02-08': [{ y: 1834, t: 'Dmitri Mendeleev is born; his periodic table predicted elements nobody had found yet.' },
-             { y: 1865, t: 'Gregor Mendel presents his pea-plant experiments, founding genetics.' }],
-  '02-11': [{ y: 2016, t: 'LIGO announces the first direct detection of gravitational waves, from two merging black holes.' }],
-  '02-12': [{ y: 1809, t: 'Charles Darwin is born.' }],
-  '02-14': [{ y: 1990, t: 'Voyager 1 turns around and photographs Earth as a pale blue dot, 6 billion km away.' }],
-  '02-15': [{ y: 1564, t: 'Galileo Galilei is born in Pisa.' }],
-  '02-18': [{ y: 1930, t: 'Clyde Tombaugh discovers Pluto.' }],
-  '02-19': [{ y: 1473, t: 'Nicolaus Copernicus is born in Toruń — he moved the Sun to the centre.' }],
+  '01-01': [{ y: 1801, t: 'Giuseppe Piazzi discovers Ceres from Palermo — the first asteroid, now a dwarf planet.', w: 'ev:ceres' }],
+  '01-02': [{ y: 1959, t: 'The Soviet Luna 1 becomes the first spacecraft to escape Earth’s gravity.', w: 'ev:luna1' }],
+  '01-03': [{ y: 2019, t: 'China’s Chang’e 4 makes the first-ever soft landing on the Moon’s far side.', w: 'ev:change4' }],
+  '01-04': [{ y: 1643, t: 'Isaac Newton is born in Lincolnshire (New Style calendar).', w: 'ev:newton' }],
+  '01-05': [{ y: 2005, t: 'Eris is discovered — the find that got Pluto reclassified as a dwarf planet.', w: 'ev:eris' }],
+  '01-07': [{ y: 1610, t: 'Galileo sees four points of light beside Jupiter — the first moons found around another planet.', w: 'ev:jupiter' }],
+  '01-14': [{ y: 2005, t: 'ESA’s Huygens probe lands on Titan, the most distant landing ever made.', w: 'ev:titan' }],
+  '01-23': [{ y: 1907, t: 'Hideki Yukawa is born in Tokyo; he predicted the meson and won Japan’s first Nobel Prize.', w: 'ev:yukawa' }],
+  '01-28': [{ y: 1986, t: 'Space Shuttle Challenger breaks apart 73 seconds after launch, killing all seven crew.', w: 'ev:challenger' }],
+  '01-31': [{ y: 1958, t: 'Explorer 1 launches and discovers the Van Allen radiation belts.', w: 'ev:explorer1' }],
+  '02-07': [{ y: 1984, t: 'Bruce McCandless makes the first untethered spacewalk, flying free on a jetpack.', w: 'ev:mccandless' }],
+  '02-08': [{ y: 1834, t: 'Dmitri Mendeleev is born; his periodic table predicted elements nobody had found yet.', w: 'ev:mendeleev' },
+             { y: 1865, t: 'Gregor Mendel presents his pea-plant experiments, founding genetics.', w: 'ev:mendel' }],
+  '02-11': [{ y: 2016, t: 'LIGO announces the first direct detection of gravitational waves, from two merging black holes.', w: 'ev:ligo' }],
+  '02-12': [{ y: 1809, t: 'Charles Darwin is born.', w: 'ev:darwin' }],
+  '02-14': [{ y: 1990, t: 'Voyager 1 turns around and photographs Earth as a pale blue dot, 6 billion km away.', w: 'ev:voyager1' }],
+  '02-15': [{ y: 1564, t: 'Galileo Galilei is born in Pisa.', w: 'ev:galileogalilei' }],
+  '02-18': [{ y: 1930, t: 'Clyde Tombaugh discovers Pluto.', w: 'ev:pluto' }],
+  '02-19': [{ y: 1473, t: 'Nicolaus Copernicus is born in Toruń — he moved the Sun to the centre.', w: 'ev:copernicus' }],
   '02-20': [{ y: 1986, t: 'The Soviet Union launches the core of Mir, humanity’s home in orbit for 15 years.' }],
-  '02-24': [{ y: 1968, t: 'Jocelyn Bell Burnell’s discovery of pulsars is announced.' }],
-  '03-13': [{ y: 1781, t: 'William Herschel discovers Uranus — the first planet found with a telescope.' }],
-  '03-14': [{ y: 1879, t: 'Albert Einstein is born in Ulm.' }, { y: 2018, t: 'Stephen Hawking dies.' }],
-  '03-16': [{ y: 1926, t: 'Robert Goddard launches the first liquid-fuelled rocket.' }],
-  '03-18': [{ y: 1965, t: 'Alexei Leonov leaves his capsule for 12 minutes — the first spacewalk.' }],
-  '03-23': [{ y: 1882, t: 'Emmy Noether is born; her theorem ties every symmetry in physics to a conservation law.' },
+  '02-24': [{ y: 1968, t: 'Jocelyn Bell Burnell’s discovery of pulsars is announced.', w: 'ev:bellburnell' }],
+  '03-13': [{ y: 1781, t: 'William Herschel discovers Uranus — the first planet found with a telescope.', w: 'ev:uranus' }],
+  '03-14': [{ y: 1879, t: 'Albert Einstein is born in Ulm.', w: 'ev:einstein' }, { y: 2018, t: 'Stephen Hawking dies.', w: 'ev:hawking' }],
+  '03-16': [{ y: 1926, t: 'Robert Goddard launches the first liquid-fuelled rocket.', w: 'ev:goddard' }],
+  '03-18': [{ y: 1965, t: 'Alexei Leonov leaves his capsule for 12 minutes — the first spacewalk.', w: 'ev:leonov' }],
+  '03-23': [{ y: 1882, t: 'Emmy Noether is born; her theorem ties every symmetry in physics to a conservation law.', w: 'ev:noether' },
              { y: 2001, t: 'Mir is guided to a controlled fiery end over the Pacific.' }],
-  '04-12': [{ y: 1961, t: 'Yuri Gagarin orbits the Earth — the first human in space.' },
-             { y: 1981, t: 'The first Space Shuttle, Columbia, launches.' }],
-  '04-13': [{ y: 1970, t: 'An oxygen tank explodes aboard Apollo 13; the crew improvise their way home.' }],
-  '04-19': [{ y: 1971, t: 'The Soviet Union launches Salyut 1, the first space station.' }],
-  '04-24': [{ y: 1990, t: 'The Hubble Space Telescope launches aboard Discovery.' }],
-  '04-25': [{ y: 1953, t: 'Watson and Crick publish DNA’s double helix, built on Rosalind Franklin’s X-ray images.' }],
-  '05-05': [{ y: 1961, t: 'Alan Shepard makes a 15-minute suborbital hop, the first American in space.' }],
-  '05-08': [{ y: 1980, t: 'The WHO declares smallpox eradicated — the only human disease ever wiped out.' }],
-  '05-12': [{ y: 1910, t: 'Dorothy Hodgkin is born; she mapped penicillin, vitamin B12 and insulin by X-ray.' }],
-  '05-14': [{ y: 1796, t: 'Edward Jenner performs the first vaccination, against smallpox.' },
-             { y: 2021, t: 'China’s Zhurong rover lands on Mars.' }],
-  '05-25': [{ y: 1961, t: 'JFK challenges the U.S. to land a man on the Moon before the decade is out.' }],
-  '05-30': [{ y: 1975, t: 'The European Space Agency is founded, pooling the continent’s space programmes.' }],
-  '06-13': [{ y: 2010, t: 'Japan’s Hayabusa returns the first samples ever collected from an asteroid.' }],
-  '06-16': [{ y: 1963, t: 'Valentina Tereshkova becomes the first woman in space, alone for three days.' }],
-  '06-18': [{ y: 1983, t: 'Sally Ride becomes the first American woman in space.' }],
-  '06-23': [{ y: 1912, t: 'Alan Turing is born; he defined what a computer is before one existed.' }],
-  '06-26': [{ y: 2000, t: 'The first draft of the human genome is announced.' }],
-  '06-30': [{ y: 1908, t: 'A meteor explodes over Tunguska, Siberia, flattening 2,000 km² of forest.' }],
-  '07-04': [{ y: 1997, t: 'Mars Pathfinder lands, delivering Sojourner — the first rover on another planet.' },
-             { y: 2012, t: 'CERN announces the discovery of the Higgs boson.' }],
-  '07-14': [{ y: 2015, t: 'New Horizons flies past Pluto, revealing its heart-shaped plain.' }],
-  '07-15': [{ y: 1965, t: 'Mariner 4 sends back the first close-up photographs of Mars.' }],
-  '07-16': [{ y: 1969, t: 'Apollo 11 launches from Kennedy Space Center.' }],
-  '07-17': [{ y: 1894, t: 'Georges Lemaître is born in Belgium; the priest-physicist who proposed the expanding universe.' },
+  '04-12': [{ y: 1961, t: 'Yuri Gagarin orbits the Earth — the first human in space.', w: 'ev:gagarin' },
+             { y: 1981, t: 'The first Space Shuttle, Columbia, launches.', w: 'ev:columbia' }],
+  '04-13': [{ y: 1970, t: 'An oxygen tank explodes aboard Apollo 13; the crew improvise their way home.', w: 'ev:apollo13' }],
+  '04-19': [{ y: 1971, t: 'The Soviet Union launches Salyut 1, the first space station.', w: 'ev:salyut1' }],
+  '04-24': [{ y: 1990, t: 'The Hubble Space Telescope launches aboard Discovery.', w: 'ev:hubble' }],
+  '04-25': [{ y: 1953, t: 'Watson and Crick publish DNA’s double helix, built on Rosalind Franklin’s X-ray images.', w: 'ev:franklin' }],
+  '05-05': [{ y: 1961, t: 'Alan Shepard makes a 15-minute suborbital hop, the first American in space.', w: 'ev:shepard' }],
+  '05-08': [{ y: 1980, t: 'The WHO declares smallpox eradicated — the only human disease ever wiped out.', w: 'ev:smallpox' }],
+  '05-12': [{ y: 1910, t: 'Dorothy Hodgkin is born; she mapped penicillin, vitamin B12 and insulin by X-ray.', w: 'ev:hodgkin' }],
+  '05-14': [{ y: 1796, t: 'Edward Jenner performs the first vaccination, against smallpox.', w: 'ev:jenner' },
+             { y: 2021, t: 'China’s Zhurong rover lands on Mars.', w: 'ev:zhurong' }],
+  '05-25': [{ y: 1961, t: 'JFK challenges the U.S. to land a man on the Moon before the decade is out.', w: 'ev:jfk' }],
+  '05-30': [{ y: 1975, t: 'The European Space Agency is founded, pooling the continent’s space programmes.', w: 'ev:esa' }],
+  '06-13': [{ y: 2010, t: 'Japan’s Hayabusa returns the first samples ever collected from an asteroid.', w: 'ev:hayabusa' }],
+  '06-16': [{ y: 1963, t: 'Valentina Tereshkova becomes the first woman in space, alone for three days.', w: 'ev:tereshkova' }],
+  '06-18': [{ y: 1983, t: 'Sally Ride becomes the first American woman in space.', w: 'ev:sallyride' }],
+  '06-23': [{ y: 1912, t: 'Alan Turing is born; he defined what a computer is before one existed.', w: 'ev:turing' }],
+  '06-26': [{ y: 2000, t: 'The first draft of the human genome is announced.', w: 'ev:genome' }],
+  '06-30': [{ y: 1908, t: 'A meteor explodes over Tunguska, Siberia, flattening 2,000 km² of forest.', w: 'ev:tunguska' }],
+  '07-04': [{ y: 1997, t: 'Mars Pathfinder lands, delivering Sojourner — the first rover on another planet.', w: 'ev:pathfinder' },
+             { y: 2012, t: 'CERN announces the discovery of the Higgs boson.', w: 'ev:higgs' }],
+  '07-14': [{ y: 2015, t: 'New Horizons flies past Pluto, revealing its heart-shaped plain.', w: 'ev:newhorizons' }],
+  '07-15': [{ y: 1965, t: 'Mariner 4 sends back the first close-up photographs of Mars.', w: 'ev:mariner4' }],
+  '07-16': [{ y: 1969, t: 'Apollo 11 launches from Kennedy Space Center.', w: 'ev:apollo11' }],
+  '07-17': [{ y: 1894, t: 'Georges Lemaître is born in Belgium; the priest-physicist who proposed the expanding universe.', w: 'ev:lemaitre' },
              { y: 1975, t: 'Apollo and Soyuz dock in orbit — Cold War rivals shaking hands in space.' }],
-  '07-18': [{ y: 1921, t: 'John Glenn, first American to orbit Earth, is born.' }],
-  '07-20': [{ y: 1969, t: 'Apollo 11 lands on the Moon; Armstrong and Aldrin walk its surface.' },
-             { y: 1976, t: 'Viking 1 makes the first successful landing on Mars.' }],
-  '07-23': [{ y: 1995, t: 'Comet Hale–Bopp is discovered; it would dazzle the sky for 18 months.' }],
-  '08-06': [{ y: 2012, t: 'NASA’s Curiosity rover lands in Gale Crater on Mars.' },
-             { y: 2014, t: 'ESA’s Rosetta arrives at comet 67P after a ten-year chase.' }],
-  '08-12': [{ y: 1877, t: 'Asaph Hall discovers Mars’ moon Deimos; Phobos follows six days later.' }],
-  '08-23': [{ y: 2023, t: 'India’s Chandrayaan-3 lands near the lunar south pole, a first for any nation.' }],
-  '08-25': [{ y: 1989, t: 'Voyager 2 flies past Neptune — humanity’s first and only close visit.' },
-             { y: 2012, t: 'Voyager 1 becomes the first spacecraft to enter interstellar space.' }],
-  '09-05': [{ y: 1977, t: 'Voyager 1 launches, carrying the Golden Record.' }],
-  '09-10': [{ y: 2008, t: 'The Large Hadron Collider circulates its first beam beneath the Swiss–French border.' }],
-  '09-12': [{ y: 1959, t: 'Luna 2 launches; two days later it becomes the first craft to reach the Moon’s surface.' }],
-  '09-21': [{ y: 2003, t: 'Galileo is deliberately crashed into Jupiter, ending a 14-year mission.' }],
-  '09-23': [{ y: 1846, t: 'Neptune is found within a degree of where Le Verrier’s maths said it would be.' }],
-  '09-24': [{ y: 2014, t: 'India’s Mangalyaan reaches Mars orbit on its first attempt, for under $75 million.' }],
-  '09-28': [{ y: 1928, t: 'Alexander Fleming notices mould killing bacteria on a forgotten dish — penicillin.' }],
-  '10-04': [{ y: 1957, t: 'The Soviet Union launches Sputnik 1; the Space Age begins with a beep.' }],
-  '10-06': [{ y: 1995, t: 'Michel Mayor and Didier Queloz announce 51 Pegasi b, the first exoplanet at a Sun-like star.' }],
-  '10-07': [{ y: 1959, t: 'Luna 3 sends back the first photographs of the Moon’s far side.' }],
-  '10-15': [{ y: 1997, t: 'Cassini launches on its journey to Saturn.' },
-             { y: 2003, t: 'Yang Liwei orbits Earth aboard Shenzhou 5 — China’s first human spaceflight.' }],
-  '10-19': [{ y: 1910, t: 'Subrahmanyan Chandrasekhar is born in Lahore; he found the mass limit that makes black holes.' }],
-  '11-02': [{ y: 2000, t: 'The first crew moves into the ISS; humans have lived off Earth ever since.' }],
-  '11-03': [{ y: 1957, t: 'Laika launches aboard Sputnik 2, the first living creature to orbit Earth.' }],
-  '11-07': [{ y: 1867, t: 'Marie Skłodowska-Curie is born in Warsaw; still the only person to win Nobels in two sciences.' }],
-  '11-08': [{ y: 1656, t: 'Edmond Halley is born; he predicted a comet’s return and it kept the appointment.' },
-             { y: 1895, t: 'Wilhelm Röntgen discovers X-rays and photographs his wife’s hand.' }],
-  '11-09': [{ y: 1934, t: 'Carl Sagan is born.' }],
-  '11-12': [{ y: 2014, t: 'ESA’s Philae makes the first-ever soft landing on a comet.' }],
-  '11-20': [{ y: 1998, t: 'Zarya, the first module of the International Space Station, launches from Kazakhstan.' }],
-  '11-26': [{ y: 2011, t: 'The Curiosity rover launches toward Mars.' }],
-  '12-06': [{ y: 2020, t: 'Japan’s Hayabusa2 drops a capsule of asteroid Ryugu into the Australian outback.' }],
-  '12-10': [{ y: 1903, t: 'Marie Curie shares the Nobel Prize in Physics — the first awarded to a woman.' }],
-  '12-14': [{ y: 1972, t: 'Apollo 17’s crew leave the Moon — the last humans to walk there, so far.' }],
-  '12-15': [{ y: 1970, t: 'Venera 7 transmits from the surface of Venus, the first data from another planet.' }],
-  '12-17': [{ y: 1903, t: 'The Wright brothers fly for 12 seconds at Kitty Hawk.' }],
-  '12-21': [{ y: 1968, t: 'Apollo 8 launches, carrying the first humans to orbit the Moon.' }],
-  '12-22': [{ y: 1887, t: 'Srinivasa Ramanujan is born in Erode, India — self-taught, and still ahead of us.' }],
+  '07-18': [{ y: 1921, t: 'John Glenn, first American to orbit Earth, is born.', w: 'ev:glenn' }],
+  '07-20': [{ y: 1969, t: 'Apollo 11 lands on the Moon; Armstrong and Aldrin walk its surface.', w: 'ev:apollo11' },
+             { y: 1976, t: 'Viking 1 makes the first successful landing on Mars.', w: 'ev:viking1' }],
+  '07-23': [{ y: 1995, t: 'Comet Hale–Bopp is discovered; it would dazzle the sky for 18 months.', w: 'ev:halebopp' }],
+  '08-06': [{ y: 2012, t: 'NASA’s Curiosity rover lands in Gale Crater on Mars.', w: 'ev:curiosity' },
+             { y: 2014, t: 'ESA’s Rosetta arrives at comet 67P after a ten-year chase.', w: 'ev:rosetta' }],
+  '08-12': [{ y: 1877, t: 'Asaph Hall discovers Mars’ moon Deimos; Phobos follows six days later.', w: 'ev:deimos' }],
+  '08-23': [{ y: 2023, t: 'India’s Chandrayaan-3 lands near the lunar south pole, a first for any nation.', w: 'ev:chandrayaan3' }],
+  '08-25': [{ y: 1989, t: 'Voyager 2 flies past Neptune — humanity’s first and only close visit.', w: 'ev:voyager2' },
+             { y: 2012, t: 'Voyager 1 becomes the first spacecraft to enter interstellar space.', w: 'ev:voyager1' }],
+  '09-05': [{ y: 1977, t: 'Voyager 1 launches, carrying the Golden Record.', w: 'ev:goldenrecord' }],
+  '09-10': [{ y: 2008, t: 'The Large Hadron Collider circulates its first beam beneath the Swiss–French border.', w: 'ev:lhc' }],
+  '09-12': [{ y: 1959, t: 'Luna 2 launches; two days later it becomes the first craft to reach the Moon’s surface.', w: 'ev:luna2' }],
+  '09-21': [{ y: 2003, t: 'Galileo is deliberately crashed into Jupiter, ending a 14-year mission.', w: 'ev:galileoprobe' }],
+  '09-23': [{ y: 1846, t: 'Neptune is found within a degree of where Le Verrier’s maths said it would be.', w: 'ev:neptune' }],
+  '09-24': [{ y: 2014, t: 'India’s Mangalyaan reaches Mars orbit on its first attempt, for under $75 million.', w: 'ev:mangalyaan' }],
+  '09-28': [{ y: 1928, t: 'Alexander Fleming notices mould killing bacteria on a forgotten dish — penicillin.', w: 'ev:fleming' }],
+  '10-04': [{ y: 1957, t: 'The Soviet Union launches Sputnik 1; the Space Age begins with a beep.', w: 'ev:sputnik1' }],
+  '10-06': [{ y: 1995, t: 'Michel Mayor and Didier Queloz announce 51 Pegasi b, the first exoplanet at a Sun-like star.', w: 'ev:pegasi' }],
+  '10-07': [{ y: 1959, t: 'Luna 3 sends back the first photographs of the Moon’s far side.', w: 'ev:luna3' }],
+  '10-15': [{ y: 1997, t: 'Cassini launches on its journey to Saturn.', w: 'ev:cassini' },
+             { y: 2003, t: 'Yang Liwei orbits Earth aboard Shenzhou 5 — China’s first human spaceflight.', w: 'ev:shenzhou5' }],
+  '10-19': [{ y: 1910, t: 'Subrahmanyan Chandrasekhar is born in Lahore; he found the mass limit that makes black holes.', w: 'ev:chandrasekhar' }],
+  '11-02': [{ y: 2000, t: 'The first crew moves into the ISS; humans have lived off Earth ever since.', w: 'ev:iss' }],
+  '11-03': [{ y: 1957, t: 'Laika launches aboard Sputnik 2, the first living creature to orbit Earth.', w: 'ev:laika' }],
+  '11-07': [{ y: 1867, t: 'Marie Skłodowska-Curie is born in Warsaw; still the only person to win Nobels in two sciences.', w: 'ev:curie_pl' }],
+  '11-08': [{ y: 1656, t: 'Edmond Halley is born; he predicted a comet’s return and it kept the appointment.', w: 'ev:halley' },
+             { y: 1895, t: 'Wilhelm Röntgen discovers X-rays and photographs his wife’s hand.', w: 'ev:rontgen' }],
+  '11-09': [{ y: 1934, t: 'Carl Sagan is born.', w: 'ev:sagan' }],
+  '11-12': [{ y: 2014, t: 'ESA’s Philae makes the first-ever soft landing on a comet.', w: 'ev:philae' }],
+  '11-20': [{ y: 1998, t: 'Zarya, the first module of the International Space Station, launches from Kazakhstan.', w: 'ev:iss_full' }],
+  '11-26': [{ y: 2011, t: 'The Curiosity rover launches toward Mars.', w: 'ev:curiosity' }],
+  '12-06': [{ y: 2020, t: 'Japan’s Hayabusa2 drops a capsule of asteroid Ryugu into the Australian outback.', w: 'ev:hayabusa2' }],
+  '12-10': [{ y: 1903, t: 'Marie Curie shares the Nobel Prize in Physics — the first awarded to a woman.', w: 'ev:curie' }],
+  '12-14': [{ y: 1972, t: 'Apollo 17’s crew leave the Moon — the last humans to walk there, so far.', w: 'ev:apollo17' }],
+  '12-15': [{ y: 1970, t: 'Venera 7 transmits from the surface of Venus, the first data from another planet.', w: 'ev:venera7' }],
+  '12-17': [{ y: 1903, t: 'The Wright brothers fly for 12 seconds at Kitty Hawk.', w: 'ev:wright' }],
+  '12-21': [{ y: 1968, t: 'Apollo 8 launches, carrying the first humans to orbit the Moon.', w: 'ev:apollo8' }],
+  '12-22': [{ y: 1887, t: 'Srinivasa Ramanujan is born in Erode, India — self-taught, and still ahead of us.', w: 'ev:ramanujan' }],
   '12-24': [{ y: 1979, t: 'Europe’s first Ariane rocket lifts off from French Guiana.' }],
-  '12-25': [{ y: 1642, t: 'Isaac Newton is born (Old Style calendar).' },
-             { y: 2021, t: 'The James Webb Space Telescope launches from French Guiana.' }],
-  '12-27': [{ y: 1571, t: 'Johannes Kepler is born; he replaced circles with ellipses.' },
-             { y: 1831, t: 'Darwin sets sail on HMS Beagle.' }]
+  '12-25': [{ y: 1642, t: 'Isaac Newton is born (Old Style calendar).', w: 'ev:newton' },
+             { y: 2021, t: 'The James Webb Space Telescope launches from French Guiana.', w: 'ev:jwst' }],
+  '12-27': [{ y: 1571, t: 'Johannes Kepler is born; he replaced circles with ellipses.', w: 'ev:kepler' },
+             { y: 1831, t: 'Darwin sets sail on HMS Beagle.', w: 'ev:beagle' }]
 };
 
 // Return today's curated space/science events (array of {y, t}), or [] if none.
@@ -306,10 +403,46 @@ function _principalPhaseOnDay(cellJDN) {
 // the calendar. It's a full instant (not just a date) so a time-of-day picker
 // can drive the same path later.
 var _almFocus = null;
+// The focus instant the hero moon last rendered at, so a jump can sweep from
+// it. Seeded to "now" when the almanac first renders.
+var _almPrevFocusTime = null;
 function _almFocusInstant() { return _almFocus || new Date(); }
 function _almIsToday(d) {
   var n = new Date();
   return d.getFullYear() === n.getFullYear() && d.getMonth() === n.getMonth() && d.getDate() === n.getDate();
+}
+
+// Date, time and timezone strings for the hero header at a given instant,
+// plus the resolved location/zone the moon and sun cards reuse. One source of
+// truth so the full header render and the lightweight scrub updater
+// (_almScrubClock) read time identically.
+//
+// The live "now" header must always read the VIEWER's own local time: the
+// person is at their device, and "what time is it right now" is unambiguous. A
+// stored almanac location drives the sky/sun math, but its derived zone must
+// never override the live clock -- a stale or wrong-hemisphere stored location
+// (e.g. a western longitude persisted with the wrong sign) otherwise resolves
+// to a far-eastern zone and paints tomorrow morning onto today's sky. Only a
+// scrubbed (non-today) focus, which has no "now", keeps the location zone so
+// its date reads consistently with the panels below.
+function _almClockParts(focus) {
+  var loc = _getLocation();
+  var locTz = null;
+  try { locTz = _almDisplayTz(loc); } catch (e) {}
+  var live = _almIsToday(focus);
+  var deviceTz = null;
+  try { deviceTz = Intl.DateTimeFormat().resolvedOptions().timeZone; } catch (e) {}
+  var displayTz = live ? (deviceTz || locTz) : locTz;
+  var lang = (typeof _currentLang !== 'undefined') ? _currentLang : 'en';
+  var _dtOpts = { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' };
+  var _tmOpts = { hour: 'numeric', minute: '2-digit' };
+  if (displayTz) { _dtOpts.timeZone = displayTz; _tmOpts.timeZone = displayTz; }
+  return {
+    loc: loc, locTz: locTz, lang: lang, live: live,
+    date: focus.toLocaleDateString(lang, _dtOpts),
+    time: focus.toLocaleTimeString(lang, _tmOpts),
+    tz: _formatTimezone(lang, displayTz)
+  };
 }
 
 // Header, hero moon and the eight pills for a given instant. Re-rendered in
@@ -320,39 +453,21 @@ function _almHeadHtml(focus) {
   var dist = _moonDistance(focus);
   var age = (m.phase * 29.53).toFixed(1);
 
-  var loc = _getLocation();
-  // Times follow the CHOSEN location's zone; with no choice on record, the
-  // device's own zone (a synthetic default resolved to Denver and showed a
-  // fresh browser an hour-off clock).
-  var locTz = null;
-  try { locTz = _almDisplayTz(loc); } catch (e) {}
-  var lang = (typeof _currentLang !== 'undefined') ? _currentLang : 'en';
-  var _dtOpts = { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' };
-  var _tmOpts = { hour: 'numeric', minute: '2-digit' };
-  if (locTz) { _dtOpts.timeZone = locTz; _tmOpts.timeZone = locTz; }
-  var dateStr = focus.toLocaleDateString(lang, _dtOpts);
-  var timeStr = focus.toLocaleTimeString(lang, _tmOpts);
-  var tzName = _formatTimezone(lang, locTz);
-  var live = _almIsToday(focus);
+  var cp = _almClockParts(focus);
+  var loc = cp.loc, locTz = cp.locTz, lang = cp.lang;
 
   var html = '<div style="text-align:center;margin-bottom:16px">';
-  html += '<div style="font-size:22px;font-weight:600;color:var(--text)">' + dateStr + '</div>';
-  html += '<div style="font-size:16px;color:var(--text2);margin-top:4px">' + timeStr + (tzName ? ' &middot; ' + tzName : '') +
-    (live ? '' : ' <button class="alm-sc-reset" onclick="_almBackToToday()">' + _almEsc(t('alm_today')) + '</button>') + '</div>';
+  html += '<div id="almanac-head-date" style="font-size:22px;font-weight:600;color:var(--text)">' + cp.date + '</div>';
+  html += '<div style="font-size:16px;color:var(--text2);margin-top:4px"><span id="almanac-head-time" class="almanac-head-time-btn" onclick="_almTmShow()" role="button" tabindex="0" onkeydown="if(event.key===\'Enter\'||event.key===\' \'){event.preventDefault();_almTmShow();}" title="' + _almEsc(t('alm_tm_open')) + '" aria-label="' + _almEsc(t('alm_tm_open')) + '">' + cp.time + '</span>' + (cp.tz ? ' &middot; ' + cp.tz : '') +
+    (cp.live ? '' : ' <button class="alm-sc-reset" onclick="_almBackToToday()">' + _almEsc(t('alm_today')) + '</button>') + '</div>';
   html += '</div>';
 
   // Hero moon — tilted so the bright limb faces the Sun as the observer sees
-  // it. brightLimb (chi − q) is the right physical quantity, but the base
-  // moon art has its lit limb at 3 o'clock and CSS rotation runs opposite to
-  // the position-angle sense on screen, so the screen tilt is −(chi−q) − 90.
-  // Applying chi−q raw flipped the crescent to the wrong side of the disc (a
-  // waxing crescent after sunset lit upper-LEFT, away from the set Sun).
-  var moonPos = _moonPosition(focus, loc.lat, loc.lon);
-  var _limbPA = (moonPos.brightLimb != null ? moonPos.brightLimb : moonPos.parallactic) || 0;
-  var moonTilt = -_limbPA - 90;
+  // it (see _heroMoonTiltDeg for the sign derivation).
+  var moonTilt = _heroMoonTiltDeg(focus, loc);
   html += '<div class="almanac-hero">';
   html += _renderAlmanacMoon(m, moonTilt);
-  html += '<div class="almanac-moon-name">' + _localMoonName(m.name) + '</div>';
+  html += '<div class="almanac-moon-name">' + _lterm('lunar_phase', _localMoonName(m.name)) + '</div>';
   html += '</div>';
 
   // Sun cards render in the shown location's timezone (same locTz as the
@@ -371,7 +486,7 @@ function _almHeadHtml(focus) {
     var _nfmStr = _nfm.date.toLocaleDateString(lang, { month: 'short', day: 'numeric' });
     html += '<div class="alm-card"><div class="alm-card-lbl">' + t('alm_next_full') + '</div><div class="alm-card-val"' +
       (_nfm.isSuper ? ' style="color:#e0b060"' : '') + '>' + _nfmStr +
-      (_nfm.isSuper ? ' \u00b7 ' + t('alm_supermoon') : '') + '</div></div>';
+      (_nfm.isSuper ? ' \u00b7 ' + _lterm('supermoon', t('alm_supermoon')) : '') + '</div></div>';
   }
   if (sunInfo0.polar) {
     html += '<div class="alm-card" style="grid-column:span 4"><div class="alm-card-val">' + sunInfo0.polar + '</div></div>';
@@ -380,11 +495,27 @@ function _almHeadHtml(focus) {
     html += '<div class="alm-card"><div class="alm-card-lbl">' + t('alm_sunset') + '</div><div class="alm-card-val">' + sunInfo0.sunset + '</div></div>';
     html += '<div class="alm-card"><div class="alm-card-lbl">' + t('alm_daylight') + '</div><div class="alm-card-val">' + sunInfo0.dayLength + '</div></div>';
     if (sunInfo0.goldenHour) {
-      html += '<div class="alm-card"><div class="alm-card-lbl">' + t('alm_golden') + '</div><div class="alm-card-val" style="color:#d4aa64">' + sunInfo0.goldenHour + '</div></div>';
+      html += '<div class="alm-card"><div class="alm-card-lbl">' + _lterm('golden_hour', t('alm_golden')) + '</div><div class="alm-card-val" style="color:#d4aa64">' + sunInfo0.goldenHour + '</div></div>';
     }
   }
   html += '</div>';
   return html;
+}
+
+// Render one panel resiliently. Travel now reaches arbitrary epochs, where a
+// given panel's math can go non-finite or throw (a lunisolar conversion, the
+// sun-map terminator, a meteor table). Catch it, drop a quiet "beyond range"
+// note into that panel's container, and let the rest — crucially the sky,
+// orrery and deep-time — carry on. One panel must never abort the repaint.
+function _almSafePanel(fn, containerId) {
+  try { fn(); }
+  catch (e) {
+    if (window.console && console.warn) console.warn('almanac: panel skipped at this epoch —', e && e.message);
+    if (containerId) {
+      var el = document.getElementById(containerId);
+      if (el) el.innerHTML = '<div class="alm-beyond">' + _tLookup('alm_tm_beyond_range', "Beyond this calendar's range") + '</div>';
+    }
+  }
 }
 
 // Repaint every panel that describes a moment, in place, for the focused
@@ -394,23 +525,34 @@ function _almHeadHtml(focus) {
 function _almRepaintFocus() {
   var focus = _almFocusInstant();
   var loc = _getLocation();
-  var m = _moonPhase(focus);
+  var m;
+  try { m = _moonPhase(focus); } catch (e) { m = null; }
   var head = document.getElementById('almanac-head');
-  if (head) head.innerHTML = _almHeadHtml(focus);
-  _renderSunMap(focus);
+  if (head) {
+    // Sweep the hero moon from the previous focus to this one (real phases +
+    // continuous rotation) after the header rebuilds to the destination.
+    var fromTime = (_almPrevFocusTime != null) ? _almPrevFocusTime : focus.getTime();
+    _almSafePanel(function () { head.innerHTML = _almHeadHtml(focus); }, 'almanac-head');
+    if (!_almReduceMotion()) _almHeroMoonSweep(head, fromTime, focus.getTime(), loc);
+  }
+  _almPrevFocusTime = focus.getTime();
+  _almSafePanel(function () { _renderSunMap(focus); }, 'almanac-sunmap');
   // _renderSunMap re-seeds the world-clock grid off the date it's handed. That
   // grid is a *clock* — it must keep reading now, not the focused instant.
   _initTzClock(new Date());
-  _renderOnThisDay(focus);
-  _renderTonightSky(focus);
-  _renderStarChart(focus);
-  _renderAnalemma(focus);
-  _renderAstroPanel(focus);
-  _renderMeteorShowers(focus, m);
-  _renderCelestialEvents(focus);
-  _renderDeepTime(focus);
+  _almSafePanel(function () { _renderOnThisDay(focus); }, 'almanac-onthisday');
+  _almSafePanel(function () { _renderTonightSky(focus); }, 'almanac-tonight');
+  _almSafePanel(function () { _renderStarChart(focus); }, null);
+  _almSafePanel(function () { _renderAnalemma(focus); }, null);
+  _almSafePanel(function () { _renderAstroPanel(focus); }, 'almanac-astro');
+  _almSafePanel(function () { _renderMeteorShowers(focus, m); }, 'almanac-meteors');
+  _almSafePanel(function () { _renderCelestialEvents(focus); }, 'almanac-events');
+  _almSafePanel(function () { _renderDeepTime(focus); }, 'almanac-deeptime');
   // Re-seeding the sky scene cancels the previous RAF, so loops don't stack.
-  _initSkyScene(focus, loc.lat, loc.lon);
+  // animateMoon=true: this repaint always follows a focus-time change (scrub
+  // settle, wheel/key step, "Go", Back to Now) -- let the moon glide onward
+  // from wherever it currently is rather than snapping to the settled value.
+  _almSafePanel(function () { _initSkyScene(focus, loc.lat, loc.lon, !_almReduceMotion()); }, null);
 }
 
 function _almBackToToday() {
@@ -424,7 +566,406 @@ function _almBackToToday() {
   _almMonth = cal.month;
   _drawAlmanacGrid();
   _almRepaintFocus();
+  _almTmMode('rest');
+  _almTmSync();
 }
+
+// == Time machine — the almanac's skeuomorphic time-travel instrument ========
+// Replaces the old velocity scrubber + flux panel. Two faces on one object:
+//   REST   — a three-row time circuit: DISPLAYED (amber, what every panel is
+//            rendering), DESTINATION (neutral, tap to choose a time), NOW
+//            (dimmed, ticks).
+//   MOTION — while the side lever is thrown, the panel collapses to one large
+//            readout of the moving position. It stays collapsed after you land
+//            until tapped, then flips back to the three rows.
+// The lever is a *displacement* control: distance from neutral sets a
+// directional speed (nonlinear — minutes/sec near the middle, centuries/sec at
+// the ends), springing back to neutral on release. All the time-state
+// machinery of the old scrubber survives (_almFocus, _almScrubSettle,
+// _almRepaintFocus, and the rAF-throttled _skySetInstant redraw at ~0.21ms/
+// frame); only the *input* and *chrome* changed.
+
+// Year range. The astronomy stays finite across an enormous span (Julian-day
+// polynomials for the sky/sun/moon/deep-time, integer-JDN calendar
+// conversions), so travel is clamped only where JS Date itself fails:
+// getTime() saturates near ±8.64e15 ms (~±273,785 yr). We stay well inside.
+var _ALM_YEAR_MIN = -270000;
+var _ALM_YEAR_MAX = 270000;
+// Beyond this window the Meeus polynomials the sky/deep-time use lose real
+// meaning (they stay finite, just inaccurate) and lunisolar calendar
+// conversions drift — panels flag it quietly rather than pretending precision.
+var _ALM_PRECISE_SPAN = 13000;         // yr either side of J2000
+
+// Lever speed curve, in simulated-ms advanced per real-ms of hold. Exponential
+// so a single throw spans ~2 sim-minutes/sec (fine scrubbing within a day) up
+// to ~300 sim-years/sec at the end stops.
+var _TM_DEADZONE = 0.06;               // lever slack around neutral — no drift
+var _TM_RATE_MIN = 120;                // ~2 simulated minutes per real second
+var _TM_RATE_MAX = 9.5e9;              // ~300 simulated years per real second
+var _TM_SPRING_MS = 260;               // spring-back + decel-to-stop on release
+var _SCRUB_WHEEL_STEP = 3600000;       // 1 hour per wheel notch / arrow key
+var _SCRUB_PAGE_STEP = 86400000;       // 1 day per PageUp/PageDown
+var _SCRUB_LIVE_EPS = 60000;           // within 1 min of now -> snap back to live
+
+function _almReduceMotion() {
+  try { return window.matchMedia('(prefers-reduced-motion: reduce)').matches; }
+  catch (e) { return false; }
+}
+
+// Build an instant from explicit parts. setFullYear (not the Date constructor)
+// so years 0–99 and negative (BCE) years land on the real proleptic-Gregorian
+// year instead of folding into 1900–1999.
+function _almMakeInstant(y, mo, d, h, mi) {
+  var dt = new Date(0);
+  dt.setFullYear(y, mo - 1, d);
+  dt.setHours(h, mi, 0, 0);
+  return dt;
+}
+
+// Keep an instant inside the range where JS Date is valid; never return NaN.
+function _almClampInstant(dt) {
+  if (isNaN(dt.getTime())) return new Date();
+  var y = dt.getFullYear();
+  if (y < _ALM_YEAR_MIN) return _almMakeInstant(_ALM_YEAR_MIN, 1, 1, 0, 0);
+  if (y > _ALM_YEAR_MAX) return _almMakeInstant(_ALM_YEAR_MAX, 12, 31, 23, 59);
+  return dt;
+}
+
+function _almYearBeyondPrecise(y) { return Math.abs(y - 2000) > _ALM_PRECISE_SPAN; }
+
+// Readout formatting: MON DD YEAR  HH:MM in the viewer's language, month
+// abbreviation upper-cased, 24-hour tabular time. The year is the signed
+// proleptic-Gregorian number (negative = BCE), matching the chooser's field so
+// it round-trips exactly.
+function _almTmFmt(d) {
+  var lang = (typeof _currentLang !== 'undefined') ? _currentLang : 'en';
+  var mon, hm;
+  try { mon = d.toLocaleDateString(lang, { month: 'short' }).toUpperCase(); }
+  catch (e) { mon = ('0' + (d.getMonth() + 1)).slice(-2); }
+  try { hm = d.toLocaleTimeString(lang, { hour: '2-digit', minute: '2-digit', hour12: false }); }
+  catch (e) { hm = ('0' + d.getHours()).slice(-2) + ':' + ('0' + d.getMinutes()).slice(-2); }
+  return mon + ' ' + ('0' + d.getDate()).slice(-2) + ' ' + d.getFullYear() + ' ' + hm;
+}
+
+// Lightweight per-frame clock update while stepping -- just the two hero text
+// nodes, no header rebuild. (The moon disc and sun cards settle on release.)
+function _almScrubClock(focus) {
+  var cp = _almClockParts(focus);
+  var d = document.getElementById('almanac-head-date');
+  var tmEl = document.getElementById('almanac-head-time');
+  if (d) d.textContent = cp.date;
+  if (tmEl) tmEl.textContent = cp.time;
+}
+
+function _almIsLiveNow(d) { return Math.abs(d.getTime() - Date.now()) < _SCRUB_LIVE_EPS; }
+
+// Move the calendar selection + browsed month onto the focused instant's day.
+function _almSyncSelectedToFocus() {
+  var f = _almFocusInstant();
+  _almSelectedJDN = _gregorianToJDN(f.getFullYear(), f.getMonth() + 1, f.getDate());
+  var cal = _jdnToCalendar(_almSystem, _almSelectedJDN);
+  _almYear = cal.year;
+  _almMonth = cal.month;
+  _drawAlmanacGrid();
+}
+
+// Settle the almanac on `target`: snap back to live if within a minute of now,
+// otherwise recompute every panel once for the new instant. opts.land plays the
+// "zap" (shake + vibration) — used for deliberate arrivals (lever release, a
+// chosen destination), not for discrete wheel/key steps.
+function _almScrubSettle(target, opts) {
+  if (_almIsLiveNow(target)) {
+    _almBackToToday();
+  } else {
+    _almFocus = _almClampInstant(target);
+    _almSyncSelectedToFocus();
+    _almRepaintFocus();
+    _almTmSync();
+  }
+  if (opts && opts.land) _almTmLand();
+}
+
+// -- Visibility -----------------------------------------------------------
+// The instrument is hidden until summoned, so the almanac opens on the sky, not
+// a control panel. It appears when the user taps the hero clock (the
+// discoverable entry), picks a different calendar day, or engages the lever;
+// the × closes it, snapping back to now via the existing back-to-now path so
+// the almanac is left reading the present.
+function _almTmShow() {
+  var el = document.getElementById('alm-tm');
+  if (!el) return;
+  el.classList.add('alm-tm-open');
+  // Land on the three-row circuit unless a lever throw is actively in flight.
+  if (el.getAttribute('data-mode') !== 'motion') _almTmMode('rest');
+  _almTmSync();
+}
+function _almTmHide() {
+  var el = document.getElementById('alm-tm');
+  if (el) el.classList.remove('alm-tm-open');
+}
+function _almTmClose() { _almBackToToday(); _almTmHide(); }
+
+// -- Panel faces & readouts --
+function _almTmMode(mode) {
+  var el = document.getElementById('alm-tm');
+  if (el) el.setAttribute('data-mode', mode);
+}
+// Tapping the collapsed readout returns to the three-row circuit.
+function _almTmToRest() { _almTmMode('rest'); _almTmSync(); }
+
+// Refresh the three-row circuit. DESTINATION mirrors DISPLAYED at rest; the
+// return-to-now control shows only while parked away from live.
+function _almTmSync() {
+  var f = _almFocusInstant();
+  var traveling = _almFocus != null && !_almIsLiveNow(_almFocus);
+  var disp = document.getElementById('alm-tm-displayed-val');
+  if (disp) disp.textContent = _almTmFmt(f);
+  var dest = document.getElementById('alm-tm-dest-val');
+  if (dest) dest.textContent = _almTmFmt(f);
+  var nowEl = document.getElementById('alm-tm-now-val');
+  if (nowEl) nowEl.textContent = _almTmFmt(new Date());
+  var ret = document.getElementById('alm-tm-return');
+  if (ret) ret.hidden = !traveling;
+  var root = document.getElementById('alm-tm');
+  if (root) root.classList.toggle('alm-tm-away', traveling);
+}
+
+function _almTmSoloUpdate(d) {
+  var el = document.getElementById('alm-tm-solo-val');
+  if (el) el.textContent = _almTmFmt(d);
+}
+
+// -- Landing ("zap to it"): brief shake + a short haptic pulse on arrival. --
+function _almTmLand() {
+  if (_almReduceMotion()) return;
+  try { if (navigator.vibrate) navigator.vibrate([10, 30, 18]); } catch (e) {}
+  var el = document.getElementById('alm-tm');
+  if (!el) return;
+  el.classList.remove('alm-tm-zap');
+  void el.offsetWidth;                 // restart the keyframe from zero
+  el.classList.add('alm-tm-zap');
+  setTimeout(function () { el.classList.remove('alm-tm-zap'); }, 480);
+}
+
+// -- Destination chooser — arbitrary date+time, any year including BCE. --
+function _almTmChooserSet(f) {
+  var vals = {
+    'alm-tm-cy': f.getFullYear(), 'alm-tm-cmo': f.getMonth() + 1, 'alm-tm-cd': f.getDate(),
+    'alm-tm-ch': f.getHours(), 'alm-tm-cmi': f.getMinutes()
+  };
+  for (var id in vals) { var el = document.getElementById(id); if (el) el.value = vals[id]; }
+}
+
+function _almTmOpenChooser() {
+  _almTmChooserSet(_almFocusInstant());
+  _almTmMode('chooser');
+  var y = document.getElementById('alm-tm-cy');
+  if (y) { y.focus(); if (y.select) y.select(); }
+}
+
+function _almTmChooserVal(id, dflt, lo, hi) {
+  var el = document.getElementById(id);
+  var n = el ? parseInt(el.value, 10) : NaN;
+  if (isNaN(n)) n = dflt;
+  if (lo != null) n = Math.max(lo, n);
+  if (hi != null) n = Math.min(hi, n);
+  return n;
+}
+
+function _almTmChooserGo() {
+  var now = new Date();
+  var y = _almTmChooserVal('alm-tm-cy', now.getFullYear(), _ALM_YEAR_MIN, _ALM_YEAR_MAX);
+  var mo = _almTmChooserVal('alm-tm-cmo', 1, 1, 12);
+  var d = _almTmChooserVal('alm-tm-cd', 1, 1, 31);
+  var h = _almTmChooserVal('alm-tm-ch', 0, 0, 23);
+  var mi = _almTmChooserVal('alm-tm-cmi', 0, 0, 59);
+  _almTmMode('rest');
+  _almScrubSettle(_almClampInstant(_almMakeInstant(y, mo, d, h, mi)), { land: true });
+}
+
+function _almTmChooserCancel() { _almTmMode('rest'); _almTmSync(); }
+
+function _almTmChooserKey(e) {
+  if (e.key === 'Enter') { e.preventDefault(); _almTmChooserGo(); }
+  else if (e.key === 'Escape') { e.preventDefault(); _almTmChooserCancel(); }
+}
+
+// Return-to-now, with the landing zap (button + Home key).
+function _almTmReturnNow() { _almBackToToday(); _almTmLand(); }
+
+// -- Lever: displacement -> directional speed, spring back on release. --
+var _almLeverActive = false;
+var _almLeverDisp = 0;                  // signed throw, -1 (past) .. +1 (future)
+var _almTravelRAF = null;               // the single travel loop (never stacked)
+var _almTravelLastTs = 0;
+var _almLeverDecel = false;             // easing the throw to zero after release
+var _almLeverDecelStart = 0;
+var _almLeverDecelFrom = 0;
+var _almTmCenterY = 0;                  // track-centre client-Y, measured on grab
+var _almTmHalf = 1;                     // px from centre to a full throw
+var _almScrubWheelTimer = null;
+
+function _almLeverClientY(e) {
+  return (e.touches && e.touches[0]) ? e.touches[0].clientY : e.clientY;
+}
+
+function _almLeverRate(disp) {
+  var a = Math.abs(disp);
+  if (a < _TM_DEADZONE) return 0;
+  var u = (a - _TM_DEADZONE) / (1 - _TM_DEADZONE);
+  var mag = _TM_RATE_MIN * Math.pow(_TM_RATE_MAX / _TM_RATE_MIN, u);
+  return disp < 0 ? -mag : mag;
+}
+
+// Reflect the throw onto the knob (up = future = negative translateY).
+function _almLeverKnob(disp) {
+  var k = document.getElementById('alm-tm-lever');
+  if (k) k.style.transform = 'translateY(' + (-disp * _almTmHalf) + 'px)';
+}
+
+// One rAF, alive only while the lever is held or decelerating. Per frame it
+// advances _almFocus by rate·dt and cheaply retargets the running sky loop via
+// _skySetInstant — the same redraw contract the scrubber had. When the throw
+// reaches zero the loop ends and settles every heavy panel once, with a zap.
+function _almTravelFrame(ts) {
+  _almTravelRAF = null;
+  if (!_almTravelLastTs) _almTravelLastTs = ts;
+  var dtReal = Math.min(50, ts - _almTravelLastTs);   // clamp gaps (tab switch)
+  _almTravelLastTs = ts;
+
+  if (_almLeverDecel) {
+    var p = Math.min(1, (ts - _almLeverDecelStart) / _TM_SPRING_MS);
+    _almLeverDisp = _almLeverDecelFrom * (1 - p * p);  // ease-out to a soft stop
+    _almLeverKnob(_almLeverDisp);
+    if (p >= 1) { _almLeverDisp = 0; _almLeverDecel = false; }
+  }
+
+  var rate = _almLeverRate(_almLeverDisp);
+  if (rate !== 0) {
+    var base = _almFocus || new Date();
+    var next = _almClampInstant(new Date(base.getTime() + rate * dtReal));
+    _almFocus = next;
+    _almTmSoloUpdate(next);
+    if (!_almReduceMotion() && typeof _skySetInstant === 'function') _skySetInstant(next);
+  }
+
+  if (_almLeverActive || _almLeverDecel) {
+    _almTravelRAF = requestAnimationFrame(_almTravelFrame);
+  } else {
+    _almTravelLastTs = 0;
+    _almScrubSettle(_almFocusInstant(), { land: true });
+  }
+}
+
+function _almTravelStart() {
+  if (_almTravelRAF) return;
+  _almTravelLastTs = 0;
+  _almTravelRAF = requestAnimationFrame(_almTravelFrame);
+}
+
+function _almLeverStart(e) {
+  if (e.type === 'pointerdown' && e.button != null && e.button !== 0) return;
+  var track = document.getElementById('alm-tm-track');
+  var knob = document.getElementById('alm-tm-lever');
+  if (!track || !knob) return;
+  var tr = track.getBoundingClientRect();
+  _almTmCenterY = tr.top + tr.height / 2;
+  _almTmHalf = Math.max(1, tr.height / 2 - knob.offsetHeight / 2);
+  _almLeverActive = true;
+  _almLeverDecel = false;
+  _almTmShow();                          // engaging the lever reveals the instrument
+  knob.classList.remove('alm-tm-lever-spring');
+  if (knob.setPointerCapture && e.pointerId != null) { try { knob.setPointerCapture(e.pointerId); } catch (err) {} }
+  _almTmMode('motion');
+  _almTmSoloUpdate(_almFocusInstant());
+  _almLeverMove(e);
+  _almTravelStart();
+  e.preventDefault();
+}
+
+function _almLeverMove(e) {
+  if (!_almLeverActive) return;
+  e.preventDefault();
+  var disp = -(_almLeverClientY(e) - _almTmCenterY) / _almTmHalf;   // up = future
+  disp = Math.max(-1, Math.min(1, disp));
+  _almLeverDisp = disp;
+  _almLeverKnob(disp);
+  var k = document.getElementById('alm-tm-lever');
+  if (k) k.setAttribute('aria-valuenow', Math.round(disp * 100));
+}
+
+function _almLeverEnd(e) {
+  if (!_almLeverActive) return;
+  _almLeverActive = false;
+  var knob = document.getElementById('alm-tm-lever');
+  if (knob) {
+    knob.classList.add('alm-tm-lever-spring');
+    knob.setAttribute('aria-valuenow', 0);
+    if (knob.releasePointerCapture && e && e.pointerId != null) { try { knob.releasePointerCapture(e.pointerId); } catch (err) {} }
+  }
+  if (_almReduceMotion()) {
+    _almLeverDisp = 0; _almLeverKnob(0); _almLeverDecel = false;
+  } else {
+    _almLeverDecel = true;
+    _almLeverDecelStart = performance.now();
+    _almLeverDecelFrom = _almLeverDisp;
+  }
+  // The in-flight travel loop sees !active (and rides the decel to zero), then
+  // settles. If it somehow isn't running, settle now.
+  if (!_almTravelRAF) _almScrubSettle(_almFocusInstant(), { land: true });
+}
+
+// Wheel over the lever (and arrow keys) step time discretely; the heavy repaint
+// is debounced so a burst of notches settles once. No zap on a mere step.
+function _almScrubStep(deltaMs) {
+  var next = _almClampInstant(new Date(_almFocusInstant().getTime() + deltaMs));
+  _almFocus = next;
+  _almScrubClock(next);
+  if (!_almReduceMotion() && typeof _skySetInstant === 'function') _skySetInstant(next);
+  _almTmSync();
+  clearTimeout(_almScrubWheelTimer);
+  _almScrubWheelTimer = setTimeout(function () { _almScrubSettle(_almFocusInstant()); }, 220);
+}
+
+function _almScrubWheel(e) {
+  e.preventDefault();
+  _almScrubStep(e.deltaY < 0 ? _SCRUB_WHEEL_STEP : -_SCRUB_WHEEL_STEP);
+}
+
+function _almScrubKey(e) {
+  var d = 0;
+  if (e.key === 'ArrowUp') d = _SCRUB_WHEEL_STEP;
+  else if (e.key === 'ArrowDown') d = -_SCRUB_WHEEL_STEP;
+  else if (e.key === 'PageUp') d = _SCRUB_PAGE_STEP;
+  else if (e.key === 'PageDown') d = -_SCRUB_PAGE_STEP;
+  else if (e.key === 'Home') { e.preventDefault(); _almTmReturnNow(); return; }
+  else return;
+  e.preventDefault();
+  _almScrubStep(d);
+}
+
+function _almTmInit() {
+  var knob = document.getElementById('alm-tm-lever');
+  if (knob) {
+    if (window.PointerEvent) {
+      knob.addEventListener('pointerdown', _almLeverStart);
+      knob.addEventListener('pointermove', _almLeverMove);
+      knob.addEventListener('pointerup', _almLeverEnd);
+      knob.addEventListener('pointercancel', _almLeverEnd);
+    } else {
+      knob.addEventListener('touchstart', _almLeverStart, { passive: false });
+      knob.addEventListener('touchmove', _almLeverMove, { passive: false });
+      knob.addEventListener('touchend', _almLeverEnd);
+      knob.addEventListener('mousedown', _almLeverStart);
+      window.addEventListener('mousemove', _almLeverMove);
+      window.addEventListener('mouseup', _almLeverEnd);
+    }
+    knob.addEventListener('wheel', _almScrubWheel, { passive: false });
+    knob.addEventListener('keydown', _almScrubKey);
+  }
+  _almTmSync();
+}
+
 
 
 function _renderAlmanacContent() {
@@ -432,9 +973,79 @@ function _renderAlmanacContent() {
   var m = _moonPhase(now);
 
   var html = '<div class="almanac-inner">';
-  html += '<div id="almanac-head">' + _almHeadHtml(now) + '</div>';
 
-  // Sky scene + calendar — wall calendar: art above, month grid below
+  // The time machine — the almanac's skeuomorphic time-travel instrument.
+  // Sticky so it stays reachable while the panels below scroll. Three faces
+  // (rest / motion / chooser) toggled by its data-mode; see the engine above.
+  html += '<div id="alm-tm" class="alm-tm" data-mode="rest">';
+  html +=   '<div class="alm-tm-panel">';
+  // Rest face — the three-row time circuit.
+  html +=     '<div class="alm-tm-rows">';
+  html +=       '<div class="alm-tm-row alm-tm-displayed">';
+  html +=         '<span class="alm-tm-label">' + t('alm_tm_displayed') + '</span>';
+  html +=         '<span class="alm-tm-time" id="alm-tm-displayed-val"></span>';
+  html +=       '</div>';
+  html +=       '<button type="button" class="alm-tm-row alm-tm-dest" onclick="_almTmOpenChooser()" title="' + _almEsc(t('alm_tm_set_dest')) + '" aria-label="' + _almEsc(t('alm_tm_set_dest')) + '">';
+  html +=         '<span class="alm-tm-label">' + t('alm_tm_destination') + '</span>';
+  html +=         '<span class="alm-tm-time" id="alm-tm-dest-val"></span>';
+  html +=         '<span class="alm-tm-dest-ic" aria-hidden="true">✎</span>';
+  html +=       '</button>';
+  html +=       '<div class="alm-tm-row alm-tm-now">';
+  html +=         '<span class="alm-tm-label">' + t('alm_tm_actual') + '</span>';
+  html +=         '<span class="alm-tm-time" id="alm-tm-now-val"></span>';
+  html +=         '<button type="button" class="alm-tm-return" id="alm-tm-return" onclick="_almTmReturnNow()" title="' + _almEsc(t('alm_back_to_now')) + '" hidden>↺ ' + t('alm_now') + '</button>';
+  html +=       '</div>';
+  html +=     '</div>';
+  // Motion face — one readout of the moving position; tap to return to rest.
+  html +=     '<button type="button" class="alm-tm-solo" onclick="_almTmToRest()" aria-label="' + _almEsc(t('alm_tm_traveling')) + '">';
+  html +=       '<span class="alm-tm-solo-lbl">' + t('alm_tm_traveling') + '</span>';
+  html +=       '<span class="alm-tm-solo-time" id="alm-tm-solo-val"></span>';
+  html +=     '</button>';
+  // Chooser face — pick any date+time; the year field accepts arbitrary and BCE.
+  var _tmFields = [
+    ['alm-tm-cy', t('alm_tm_year'), t('alm_tm_year_hint'), 'alm-tm-field-year'],
+    ['alm-tm-cmo', t('alm_tm_month'), '', ''],
+    ['alm-tm-cd', t('alm_tm_day'), '', ''],
+    ['alm-tm-ch', t('alm_tm_hour'), '', ''],
+    ['alm-tm-cmi', t('alm_tm_min'), '', '']
+  ];
+  html +=     '<div class="alm-tm-chooser">';
+  html +=       '<div class="alm-tm-fields">';
+  for (var _fi = 0; _fi < _tmFields.length; _fi++) {
+    var _f = _tmFields[_fi];
+    html +=       '<label class="alm-tm-field ' + _f[3] + '"><span class="alm-tm-field-lbl">' + _f[1] + '</span>' +
+                    '<input type="number" step="1" id="' + _f[0] + '" class="alm-tm-input" inputmode="numeric"' +
+                    ' aria-label="' + _almEsc(_f[1]) + '"' + (_f[2] ? ' title="' + _almEsc(_f[2]) + '"' : '') +
+                    ' onkeydown="_almTmChooserKey(event)"></label>';
+  }
+  html +=       '</div>';
+  html +=       '<div class="alm-tm-chooser-btns">';
+  html +=         '<button type="button" class="alm-tm-cancel" onclick="_almTmChooserCancel()">' + t('alm_tm_cancel') + '</button>';
+  html +=         '<button type="button" class="alm-tm-go" onclick="_almTmChooserGo()">' + t('alm_tw_go') + '</button>';
+  html +=       '</div>';
+  html +=     '</div>';
+  html +=   '</div>';
+  // Side-mounted lever — throw up for the future, down for the past.
+  html +=   '<div class="alm-tm-lever-col">';
+  html +=     '<div class="alm-tm-track" id="alm-tm-track">';
+  html +=       '<span class="alm-tm-endstop alm-tm-endstop-fwd" aria-hidden="true"></span>';
+  html +=       '<div class="alm-tm-lever alm-tm-lever-spring" id="alm-tm-lever" role="slider" tabindex="0"' +
+                  ' aria-label="' + _almEsc(t('alm_tm_lever_label')) + '" aria-orientation="vertical"' +
+                  ' aria-valuemin="-100" aria-valuemax="100" aria-valuenow="0">' +
+                  '<span class="alm-tm-lever-grip" aria-hidden="true"></span>' +
+                '</div>';
+  html +=       '<span class="alm-tm-endstop alm-tm-endstop-back" aria-hidden="true"></span>';
+  html +=     '</div>';
+  html +=   '</div>';
+  // Close — returns the almanac to now and hides the instrument again.
+  html +=   '<button type="button" class="alm-tm-close" onclick="_almTmClose()" title="' + _almEsc(t('alm_tm_close')) + '" aria-label="' + _almEsc(t('alm_tm_close')) + '">×</button>';
+  html += '</div>';
+
+  html += '<div id="almanac-head">' + _almHeadHtml(now) + '</div>';
+  _almPrevFocusTime = now.getTime();   // seed the hero-moon sweep's start
+
+  // Sky scene + calendar — wall calendar: art above, month grid below. Time is
+  // driven by the time machine at the top; the sky animates live as you travel.
   html += '<div class="almanac-sky-wrap">' +
     '<canvas id="almanac-sky-canvas" aria-describedby="almanac-sky-desc" role="img"></canvas>' +
     // Inline styles duplicate .sr-only so a stale cached app.css can never
@@ -451,7 +1062,7 @@ function _renderAlmanacContent() {
 
   // Orrery
   html += '<div class="almanac-section">';
-  html += '<div class="almanac-section-title">' + t('alm_solar_system') + '</div>';
+  html += '<div class="almanac-section-title">' + _lterm('solar_system', t('alm_solar_system')) + '</div>';
   html += '<div class="almanac-orrery-wrap"><canvas id="almanac-orrery"></canvas></div>';
   html += '<div class="orrery-controls">';
   // Bidirectional speed slider: left = rewind, center = 1×, right = fast forward
@@ -493,14 +1104,14 @@ function _renderAlmanacContent() {
 
   // The Analemma — the Sun's yearly figure-8 (equation of time × declination)
   html += '<div class="almanac-section">';
-  html += '<div class="almanac-section-title">' + t('alm_analemma') + '</div>';
+  html += '<div class="almanac-section-title">' + _lterm('analemma', t('alm_analemma')) + '</div>';
   html += '<div class="alm-analemma-wrap"><canvas id="almanac-analemma"></canvas></div>';
   html += '<div id="almanac-analemma-caption" class="alm-analemma-caption"></div>';
   html += '</div>';
 
   // Meteor showers
   html += '<div class="almanac-section">';
-  html += '<div class="almanac-section-title">' + t('alm_meteor_showers') + '</div>';
+  html += '<div class="almanac-section-title">' + _lterm('meteor_shower', t('alm_meteor_showers')) + '</div>';
   html += '<div id="almanac-meteors"></div>';
   html += '</div>';
 
@@ -554,6 +1165,7 @@ function _renderAlmanacContent() {
   _orreryAnimate();
   _loadSunData(now);
   _startTzClock();
+  _almTmInit();
   _cacheAlmanacHighlights(now, m);
 }
 
@@ -607,7 +1219,128 @@ function _cacheAlmanacHighlights(now, moon) {
 
 // ── Moon rendering ──
 
-// Almanac hero moon — delegates to shared _renderMoonHTML (defined in index.html)
+// Screen tilt (degrees) of the hero disc at a given instant: the bright limb
+// faces the Sun as the observer sees it. brightLimb (chi - q) is the physical
+// quantity; the base art has its lit limb at 3 o'clock and CSS rotation runs
+// opposite to the position-angle sense, so the screen tilt is -(chi-q) - 90.
+function _heroMoonTiltDeg(date, loc) {
+  var mp = _moonPosition(date, loc.lat, loc.lon);
+  var limb = (mp.brightLimb != null ? mp.brightLimb : mp.parallactic) || 0;
+  return -limb - 90;
+}
+
+// ── Hero moon time-travel sweep ──
+// When the focus jumps, the big hero disc doesn't cut to the new phase: a live
+// <canvas> overlay draws the moon at successive REAL instants between the two
+// times, so the terminator sweeps its true path and the disc rotates from the
+// old tilt to the new one -- as if a camera stayed on it. Driven by the sky
+// scene's existing rAF (via _heroMoonTick), so there is no second loop. The
+// overlay's opaque disc fully covers the crisp resting <img> beneath it, which
+// already shows the destination phase; on completion the overlay is removed and
+// that img is revealed with no visible seam. Reduced motion snaps (caller +
+// CSS guard). Position never changes -- the hero is centred -- so only phase
+// and tilt animate.
+var _HERO_MOON_ANIM_SIZE = 128;   // sprite gen size while moving (cheap; scaled to fill)
+var _HERO_MOON_PHASE_STEP = 0.02; // quantise illum to ~50 buckets so re-shades stay cached
+var _HERO_MOON_MIN_SPAN_MS = 1000;// jumps under this (e.g. a location refresh) just snap
+var _heroMoonAnim = null;         // active discrete-jump descriptor, or null
+var _heroMoonOverlay = null;      // the overlay <canvas>, or null
+
+function _moonEaseInOut(p) {
+  return p < 0.5 ? 4 * p * p * p : 1 - Math.pow(-2 * p + 2, 3) / 2;
+}
+
+// The overlay canvas laid over the current hero moon (created lazily, reused).
+function _heroMoonEnsureOverlay(hero) {
+  if (_heroMoonOverlay && _heroMoonOverlay.isConnected) return _heroMoonOverlay;
+  var dpr = window.devicePixelRatio || 1;
+  var cv = document.createElement('canvas');
+  cv.className = 'almanac-moon-anim';
+  cv.setAttribute('aria-hidden', 'true');
+  cv.width = Math.round(200 * dpr);
+  cv.height = Math.round(200 * dpr);
+  hero.appendChild(cv);
+  _heroMoonOverlay = cv;
+  return cv;
+}
+
+function _heroMoonRemoveOverlay() {
+  if (_heroMoonOverlay && _heroMoonOverlay.parentNode) {
+    _heroMoonOverlay.parentNode.removeChild(_heroMoonOverlay);
+  }
+  _heroMoonOverlay = null;
+}
+
+// Draw the moon into the overlay: cached shaded sprite (drawImage is ~free once
+// the 1% bucket exists) rotated by the interpolated tilt. genSize controls the
+// sprite resolution -- small while moving, full on the landing frame so the
+// hand-off to the resting img is seamless.
+function _heroMoonDrawCanvas(cv, illumFrac, waxing, tiltDeg, genSize) {
+  var ctx = cv.getContext('2d');
+  var W = cv.width, c = W / 2;
+  ctx.clearRect(0, 0, W, W);
+  var spr = _moonSpriteCanvas(illumFrac, waxing, genSize);
+  ctx.save();
+  ctx.translate(c, c);
+  ctx.rotate(tiltDeg * Math.PI / 180);
+  ctx.drawImage(spr, -c, -c, W, W);
+  ctx.restore();
+}
+
+// Begin a hero sweep from fromTime to toTime (focus instants, ms). Called right
+// after _almHeadHtml has rebuilt the header to the destination phase/tilt.
+function _almHeroMoonSweep(head, fromTime, toTime, loc) {
+  if (Math.abs(toTime - fromTime) < _HERO_MOON_MIN_SPAN_MS) return; // no real jump
+  var hero = head.querySelector('.almanac-hero');
+  if (!hero || !hero.querySelector('.almanac-moon')) return;
+  _heroMoonEnsureOverlay(hero);
+  _heroMoonAnim = {
+    fromTime: fromTime, toTime: toTime,
+    fromTilt: _heroMoonTiltDeg(new Date(fromTime), loc),
+    toTilt: _heroMoonTiltDeg(new Date(toTime), loc),
+    start: performance.now(),
+    dur: _moonAnimDurMs(fromTime, toTime)
+  };
+}
+
+// Per-frame hook, called from the sky rAF. Advances a discrete jump sweep and,
+// failing that, keeps the hero flowing while the time lever is engaged.
+function _heroMoonTick(ts) {
+  if (_heroMoonAnim) {
+    var a = _heroMoonAnim, cv = _heroMoonOverlay;
+    if (!cv || !cv.isConnected) { _heroMoonAnim = null; return; }
+    var p = (ts - a.start) / a.dur;
+    if (p >= 1) {
+      // Land at full resolution so removing the overlay reveals an identical img.
+      var end = _moonPhase(new Date(a.toTime));
+      _heroMoonDrawCanvas(cv, end.illumination / 100, end.phase < 0.5, a.toTilt, 200);
+      _heroMoonRemoveOverlay();
+      _heroMoonAnim = null;
+      return;
+    }
+    var e = _moonEaseInOut(p);
+    var ph = _moonAnimPhaseAt(a.fromTime, a.toTime, e);
+    var illumFrac = Math.round(ph.illumination / 100 / _HERO_MOON_PHASE_STEP) * _HERO_MOON_PHASE_STEP;
+    var tilt = a.fromTilt + _angleDelta(a.fromTilt, a.toTilt) * e;
+    _heroMoonDrawCanvas(cv, illumFrac, ph.phase < 0.5, tilt, _HERO_MOON_ANIM_SIZE);
+    return;
+  }
+  // Live lever travel: the header isn't rebuilt per frame, so drive the disc
+  // straight from the current focus. Real tilt at a single instant is stable
+  // (no daily-parallactic strobe, which only shows when sampling ACROSS days).
+  var travel = (typeof _almLeverActive !== 'undefined') && (_almLeverActive || _almLeverDecel);
+  if (travel) {
+    var heroEl = document.querySelector('#almanac-head .almanac-hero');
+    if (!heroEl || !heroEl.querySelector('.almanac-moon')) return;
+    var cv2 = _heroMoonEnsureOverlay(heroEl);
+    var f = _almFocusInstant(), loc2 = _getLocation(), m = _moonPhase(f);
+    _heroMoonDrawCanvas(cv2, m.illumination / 100, m.phase < 0.5, _heroMoonTiltDeg(f, loc2), _HERO_MOON_ANIM_SIZE);
+    return;
+  }
+  if (_heroMoonOverlay) _heroMoonRemoveOverlay();   // travel ended: reveal the img
+}
+
+// Almanac hero moon — delegates to _renderMoonHTML (defined in app.js)
 // Adds the almanac-specific glow wrapper
 function _renderAlmanacMoon(m, tiltDeg) {
   var illumFrac = m.illumination / 100;
@@ -806,11 +1539,6 @@ function _auToVis(au) {
 // Rockets use an adaptive 3-phase speed profile:
 //   Departure (first 5%) → smooth ramp up → Cruise (middle 90%) → smooth ramp down → Approach (last 5%)
 // Speeds scale to transit duration so every launch feels ~12 seconds regardless of planet.
-
-function _smoothstep(edge0, edge1, x) {
-  var t = Math.max(0, Math.min(1, (x - edge0) / (edge1 - edge0)));
-  return t * t * (3 - 2 * t);
-}
 
 
 // ── Bidirectional logarithmic speed slider ──
@@ -1031,7 +1759,7 @@ function _computeEclipses(fromDate, count) {
       // totality read "Americas"). Real ground tracks need Besselian
       // elements — until then, show only what we can stand behind.
       var dateStr = eclDate.getFullYear() + '-' + String(eclDate.getMonth() + 1).padStart(2, '0') + '-' + String(eclDate.getDate()).padStart(2, '0');
-      results.push({ date: dateStr, type: type });
+      results.push({ date: dateStr, type: type, solar: isSolar });
     }
   }
   return results.slice(0, count);
@@ -1048,15 +1776,22 @@ function _renderAstroPanel(now) {
   // Hemisphere-aware seasons: flip for southern hemisphere observers
   var obsLat = _getLocation().lat;
   var south = obsLat < 0;
+  // Season labels follow the observer's hemisphere; the article key follows the
+  // label (a "Summer" label in the south links the Summer article, not Winter).
+  var Wk = south ? 'summer' : 'winter', Spk = south ? 'autumn' : 'spring';
+  var Suk = south ? 'winter' : 'summer', Auk = south ? 'spring' : 'autumn';
   var W = south ? t('season_summer') : t('season_winter'), Sp = south ? t('season_autumn') : t('season_spring');
   var Su = south ? t('season_winter') : t('season_summer'), Au = south ? t('season_spring') : t('season_autumn');
-  var _eq = t('alm_equinox'), _sol = t('alm_solstice');
+  var _eq = _lterm('equinox', t('alm_equinox')), _sol = _lterm('solstice', t('alm_solstice'));
+  // setFullYear (see _dayOfYear) so season boundaries land on the real year for
+  // any epoch the time machine reaches, not the 1900s for years 0–99.
+  function _dmy(yy, mo, dd) { var x = new Date(0); x.setFullYear(yy, mo, dd); x.setHours(0, 0, 0, 0); return x; }
   var seasonBounds = [
-    { name: W, start: new Date(y - 1, 11, 21), end: new Date(y, 2, 20), next: Sp + ' ' + _eq },
-    { name: Sp, start: new Date(y, 2, 20), end: new Date(y, 5, 21), next: Su + ' ' + _sol },
-    { name: Su, start: new Date(y, 5, 21), end: new Date(y, 8, 22), next: Au + ' ' + _eq },
-    { name: Au, start: new Date(y, 8, 22), end: new Date(y, 11, 21), next: W + ' ' + _sol },
-    { name: W, start: new Date(y, 11, 21), end: new Date(y + 1, 2, 20), next: Sp + ' ' + _eq }
+    { name: W, nameKey: Wk, start: _dmy(y - 1, 11, 21), end: _dmy(y, 2, 20), next: Sp + ' ' + _eq },
+    { name: Sp, nameKey: Spk, start: _dmy(y, 2, 20), end: _dmy(y, 5, 21), next: Su + ' ' + _sol },
+    { name: Su, nameKey: Suk, start: _dmy(y, 5, 21), end: _dmy(y, 8, 22), next: Au + ' ' + _eq },
+    { name: Au, nameKey: Auk, start: _dmy(y, 8, 22), end: _dmy(y, 11, 21), next: W + ' ' + _sol },
+    { name: W, nameKey: Wk, start: _dmy(y, 11, 21), end: _dmy(y + 1, 2, 20), next: Sp + ' ' + _eq }
   ];
   var season = null;
   for (var si = 0; si < seasonBounds.length; si++) {
@@ -1068,7 +1803,7 @@ function _renderAstroPanel(now) {
     }
   }
 
-  var perihelion = new Date(y, 0, 3);
+  var perihelion = _dmy(y, 0, 3);
   var daysSincePeri = (now - perihelion) / MS_PER_DAY;
   var earthSunDist = 149598023 * (1 - 0.0167 * Math.cos(daysSincePeri / 365.25 * 2 * Math.PI));
   var earthSunAU = (earthSunDist / 149597870.7).toFixed(4);
@@ -1085,9 +1820,9 @@ function _renderAstroPanel(now) {
     { name: 'Scorpius', start: 241.1 }, { name: 'Sagittarius', start: 266.6 },
     { name: 'Capricornus', start: 300.0 }, { name: 'Aquarius', start: 327.9 }
   ];
-  var constellation = _tc(zodiac[zodiac.length - 1].name);
+  var constellation = _lc(zodiac[zodiac.length - 1].name);
   for (var zi = zodiac.length - 1; zi >= 0; zi--) {
-    if (sunLon >= zodiac[zi].start) { constellation = _tc(zodiac[zi].name); break; }
+    if (sunLon >= zodiac[zi].start) { constellation = _lc(zodiac[zi].name); break; }
   }
 
   // Compute eclipses algorithmically — works for any date, forever
@@ -1096,26 +1831,34 @@ function _renderAstroPanel(now) {
   var html = '<div class="almanac-info-grid">';
   html += '<div class="almanac-info-item"><div class="almanac-info-val">' + dayOfYear + ' / ' + daysInYear + '</div><div class="almanac-info-lbl">' + t('alm_day_of_year') + '</div></div>';
   if (season) {
-    html += '<div class="almanac-info-item"><div class="almanac-info-val">' + season.name + '</div><div class="almanac-info-lbl">' + t('alm_days_to_next', { n: season.daysUntilNext, next: season.next }) + '</div>' +
+    html += '<div class="almanac-info-item"><div class="almanac-info-val">' + _lseason(season.nameKey, season.name) + '</div><div class="almanac-info-lbl">' + t('alm_days_to_next', { n: season.daysUntilNext, next: season.next }) + '</div>' +
       '<div class="almanac-progress"><div class="almanac-progress-bar" style="width:' + Math.round(season.progress * 100) + '%"></div></div></div>';
   }
-  html += '<div class="almanac-info-item"><div class="almanac-info-val">' + earthSunAU + ' AU</div><div class="almanac-info-lbl">' + t('alm_earth_sun_dist') + '</div></div>';
+  html += '<div class="almanac-info-item"><div class="almanac-info-val">' + earthSunAU + ' ' + _lterm('astronomical_unit', 'AU') + '</div><div class="almanac-info-lbl">' + t('alm_earth_sun_dist') + '</div></div>';
   html += '<div class="almanac-info-item"><div class="almanac-info-val">' + constellation + '</div><div class="almanac-info-lbl">' + t('alm_sun_constellation') + '</div></div>';
   html += '</div>';
 
-  if (nextEclipses.length > 0) {
+  // Eclipse rows. The date string uses a plain YYYY-MM-DD that Date can't parse
+  // for year 0, five-figure, or BCE years — skip any row that comes back invalid
+  // rather than printing "Invalid Date / NaN days", and drop the whole section
+  // if none survive. (We can't meaningfully date eclipses millennia out anyway.)
+  var eclipseRows = '';
+  for (var ei = 0; ei < nextEclipses.length; ei++) {
+    var ec = nextEclipses[ei];
+    var ecDate = new Date(ec.date + 'T00:00:00');
+    if (isNaN(ecDate.getTime())) continue;
+    var daysUntil = Math.ceil((ecDate - now) / MS_PER_DAY);
+    if (!isFinite(daysUntil)) continue;
+    var untilStr = daysUntil <= 0 ? t('alm_today') : daysUntil === 1 ? t('alm_tomorrow') : t('alm_n_days', { n: daysUntil });
+    eclipseRows += '<div class="almanac-eclipse-row">' +
+      '<div><span class="almanac-eclipse-type">' + _alLink(ec.solar ? 'eclipse:total_solar' : 'eclipse:total_lunar', ec.type) + '</span><br><span class="almanac-eclipse-date">' +
+      ecDate.toLocaleDateString((typeof _currentLang !== 'undefined') ? _currentLang : undefined, { month: 'long', day: 'numeric', year: 'numeric' }) + '</span></div>' +
+      '<div class="almanac-eclipse-until">' + untilStr + '</div></div>';
+  }
+  if (eclipseRows) {
     html += '<div style="margin-top:16px">';
     html += '<div style="font-size:12px;color:var(--text2);margin-bottom:8px">' + t('alm_upcoming_eclipses') + '</div>';
-    for (var ei = 0; ei < nextEclipses.length; ei++) {
-      var ec = nextEclipses[ei];
-      var ecDate = new Date(ec.date + 'T00:00:00');
-      var daysUntil = Math.ceil((ecDate - now) / MS_PER_DAY);
-      var untilStr = daysUntil <= 0 ? t('alm_today') : daysUntil === 1 ? t('alm_tomorrow') : t('alm_n_days', { n: daysUntil });
-      html += '<div class="almanac-eclipse-row">' +
-        '<div><span class="almanac-eclipse-type">' + ec.type + '</span><br><span class="almanac-eclipse-date">' +
-        ecDate.toLocaleDateString((typeof _currentLang !== 'undefined') ? _currentLang : undefined, { month: 'long', day: 'numeric', year: 'numeric' }) + '</span></div>' +
-        '<div class="almanac-eclipse-until">' + untilStr + '</div></div>';
-    }
+    html += eclipseRows;
     html += '</div>';
   }
 
@@ -1495,12 +2238,16 @@ function _initTzClock(now) {
 }
 
 function _almSelectTz(tz, idx) {
-  // A world-clock card is a PREVIEW: it drives the analog clock and the card
-  // highlight, nothing else. It used to also _saveLocation(city) — so peeking
-  // at Tokyo's time silently re-homed the entire almanac (header clock, sun
-  // times, holidays) to Tokyo, permanently, per browser. Location changes
-  // belong to the sun map's picker alone.
+  // Clicking a world-clock city re-homes the almanac there: it drives the
+  // analog preview clock AND sets the page location through the same setter the
+  // sun-map picker uses, so the header clock, sun times, holidays and sky all
+  // follow to that city.
   _almSelectedTz = tz;
+  var city = _TZ_CITIES[idx];
+  if (city) {
+    _saveLocation(city.lat, city.lon, t('alm_city_' + city.key));
+    _almRepaintFocus();   // location-only refresh, preserves scroll
+  }
   _initTzClock(new Date());
   _drawTzClock(new Date());
 }
@@ -1649,14 +2396,15 @@ function _drawTzClock(now) {
     if (!secEl || labelEl.dataset.tz !== tz) {
       labelEl.dataset.tz = tz;
       labelEl.innerHTML =
-        '<div class="alm-clock-time"><span id="alm-clock-hm">' + hm + '</span>' +
-          '<span class="alm-clock-sec" id="alm-clock-sec">' + sec + '</span>' +
+        '<div class="alm-clock-time"><span class="alm-clock-hm" id="alm-clock-hm"></span>' +
+          '<span class="alm-clock-sec" id="alm-clock-sec"></span>' +
           '<span class="alm-clock-ampm" id="alm-clock-ampm">' + ampm + '</span></div>' +
         '<div class="alm-clock-date" id="alm-clock-date">' + dateStr + '</div>' +
         '<div class="alm-clock-sub"><span id="alm-clock-tzname">' + (tzLabel || '') + (tzAbbr ? ' \u00b7 ' + tzAbbr : '') + '</span></div>';
+      _rollDigitStr(document.getElementById('alm-clock-hm'), hm);
+      _rollDigitStr(document.getElementById('alm-clock-sec'), sec);
     } else {
-      var hmEl = document.getElementById('alm-clock-hm');
-      if (hmEl && hmEl.textContent !== hm) hmEl.textContent = hm;
+      _rollDigitStr(document.getElementById('alm-clock-hm'), hm);
       var apEl = document.getElementById('alm-clock-ampm');
       if (apEl && apEl.textContent !== ampm) apEl.textContent = ampm;
       var dEl = document.getElementById('alm-clock-date');
@@ -1664,11 +2412,76 @@ function _drawTzClock(now) {
       var tnEl = document.getElementById('alm-clock-tzname');
       var tzText = (tzLabel || '') + (tzAbbr ? ' \u00b7 ' + tzAbbr : '');
       if (tnEl && tnEl.textContent !== tzText) tnEl.textContent = tzText;
-      var secondsEl = document.getElementById('alm-clock-sec');
-      if (secondsEl && secondsEl.textContent !== sec) secondsEl.textContent = sec;
+      _rollDigitStr(document.getElementById('alm-clock-sec'), sec);
     }
   }
 }
+
+// Render/roll a clock string (seconds "42", or the hours:minutes "9:07") as
+// independent digit columns: each digit is its own clipped roll column, each
+// non-digit (the colon) a static separator. Column-count agnostic, so the same
+// per-digit roll drives hours, minutes and seconds alike. The shell is rebuilt
+// only when the column PATTERN changes -- e.g. 9:59 → 10:00 gains an hour digit
+// -- so an ordinary tick just rolls the digits that actually changed, and
+// _tickDigit's leak clamp keeps each column at ≤2 layers forever.
+function _rollDigitStr(el, str) {
+  if (!el) return;
+  str = '' + str;
+  var pattern = str.replace(/[0-9]/g, '#');
+  if (el.dataset.pat !== pattern) {
+    el.dataset.pat = pattern;
+    var shell = '';
+    for (var i = 0; i < str.length; i++) {
+      var ch = str.charAt(i);
+      if (ch >= '0' && ch <= '9') shell += '<span class="alm-clock-sec-col"><span class="alm-clock-sec-d">' + ch + '</span></span>';
+      else shell += '<span class="alm-clock-sep">' + ch + '</span>';
+    }
+    el.innerHTML = shell;
+    return;
+  }
+  var cols = el.querySelectorAll('.alm-clock-sec-col');
+  var ci = 0;
+  for (var j = 0; j < str.length; j++) {
+    var c = str.charAt(j);
+    if (c >= '0' && c <= '9') { _tickDigit(cols[ci], c); ci++; }
+  }
+}
+
+// Animate one clock digit column (seconds, minutes or hours): the old value
+// slides/fades up and out, the new value rises in from below — a clean counting
+// tick, transform+opacity only (no layout shift; the column clips the vertical
+// travel). Honours prefers-reduced-motion by swapping the text instantly.
+// Called per digit so a column only animates when ITS value changes.
+function _tickDigit(colEl, ch) {
+  if (!colEl) return;
+  var digits = colEl.querySelectorAll('.alm-clock-sec-d');
+  // Leak clamp: at any instant we want at most two layers — the current digit
+  // plus one outgoing mid-animation. querySelectorAll returns document order,
+  // so the LAST span is always the authoritative current value; earlier spans
+  // are outgoing layers. Drop everything older than those two so a missed
+  // animationend (backgrounded tab, interrupted transition) can never stack up
+  // permanent inline spans and grow the clock horizontally.
+  for (var i = 0; i < digits.length - 2; i++) {
+    if (digits[i].parentNode) digits[i].parentNode.removeChild(digits[i]);
+  }
+  var cur = digits.length ? digits[digits.length - 1] : null;
+  if (!cur) { colEl.innerHTML = '<span class="alm-clock-sec-d">' + ch + '</span>'; return; }
+  // Reading the last span (not the first) is what stops per-frame stacking:
+  // once the incoming digit is appended it becomes `cur`, and every remaining
+  // RAF frame this second short-circuits here instead of appending again.
+  if (cur.textContent === ch) return;
+  var reduce = false;
+  try { reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches; } catch (e) {}
+  if (reduce) { cur.textContent = ch; return; }
+  var incoming = document.createElement('span');
+  incoming.className = 'alm-clock-sec-d alm-sec-in';
+  incoming.textContent = ch;
+  incoming.addEventListener('animationend', function () { incoming.classList.remove('alm-sec-in'); }, { once: true });
+  cur.classList.add('alm-sec-out');
+  cur.addEventListener('animationend', function () { if (cur.parentNode) cur.parentNode.removeChild(cur); }, { once: true });
+  colEl.appendChild(incoming);
+}
+
 
 // Cached Intl.DateTimeFormat objects — avoid 180+ allocations/sec in the RAF loop
 var _tzFmtCache = {};
@@ -1694,6 +2507,10 @@ function _startTzClock() {
     if (now.getMinutes() !== _tzGridMinute) {
       _tzGridMinute = now.getMinutes();
       _initTzClock(now);
+      // Keep the time machine's NOW row ticking (HH:MM resolution, so a
+      // once-per-minute refresh is enough) while parked in the past/future.
+      var _nowRow = document.getElementById('alm-tm-now-val');
+      if (_nowRow) _nowRow.textContent = _almTmFmt(now);
     }
     _tzClockRAF = requestAnimationFrame(tick);
   }
@@ -2683,8 +3500,8 @@ function _renderAnalemma(now) {
     var mins = Math.abs(td.eot);
     var fastSlow = td.eot >= 0 ? t('alm_sun_ahead') : t('alm_sun_behind');
     cap.innerHTML =
-      '<div class="alm-analemma-now">' + t('alm_sun') + ': ' + mins.toFixed(1) + ' ' + t('alm_min') + ' ' + fastSlow +
-      ' · ' + t('alm_declination') + ' ' + td.decl.toFixed(1) + '°</div>' +
+      '<div class="alm-analemma-now">' + t('alm_sun') + ': ' + _lterm('equation_of_time', mins.toFixed(1) + ' ' + t('alm_min') + ' ' + fastSlow) +
+      ' · ' + _lterm('declination', t('alm_declination')) + ' ' + td.decl.toFixed(1) + '°</div>' +
       '<div class="alm-analemma-desc">' + t('alm_analemma_desc') + '</div>';
   }
 }
@@ -2703,9 +3520,11 @@ function _renderOnThisDay(now) {
     var ev = events[i];
     var ago = thisYear - ev.y;
     var agoStr = ago > 0 ? String(ago) + ' ' + (ago === 1 ? t('alm_year_ago') : t('alm_years_ago')) : '';
+    var evText = (window.AlmanacLinks && window.AlmanacLinks.linkifyEvent)
+      ? window.AlmanacLinks.linkifyEvent(ev.t, ev.w) : _almEsc(ev.t);
     rows += '<div class="alm-otd-row">' +
       '<div class="alm-otd-year">' + String(ev.y) + '</div>' +
-      '<div class="alm-otd-text">' + _almEsc(ev.t) +
+      '<div class="alm-otd-text">' + evText +
       (agoStr ? ' <span class="alm-otd-ago">' + agoStr + '</span>' : '') + '</div></div>';
   }
   el.innerHTML = '<div class="almanac-section">' +
@@ -2730,13 +3549,13 @@ function _renderTonightSky(now) {
       var brightness = p.magnitude < -3 ? t('alm_brightness_brilliant') : p.magnitude < -1 ? t('alm_brightness_very_bright') : p.magnitude < 1 ? t('alm_brightness_bright') : p.magnitude < 3 ? t('alm_brightness_visible') : t('alm_brightness_faint');
       html += '<div class="almanac-eclipse-row">' +
         '<div>' +
-        '<span class="almanac-eclipse-type" style="color:' + p.color + '">' + _tp(p.name) + '</span>' +
-        '<br><span class="almanac-eclipse-date">' + brightness + ' &middot; mag ' + magStr + ' &middot; ' + p.elongation.toFixed(0) + '\u00b0 ' + t('alm_from_sun') + '</span>' +
+        '<span class="almanac-eclipse-type" style="color:' + p.color + '">' + _lp(p.name) + '</span>' +
+        '<br><span class="almanac-eclipse-date">' + brightness + ' &middot; ' + _lterm('apparent_magnitude', 'mag') + ' ' + magStr + ' &middot; ' + _lterm('elongation', p.elongation.toFixed(0) + '\u00b0 ' + t('alm_from_sun')) + '</span>' +
         '</div>' +
         '<div class="almanac-eclipse-until" style="font-size:11px">' + p.sky + '<br>' + p.direction + '</div></div>';
     }
     if (notVisible.length > 0) {
-      var names = notVisible.map(function(p) { return _tp(p.name); });
+      var names = notVisible.map(function(p) { return _lp(p.name); });
       html += '<div style="margin-top:8px;font-size:11px;color:var(--text3);text-align:center">' + names.join(', ') + ' \u2014 ' + t('alm_not_visible_tonight') + '</div>';
     }
   }
@@ -2791,16 +3610,20 @@ function _renderMeteorShowers(now, moon) {
   var html = '';
   for (var i = 0; i < upcoming.length; i++) {
     var s = upcoming[i];
-    var untilStr = s.daysUntil < 0 ? t('alm_peak') : s.daysUntil === 0 ? t('alm_tonight') : s.daysUntil === 1 ? t('alm_tomorrow') : s.daysUntil + ' ' + t('alm_days');
+    // A shower at (or just past) its peak gets a highlighted chip; everything
+    // else is a plain amber countdown value.
+    var isPeaking = s.daysUntil < 0;
+    var untilStr = isPeaking ? t('alm_peak') : s.daysUntil === 0 ? t('alm_tonight') : s.daysUntil === 1 ? t('alm_tomorrow') : s.daysUntil + ' ' + t('alm_days');
+    var untilClass = 'almanac-eclipse-until' + (isPeaking ? ' almanac-eclipse-peak' : '');
     var rateDesc = s.zhr >= 100 ? t('alm_meteor_major') : s.zhr >= 25 ? t('alm_meteor_moderate') : t('alm_meteor_minor');
     var condColor = s.moonCondition === t('alm_moon_ideal') ? 'var(--accent)' : s.moonCondition === t('alm_moon_fair') ? 'var(--text2)' : 'var(--text3)';
     html += '<div class="almanac-eclipse-row">' +
       '<div>' +
-      '<span class="almanac-eclipse-type">' + t('alm_shower_' + s.key) + '</span>' +
-      '<br><span class="almanac-eclipse-date">~' + s.zhr + t('alm_per_hour') + ' &middot; ' + _tc(s.radiant) + ' &middot; ' + t('alm_speed_' + s.speed.toLowerCase()) +
+      '<span class="almanac-eclipse-type">' + _alLink('shower:' + s.key, t('alm_shower_' + s.key)) + '</span>' +
+      '<br><span class="almanac-eclipse-date">~' + s.zhr + t('alm_per_hour') + ' &middot; ' + _lc(s.radiant) + ' &middot; ' + t('alm_speed_' + s.speed.toLowerCase()) +
       ' &middot; <span style="color:' + condColor + '">' + s.moonIcon + ' ' + s.moonCondition + '</span></span>' +
       '</div>' +
-      '<div class="almanac-eclipse-until">' + untilStr + '</div></div>';
+      '<div class="' + untilClass + '">' + untilStr + '</div></div>';
   }
   html += '<div style="margin-top:10px;font-size:11px;color:var(--text3)">' + t('alm_moon_conditions') + ': ' +
     '\u{1F311} ' + t('alm_moon_ideal_desc') + ' &middot; \u{1F313} ' + t('alm_moon_fair') + ' &middot; \u{1F315} ' + t('alm_moon_poor_desc') + '</div>';
@@ -2917,13 +3740,13 @@ function _renderCelestialEvents(now) {
       var untilStr = ev.daysUntil <= 1 ? t('alm_now_exclaim') : ev.daysUntil + ' ' + t('alm_days');
       var title, detail;
       if (ev.type === 'conjunction') {
-        title = _tp(ev.planets[0]) + ' \u2013 ' + _tp(ev.planets[1]) + ' ' + t('alm_conjunction');
+        title = _lp(ev.planets[0]) + ' \u2013 ' + _lp(ev.planets[1]) + ' ' + _lterm('conjunction', t('alm_conjunction'));
         detail = ev.separation.toFixed(1) + '\u00b0 ' + t('alm_apart') + ' &middot; ' + dateStr;
       } else if (ev.type === 'opposition') {
-        title = _tp(ev.planet) + ' ' + t('alm_at_opposition');
+        title = _lp(ev.planet) + ' ' + _lterm('opposition', t('alm_at_opposition'));
         detail = t('alm_closest_brightest') + ' &middot; ' + dateStr;
       } else if (ev.type === 'elongation') {
-        title = _tp(ev.planet) + ' ' + t('alm_greatest_elongation');
+        title = _lp(ev.planet) + ' ' + _lterm('elongation', t('alm_greatest_elongation'));
         var skyLabel = ev.sky === 'evening' ? t('alm_evening') : t('alm_morning');
         detail = ev.elongation.toFixed(1) + '\u00b0 &middot; ' + skyLabel + ' ' + t('alm_sky') + ' &middot; ' + dateStr;
       }
@@ -3172,12 +3995,8 @@ function _almRegionName(region) {
 function _almRegion() {
   // The chosen location is the source of truth: clicking Italy on the map
   // means Italian holidays, whatever the browser locale says.
-  try {
-    var locData = JSON.parse(localStorage.getItem(_ALM_LOC_KEY) || 'null');
-    if (locData && typeof locData.lat === 'number') {
-      return _almRegionForLocation(locData.lat, locData.lon);
-    }
-  } catch (e) {}
+  var loc = _getLocation();
+  if (loc.stored) return _almRegionForLocation(loc.lat, loc.lon);
   try {
     var m = String(navigator.language || '').match(/[-_]([A-Za-z]{2})(\b|$)/);
     if (m) {
@@ -3203,13 +4022,13 @@ function _applyRegionHolidays(region, year, month, add) {
   var i;
   for (i = 0; i < (pack.fixed || []).length; i++) {
     var fx = pack.fixed[i];
-    if (fx[0] === month) add(fx[1], fx[2], 'holiday', '', src);
+    if (fx[0] === month) add(fx[1], fx[2], 'holiday', '', src, region);
   }
   for (i = 0; i < (pack.nth || []).length; i++) {
     var nh = pack.nth[i];
     if (nh[0] !== month) continue;
     var day = nh[2] === -1 ? _lastWeekday(year, month, nh[1]) : _nthWeekday(year, month, nh[1], nh[2]);
-    add(day, nh[3], 'holiday', '', src);
+    add(day, nh[3], 'holiday', '', src, region);
   }
   // Clock changes: labels hold both hemispheres (October IS spring in AU)
   var dst = pack.dst;
@@ -3267,11 +4086,8 @@ function _seasonEventsForYear(year) {
   if (_seasonCache.year === year) return _seasonCache.events;
   // Hemisphere-aware names: October IS spring in Sydney. Chosen location
   // decides; no location defaults to the northern names.
-  var south = false;
-  try {
-    var loc = JSON.parse(localStorage.getItem(_ALM_LOC_KEY) || 'null');
-    south = !!(loc && loc.lat < 0);
-  } catch (e) {}
+  var loc = _getLocation();
+  var south = !!(loc.stored && loc.lat < 0);
   var names = south
     ? ['Autumn Equinox', 'Winter Solstice', 'Spring Equinox', 'Summer Solstice']
     : ['Spring Equinox', 'Summer Solstice', 'Autumn Equinox', 'Winter Solstice'];
@@ -3288,7 +4104,7 @@ function _seasonEventsForYear(year) {
 // Get almanac events for a given calendar system's month, keyed by day number
 function _getAlmanacEvents(sys, year, month) {
   var events = {};
-  function add(day, label, type, icon, src) {
+  function add(day, label, type, icon, src, region) {
     if (day < 1 || day > 31) return;
     if (!events[day]) events[day] = [];
     // Belt-and-suspenders: base set + one region pack should never
@@ -3296,7 +4112,9 @@ function _getAlmanacEvents(sys, year, month) {
     for (var di = 0; di < events[day].length; di++) {
       if (events[day][di].label === label) return;
     }
-    events[day].push({ label: label, type: type, icon: icon || '', src: src || '' });
+    // `region` (ISO code) lets a shared label like "Independence Day" deep-link
+    // to the right country's article; '' for worldwide/native events.
+    events[day].push({ label: label, type: type, icon: icon || '', src: src || '', region: region || '' });
   }
 
   // Base worldwide / regional / astronomical events are computed on absolute
@@ -3521,10 +4339,13 @@ function _drawAlmanacGrid() {
 
   var html = '';
 
-  // Navigation
+  // Navigation. The year is directly clickable/typable \u2014 jump to any year,
+  // including 0, five-figure years, or a negative year for BCE.
   html += '<div class="alm-nav">';
   html += '<button class="alm-arrow" onclick="_almPrev()">\u25C0</button>';
-  html += '<div class="alm-title">' + monthName + ' ' + yearStr + '</div>';
+  html += '<div class="alm-title">' + monthName + ' ' +
+    '<span class="alm-year" tabindex="0" role="button" onclick="_almYearEdit(event)" onkeydown="_almYearTitleKey(event)" title="' + _almEsc(t('alm_tm_year_hint')) + '">' +
+    _almYear + '</span>' + _calYearSuffix(_almSystem) + '</div>';
   html += '<button class="alm-arrow" onclick="_almNext()">\u25B6</button>';
   var todayCal = _jdnToCalendar(_almSystem, todayJDN);
   var isCurrentMonth = (_almYear === todayCal.year && _almMonth === todayCal.month);
@@ -3592,7 +4413,11 @@ function _drawAlmanacGrid() {
       html += '<div class="alm-day-detail">';
       for (var ei = 0; ei < selEvents.length; ei++) {
         var ev = selEvents[ei];
-        var detailLabel = _th(ev.label).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+        var rawLabel = _th(ev.label);
+        var escName = rawLabel.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+        // Holidays deep-link into the library (fail-soft); other event types stay plain text.
+        var detailLabel = (ev.type === 'holiday' && window.AlmanacLinks)
+          ? window.AlmanacLinks.wrapHoliday(escName, rawLabel, ev.region) : escName;
         if (ev.src) detailLabel += ' <span style="color:var(--text3)">\u00b7 ' + ev.src.replace(/</g,'&lt;') + '</span>';
         html += '<div class="alm-ev alm-ev-' + ev.type + (ev.src ? ' alm-ev-country' : '') + '" style="font-size:12px;padding:2px 0">' +
           (ev.icon ? ev.icon + ' ' : '') + detailLabel + '</div>';
@@ -3635,8 +4460,11 @@ function _almSelectDay(jdn) {
   // instantaneous numbers describe "this time, that day".
   var g = _jdnToGregorian(jdn);
   var nowT = new Date();
-  var picked = new Date(g.year, g.month - 1, g.day, nowT.getHours(), nowT.getMinutes(), 0);
-  _almFocus = _almIsToday(picked) ? null : picked;
+  // _almMakeInstant (setFullYear) so a day picked in an arbitrary/ancient year
+  // — reachable via the typable year — lands on the real year, not the 1900s.
+  var picked = _almMakeInstant(g.year, g.month, g.day, nowT.getHours(), nowT.getMinutes());
+  _almFocus = _almIsToday(picked) ? null : _almClampInstant(picked);
+  _almTmShow();                          // picking a day reveals the instrument
   _almRepaintFocus();
   // If clicked day is outside current month view, navigate to it
   var cal = _jdnToCalendar(_almSystem, jdn);
@@ -3652,21 +4480,30 @@ function _almRenderCrossRef(jdn) {
   var html = '<div class="alm-crossref">';
   for (var i = 0; i < _CAL_SYSTEMS.length; i++) {
     var sys = _CAL_SYSTEMS[i];
-    var cal = _jdnToCalendar(sys, jdn);
-    var monthName = _calMonthName(sys, cal.year, cal.month);
-    var yearStr = cal.year + _calYearSuffix(sys);
-    var dateStr = monthName + ' ' + cal.day + ', ' + yearStr;
-    if (sys === 'chinese') {
-      // Key the animal to the CHINESE year being displayed (era 2697), which is
-      // the Gregorian year of that year's New Year \u2014 so the animal doesn't flip
-      // on Jan 1 in the weeks before Chinese New Year.
-      var chinese = _chineseZodiac(cal.year - 2697);
-      dateStr = monthName + ' ' + cal.day + ' \u00b7 ' + chinese.animal + ' \u00b7 ' + yearStr;
+    // Beyond a lunisolar calendar's meaningful span its conversion returns a
+    // non-finite or absurd value; show a quiet "beyond range" note rather than
+    // NaN or garbage. The Gregorian/Julian arithmetic stays valid throughout.
+    var dateStr;
+    try {
+      var cal = _jdnToCalendar(sys, jdn);
+      if (!isFinite(cal.year) || !isFinite(cal.month) || !isFinite(cal.day)) throw 0;
+      var monthName = _calMonthName(sys, cal.year, cal.month);
+      var yearStr = cal.year + _calYearSuffix(sys);
+      dateStr = monthName + ' ' + cal.day + ', ' + yearStr;
+      if (sys === 'chinese') {
+        // Key the animal to the CHINESE year being displayed (era 2697), which is
+        // the Gregorian year of that year's New Year \u2014 so the animal doesn't flip
+        // on Jan 1 in the weeks before Chinese New Year.
+        var chinese = _chineseZodiac(cal.year - 2697);
+        dateStr = monthName + ' ' + cal.day + ' \u00b7 ' + _alLink('zodiac:' + chinese.animalKey, chinese.animal) + ' \u00b7 ' + yearStr;
+      }
+    } catch (e) {
+      dateStr = '<span class="alm-beyond">' + _tLookup('alm_tm_beyond_range', "Beyond this calendar's range") + '</span>';
     }
     var isActive = sys === _almSystem ? ' alm-crossref-active' : '';
     html += '<div class="alm-crossref-row' + isActive + '"' +
       ' onclick="_almSwitchSystem(\'' + sys + '\')">' +
-      '<span class="alm-crossref-label">' + _calLabel(sys) + '</span>' +
+      '<span class="alm-crossref-label">' + _alLink('cal:' + sys, _calLabel(sys)) + '</span>' +
       '<span class="alm-crossref-date">' + dateStr + '</span>' +
       '</div>';
   }
@@ -3692,6 +4529,49 @@ function _almToday() {
   var cal = _jdnToCalendar(_almSystem, _almTodayJDN);
   _almYear = cal.year;
   _almMonth = cal.month;
+  _drawAlmanacGrid();
+}
+
+// Turn the calendar's year label into a number field you can type any year
+// into. Enter/blur commits, Escape restores. The field is unbounded in the
+// markup; _almJumpYear does the clamping.
+function _almYearEdit(e) {
+  if (e) e.stopPropagation();
+  var span = document.querySelector('#almanac-calendar .alm-year');
+  if (!span) return;
+  var input = document.createElement('input');
+  input.type = 'number';
+  input.step = '1';
+  input.className = 'alm-year-input';
+  input.value = _almYear;
+  input.setAttribute('aria-label', t('alm_tm_year'));
+  input.setAttribute('inputmode', 'numeric');
+  var done = false;
+  function commit() { if (done) return; done = true; _almJumpYear(input.value); }
+  function cancel() { if (done) return; done = true; _drawAlmanacGrid(); }
+  span.replaceWith(input);
+  input.focus();
+  if (input.select) input.select();
+  input.addEventListener('keydown', function (ev) {
+    if (ev.key === 'Enter') { ev.preventDefault(); commit(); }
+    else if (ev.key === 'Escape') { ev.preventDefault(); cancel(); }
+  });
+  input.addEventListener('blur', commit);
+}
+
+function _almYearTitleKey(e) {
+  if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); _almYearEdit(e); }
+}
+
+// Jump the browsed calendar to an arbitrary year in the current system. Clamp
+// to the span where JS Date stays valid so no downstream conversion goes NaN.
+function _almJumpYear(v) {
+  var y = parseInt(v, 10);
+  if (isNaN(y)) { _drawAlmanacGrid(); return; }
+  _almYear = Math.max(_ALM_YEAR_MIN, Math.min(_ALM_YEAR_MAX, y));
+  var max = _calMonthCount(_almSystem, _almYear);
+  if (_almMonth > max) _almMonth = max;
+  if (_almMonth < 1) _almMonth = 1;
   _drawAlmanacGrid();
 }
 
@@ -3788,6 +4668,7 @@ function _chineseZodiac(year) {
   var branches = ['\u5b50','\u4e11','\u5bc5','\u536f','\u8fb0','\u5df3','\u5348','\u672a','\u7533','\u9149','\u620c','\u4ea5'];
   var animals = [t('alm_zodiac_rat'),t('alm_zodiac_ox'),t('alm_zodiac_tiger'),t('alm_zodiac_rabbit'),t('alm_zodiac_dragon'),t('alm_zodiac_snake'),t('alm_zodiac_horse'),t('alm_zodiac_goat'),t('alm_zodiac_monkey'),t('alm_zodiac_rooster'),t('alm_zodiac_dog'),t('alm_zodiac_pig')];
   var elements = [t('alm_element_wood'),t('alm_element_wood'),t('alm_element_fire'),t('alm_element_fire'),t('alm_element_earth'),t('alm_element_earth'),t('alm_element_metal'),t('alm_element_metal'),t('alm_element_water'),t('alm_element_water')];
+  var animalKeys = ['rat','ox','tiger','rabbit','dragon','snake','horse','goat','monkey','rooster','dog','pig'];
   var offset = year - 4; // 4 CE was a Jia-Zi year
   var stemIdx = ((offset % 10) + 10) % 10;
   var branchIdx = ((offset % 12) + 12) % 12;
@@ -3796,7 +4677,7 @@ function _chineseZodiac(year) {
   var chineseYear = year + 2697; // Huang Di epoch (approximate)
   return {
     stem: stems[stemIdx], branch: branches[branchIdx],
-    animal: animals[branchIdx], element: elements[stemIdx],
+    animal: animals[branchIdx], animalKey: animalKeys[branchIdx], element: elements[stemIdx],
     cycle: stems[stemIdx] + branches[branchIdx],
     cycleYear: cycleYear, year: chineseYear
   };
@@ -4282,13 +5163,13 @@ function _renderDeepTime(now) {
 
   // Axial tilt
   html += '<div class="almanac-info-item"><div class="almanac-info-val">' + obliquityDeg.toFixed(2) + '\u00b0</div>' +
-    '<div class="almanac-info-lbl">' + t('alm_dt_tilt') + '</div>' +
+    '<div class="almanac-info-lbl">' + _lterm('axial_tilt', t('alm_dt_tilt')) + '</div>' +
     '<div style="font-size:11px;color:var(--text3);margin-top:4px">' +
     t('alm_dt_tilt_desc', { trend: tiltDir, impact: seasonImpact, pct: tiltInCycle }) + '</div></div>';
 
   // North Star
   html += '<div class="almanac-info-item"><div class="almanac-info-val">' + polarisDist + '\u00b0 ' + t('alm_from_true_north') + '</div>' +
-    '<div class="almanac-info-lbl">' + t('alm_dt_polaris') + '</div>' +
+    '<div class="almanac-info-lbl">' + _alLink('star:polaris', t('alm_dt_polaris')) + '</div>' +
     '<div style="font-size:11px;color:var(--text3);margin-top:4px">' +
     t('alm_dt_polaris_desc', { years: (14000 - now.getFullYear()).toLocaleString() }) + '</div></div>';
 
@@ -4298,20 +5179,20 @@ function _renderDeepTime(now) {
                totalExcessMs > 0.01 ? '+' + (totalExcessMs * 1000).toFixed(0) + '\u00b5s ' + t('alm_over_24h') :
                '~24h';
   html += '<div class="almanac-info-item"><div class="almanac-info-val">' + dayStr + '</div>' +
-    '<div class="almanac-info-lbl">' + t('alm_dt_daylen') + '</div>' +
+    '<div class="almanac-info-lbl">' + _lterm('tidal_acceleration', t('alm_dt_daylen')) + '</div>' +
     '<div style="font-size:11px;color:var(--text3);margin-top:4px">' +
     t('alm_dt_daylen_desc', { ms: excessMs.toFixed(1) }) + '</div></div>';
 
   // Orbital eccentricity
   var eccTrendStr = parseFloat(earthEcc) < eccPrev ? t('alm_decreasing') : t('alm_increasing');
   html += '<div class="almanac-info-item"><div class="almanac-info-val">' + earthEcc + '</div>' +
-    '<div class="almanac-info-lbl">' + t('alm_dt_orbit') + '</div>' +
+    '<div class="almanac-info-lbl">' + _lterm('orbital_eccentricity', t('alm_dt_orbit')) + '</div>' +
     '<div style="font-size:11px;color:var(--text3);margin-top:4px">' +
     t('alm_dt_orbit_desc', { trend: eccTrendStr }) + '</div></div>';
 
   // Julian Date
   html += '<div class="almanac-info-item"><div class="almanac-info-val">JD ' + julianDate + '</div>' +
-    '<div class="almanac-info-lbl">' + t('alm_dt_julian') + '</div>' +
+    '<div class="almanac-info-lbl">' + _lterm('julian_day', t('alm_dt_julian')) + '</div>' +
     '<div style="font-size:11px;color:var(--text3);margin-top:4px">' +
     t('alm_dt_julian_desc') + '</div></div>';
 
@@ -4322,7 +5203,7 @@ function _renderDeepTime(now) {
   var currentOrbitPct = ((sunAge % galacticPeriod) / galacticPeriod * 100).toFixed(1);
 
   html += '<div class="almanac-info-item"><div class="almanac-info-val">' + t('alm_galactic_orbit', { pct: currentOrbitPct, n: orbitsCompleted + 1 }) + '</div>' +
-    '<div class="almanac-info-lbl">' + t('alm_dt_galactic') + '</div>' +
+    '<div class="almanac-info-lbl">' + _lterm('galactic_year', t('alm_dt_galactic')) + '</div>' +
     '<div style="font-size:11px;color:var(--text3);margin-top:4px">' +
     t('alm_dt_galactic_desc', { age: (sunAge / 1000).toFixed(1), orbits: orbitsCompleted }) + '</div></div>';
 
@@ -4408,12 +5289,32 @@ async function _renderRosettaStone(now) {
   }
   html += '</div>';
 
+  // Title (linked to the encyclopedia article when the curated Q-ID resolves)
+  html += '<div class="rosetta-title-link">' + _lrosetta(entry.id, _almEsc(_rf(entry, 'title'))) + '</div>';
+
   // Metadata
   html += '<div class="rosetta-meta">' + _rf(entry, 'date') + ' \u00b7 ' + _rf(entry, 'place') + ' \u00b7 ' + _rf(entry, 'medium') + '</div>';
   html += '<div class="rosetta-context">' + _rf(entry, 'context') + '</div>';
 
-  // Language pills (bottom row) — show language names in current UI language
-  html += '<div class="rosetta-pills">';
+  // Language pills + text blocks live in stable containers so a language toggle
+  // can rewrite only them (via _updateRosettaLangs) without tearing down the
+  // artifact's image gallery below — its ~50 <img> nodes would otherwise be
+  // destroyed and re-decoded on every pill click.
+  html += '<div class="rosetta-pills" id="alm-rosetta-langpills">' + _rosettaLangPillsHtml(availLangs) + '</div>';
+  html += '<div id="alm-rosetta-texts">' + _rosettaTextsHtml(data) + '</div>';
+
+  // Golden Record image gallery (only when that inscription is selected)
+  if (entry.id === 'golden-record') {
+    html += _renderGoldenRecordGallery();
+  }
+
+  el.innerHTML = html;
+}
+
+// Language pill row (bottom) — active state reflects the chosen language(s).
+// Split out so a language toggle rebuilds only the pills, not the gallery.
+function _rosettaLangPillsHtml(availLangs) {
+  var html = '';
   for (var li = 0; li < _ALL_LANGS.length; li++) {
     var lc = _ALL_LANGS[li].code;
     var langLabel = t('lang_name_' + lc);
@@ -4426,11 +5327,14 @@ async function _renderRosettaStone(now) {
       html += '<button class="pill disabled" disabled>' + langLabel + '</button>';
     }
   }
-  html += '</div>';
+  return html;
+}
 
-  // Text block(s) — one or two-up comparison
+// Inscription text block(s) for the chosen language(s) — one, or a two-up
+// comparison. The only part that changes when languages toggle.
+function _rosettaTextsHtml(data) {
   var twoUp = _rosettaLangs.length === 2;
-  if (twoUp) html += '<div class="rosetta-compare">';
+  var html = twoUp ? '<div class="rosetta-compare">' : '';
   for (var ri = 0; ri < _rosettaLangs.length; ri++) {
     var langCode = _rosettaLangs[ri];
     var text = (data.texts || {})[langCode] || (data.texts || {})['en'] || '';
@@ -4447,13 +5351,21 @@ async function _renderRosettaStone(now) {
       '</div>';
   }
   if (twoUp) html += '</div>';
+  return html;
+}
 
-  // Golden Record image gallery (only when that inscription is selected)
-  if (entry.id === 'golden-record') {
-    html += _renderGoldenRecordGallery();
-  }
-
-  el.innerHTML = html;
+// Swap only the language pills + text blocks in place, leaving the artifact
+// title, metadata and (expensive) image gallery untouched.
+async function _updateRosettaLangs() {
+  var manifest = await _loadRosettaManifest();
+  if (!manifest.length) return;
+  var entry = manifest[_rosettaTextIdx] || manifest[0];
+  var data = await _loadInscription(entry.id);   // served from _rosettaCache
+  var availLangs = Object.keys(data.texts || {});
+  var pills = document.getElementById('alm-rosetta-langpills');
+  if (pills) pills.innerHTML = _rosettaLangPillsHtml(availLangs);
+  var texts = document.getElementById('alm-rosetta-texts');
+  if (texts) texts.innerHTML = _rosettaTextsHtml(data);
 }
 
 function _renderGoldenRecordGallery() {
@@ -4537,7 +5449,8 @@ function _toggleRosettaLang(code) {
     if (_rosettaLangs.length >= 2) _rosettaLangs.shift();
     _rosettaLangs.push(code);
   }
-  _renderRosettaStone(new Date());
+  // Language-only change — swap the text without rebuilding the image gallery.
+  _updateRosettaLangs();
 }
 
 // Scroll to Messages Across Time and select Golden Record (called from Voyager card)
@@ -4572,6 +5485,9 @@ window.addEventListener('resize', function() {
   _almanacResizeTimer = setTimeout(function() {
     _initOrrery();
     var loc = _getLocation();
-    _initSkyScene(new Date(), loc.lat, loc.lon);
+    // Redraw for the CURRENTLY focused instant, not live now — resizing while
+    // parked in the past/future must not snap the moon back to today. No
+    // animateMoon: from == to position, so it repaints in place without a glide.
+    _initSkyScene(_almFocusInstant(), loc.lat, loc.lon);
   }, 200);
 });

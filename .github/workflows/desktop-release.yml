@@ -27,6 +27,9 @@ jobs:
           - os: macos-latest
             artifact: Zimi-AppleSilicon
             asset: Zimi-AppleSilicon.dmg
+          - os: windows-latest
+            artifact: Zimi-windows-x64
+            asset: Zimi-windows-x64.zip
 
     runs-on: ${{ matrix.os }}
 
@@ -39,7 +42,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.12'
 
       - name: Install system dependencies (Linux)
         if: runner.os == 'Linux'
@@ -53,6 +56,14 @@ jobs:
 
       - name: Install dependencies
         run: pip install -r requirements-desktop.txt
+
+      - name: Install libtorrent (in-process BT engine)
+        shell: bash
+        run: |
+          # Soft dependency: no wheel for this platform → the build still
+          # ships and runs HTTP-only (soft import). Never block a release
+          # on BT bundling.
+          pip install "libtorrent==2.0.*" || echo "::warning::no libtorrent wheel for this platform — this build runs HTTP-only"
 
       - name: Install PyGObject (Linux)
         if: runner.os == 'Linux'
@@ -79,6 +90,32 @@ jobs:
           cp -R /tmp/Sparkle.framework Sparkle.framework
           echo "Sparkle.framework ready ($(du -sh Sparkle.framework | cut -f1))"
 
+      - name: Download WinSparkle.dll (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # Pinned WinSparkle release + sha256 (verified in-workflow, same
+          # discipline the old aria2 static download used). WinSparkle's EdDSA
+          # verification is wire-compatible with Sparkle's sign_update tool, so
+          # the release job signs the Windows enclosure with the same key.
+          $ver = '0.9.4'
+          # Upstream re-uploaded the 0.9.4 zip on 2026-07-23 (distrib.makefile
+          # fix adding the missing x86 build — vslavik/winsparkle commit
+          # "Really fix distrib.makefile", issue "0.9.4 doesn't contain x86
+          # build"). Hash re-verified from an independent download of the
+          # re-packaged asset; the x64 DLL layout is unchanged.
+          $expected = '6037df37fc263bd1650a1c4949681a9d40ffe991d01f35892a406cb5d103c976'
+          $url = "https://github.com/vslavik/winsparkle/releases/download/v$ver/WinSparkle-$ver.zip"
+          Invoke-WebRequest -Uri $url -OutFile winsparkle.zip -MaximumRetryCount 5 -RetryIntervalSec 5
+          $actual = (Get-FileHash winsparkle.zip -Algorithm SHA256).Hash.ToLower()
+          if ($actual -ne $expected) {
+            Write-Error "WinSparkle sha256 mismatch: expected $expected, got $actual"
+            exit 1
+          }
+          Expand-Archive -Path winsparkle.zip -DestinationPath winsparkle -Force
+          Copy-Item "winsparkle/WinSparkle-$ver/x64/Release/WinSparkle.dll" -Destination WinSparkle.dll -Force
+          Write-Host "WinSparkle.dll ready ($((Get-Item WinSparkle.dll).Length) bytes)"
+
       - name: Generate icons
         run: python zimi/assets/generate_icons.py
 
@@ -101,27 +138,6 @@ jobs:
                       print(f'  {f}  ({sz})')
           "
 
-      # ── Bundled aria2 sidecar (BT works out of the box on desktop) ────
-      - name: Prepare aria2 sidecar (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          brew list aria2 >/dev/null 2>&1 || brew install aria2
-          ci/bundle_aria2_macos.sh build/aria2-bundle
-          echo "ZIMI_ARIA2_DIR=$PWD/build/aria2-bundle" >> $GITHUB_ENV
-
-      - name: Prepare aria2 sidecar (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          mkdir -p build/aria2-bundle
-          curl -sL --retry 5 --retry-all-errors --retry-delay 5 \
-            "https://github.com/abcfy2/aria2-static-build/releases/download/1.37.0/aria2-x86_64-linux-musl_static.zip" \
-            -o /tmp/aria2-static.zip
-          echo "e0a09b12ef67f35f8a8e4fdddbec851d235b7c31da549d0578bff459032b499a  /tmp/aria2-static.zip" | sha256sum -c -
-          unzip -o /tmp/aria2-static.zip -d build/aria2-bundle
-          chmod +x build/aria2-bundle/aria2c
-          build/aria2-bundle/aria2c --version | head -1
-          echo "ZIMI_ARIA2_DIR=$PWD/build/aria2-bundle" >> $GITHUB_ENV
-
       - name: Build with PyInstaller
         run: pyinstaller --noconfirm zimi_desktop.spec
 
@@ -136,9 +152,49 @@ jobs:
         run: |
           if [ "$RUNNER_OS" = "macOS" ]; then
             ci/smoke_binary.sh "dist/Zimi.app/Contents/MacOS/Zimi"
+          elif [ "$RUNNER_OS" = "Windows" ]; then
+            # windows-latest runners provide git-bash for `shell: bash`.
+            # One-dir PyInstaller output is dist/Zimi/Zimi.exe.
+            ci/smoke_binary.sh "dist/Zimi/Zimi.exe"
           else
             ci/smoke_binary.sh "dist/Zimi/Zimi"
           fi
+
+      # GUI smoke: the check above only exercises the headless HTTP server, so
+      # it never opens a window — that gap let a build ship that crashed at
+      # launch (pythonnet couldn't load System.Windows.Forms). windows-latest
+      # runners have an interactive desktop + WebView2, so a real EdgeChromium
+      # window CAN open. Run the BUILT exe with ZIMI_DESKTOP_SMOKE=1 and demand
+      # the "SMOKE: window shown" marker + a clean exit.
+      - name: GUI smoke test (Windows — real window)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          ZIMI_DESKTOP_SMOKE: '1'
+        run: |
+          $exe = "dist/Zimi/Zimi.exe"
+          $out = "smoke_gui.out.log"
+          $err = "smoke_gui.err.log"
+          Write-Host "Launching $exe in GUI smoke mode..."
+          $p = Start-Process -FilePath $exe -PassThru `
+                 -RedirectStandardOutput $out -RedirectStandardError $err
+          if (-not $p.WaitForExit(120000)) {
+            try { $p.Kill() } catch {}
+            Write-Host "--- stdout ---"; Get-Content $out -ErrorAction SilentlyContinue
+            Write-Host "--- stderr ---"; Get-Content $err -ErrorAction SilentlyContinue
+            Write-Error "GUI smoke timed out (no exit within 120s)"
+            exit 1
+          }
+          $code = $p.ExitCode
+          Write-Host "--- stdout ---"; Get-Content $out -ErrorAction SilentlyContinue
+          Write-Host "--- stderr ---"; Get-Content $err -ErrorAction SilentlyContinue
+          Write-Host "exit code: $code"
+          if ($code -ne 0) { Write-Error "GUI smoke exited $code"; exit 1 }
+          if (-not (Select-String -Path $out -Pattern 'SMOKE: window shown' -Quiet)) {
+            Write-Error "GUI smoke did not report 'SMOKE: window shown'"
+            exit 1
+          }
+          Write-Host "GUI smoke passed: a real EdgeChromium window opened and was shown."
 
       # ── Packaging ─────────────────────────────────────────────────────
 
@@ -266,8 +322,9 @@ jobs:
             codesign --force --options runtime --sign "$IDENTITY" --timestamp "$SPARKLE"
           fi
 
-          # Sign all binaries inside the app bundle (incl. the aria2c sidecar)
-          find dist/Zimi.app -type f \( -name "*.dylib" -o -name "*.so" -o -name "*.pyd" -o -name "aria2c" \) -exec \
+          # Sign all binaries inside the app bundle (incl. the libtorrent
+          # extension + its bundled dylibs)
+          find dist/Zimi.app -type f \( -name "*.dylib" -o -name "*.so" -o -name "*.pyd" \) -exec \
             codesign --force --options runtime --sign "$IDENTITY" --timestamp {} \;
 
           # Sign the main executable
@@ -319,6 +376,32 @@ jobs:
           done
           echo "Notarization complete"
 
+      - name: Package portable ZIP (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # PyInstaller one-dir output is dist/Zimi/ (Zimi.exe + deps). Zip the
+          # whole folder so the archive extracts to a self-contained Zimi\ dir —
+          # no installer, portable. Compress-Archive ships with the runner.
+          Compress-Archive -Path dist/Zimi -DestinationPath ${{ matrix.asset }} -Force
+
+      - name: Build installer (Windows / Inno Setup)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # WinSparkle downloads and runs an installer to apply updates (a
+          # portable zip can't self-install), so ship a per-user Inno Setup
+          # installer as the auto-update enclosure alongside the portable zip.
+          # ISCC ships on the windows runner image; install via Chocolatey if not.
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup -y --no-progress
+            $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          }
+          $ver = (Select-String -Path pyproject.toml -Pattern '^version\s*=\s*"(.*)"').Matches[0].Groups[1].Value
+          & $iscc "/DMyAppVersion=$ver" windows\zimi.iss
+          Write-Host "Built installer: dist/Zimi-windows-x64-Setup.exe"
+
       - name: Move asset to dist
         run: mv ${{ matrix.asset }} dist/ 2>/dev/null || true
         shell: bash
@@ -328,6 +411,13 @@ jobs:
         with:
           name: ${{ matrix.artifact }}
           path: dist/${{ matrix.asset }}
+
+      - name: Upload Windows installer artifact
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Zimi-windows-x64-Setup
+          path: dist/Zimi-windows-x64-Setup.exe
 
   release:
     needs: build
@@ -347,17 +437,19 @@ jobs:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
 
-      # ── Sparkle EdDSA signing + appcast ─────────────────────────────
-      - name: Sign DMGs and update appcast.xml
+      # ── Sparkle/WinSparkle EdDSA signing + appcasts ─────────────────
+      - name: Sign updates and update appcasts
         env:
           SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
         run: |
           if [ -z "$SPARKLE_PRIVATE_KEY" ]; then
-            echo "SPARKLE_PRIVATE_KEY not set, skipping DMG signing"
+            echo "SPARKLE_PRIVATE_KEY not set, skipping update signing"
             exit 0
           fi
 
-          # Download Sparkle tools
+          # Download Sparkle tools. sign_update produces EdDSA (ed25519)
+          # signatures that WinSparkle verifies too, so one keypair signs the
+          # mac DMGs and the Windows installer alike.
           curl -sL --retry 5 --retry-all-errors --retry-delay 5 "https://github.com/sparkle-project/Sparkle/releases/download/2.8.1/Sparkle-2.8.1.tar.xz" -o /tmp/sparkle.tar.xz
           tar -xf /tmp/sparkle.tar.xz -C /tmp
 
@@ -365,22 +457,22 @@ jobs:
           VERSION="${TAG#v}"
           REPO="epheterson/Zimi"
 
-          # Sign both DMGs and generate per-architecture appcasts
+          # Sign one enclosure and write its appcast.
+          #   $1 label  $2 file-to-sign  $3 release-asset  $4 outfile  $5 min-sys line
           generate_appcast() {
-            local ARCH_NAME="$1" DMG_DIR="$2" DMG_ASSET="$3" OUTFILE="$4"
-            local DMG_FILE=$(ls "$DMG_DIR"/*.dmg 2>/dev/null | head -1)
-            if [ -z "$DMG_FILE" ]; then
-              echo "WARNING: No $ARCH_NAME DMG found in $DMG_DIR"
+            local LABEL="$1" FILE="$2" ASSET="$3" OUTFILE="$4" MINSYS="$5"
+            if [ ! -f "$FILE" ]; then
+              echo "WARNING: No $LABEL enclosure found at $FILE"
               return 1
             fi
 
-            echo "Signing $DMG_FILE ($ARCH_NAME)..."
-            local SIG=$(/tmp/bin/sign_update "$DMG_FILE" --ed-key-file <(echo "$SPARKLE_PRIVATE_KEY") 2>&1)
+            echo "Signing $FILE ($LABEL)..."
+            local SIG=$(/tmp/bin/sign_update "$FILE" --ed-key-file <(echo "$SPARKLE_PRIVATE_KEY") 2>&1)
             local ED_SIG=$(echo "$SIG" | grep -o 'sparkle:edSignature="[^"]*"' | sed 's/sparkle:edSignature="//;s/"//')
             local LENGTH=$(echo "$SIG" | grep -o 'length="[^"]*"' | sed 's/length="//;s/"//')
 
             if [ -z "$ED_SIG" ]; then
-              echo "ERROR: Failed to sign $ARCH_NAME DMG"
+              echo "ERROR: Failed to sign $LABEL enclosure"
               return 1
             fi
 
@@ -395,11 +487,10 @@ jobs:
               <item>
                 <title>Version ${VERSION}</title>
                 <sparkle:version>${VERSION}</sparkle:version>
-                <sparkle:shortVersionString>${VERSION}</sparkle:shortVersionString>
-                <sparkle:minimumSystemVersion>12.0</sparkle:minimumSystemVersion>
+                <sparkle:shortVersionString>${VERSION}</sparkle:shortVersionString>${MINSYS}
                 <pubDate>$(date -R)</pubDate>
                 <enclosure
-                  url="https://github.com/${REPO}/releases/download/${TAG}/${DMG_ASSET}"
+                  url="https://github.com/${REPO}/releases/download/${TAG}/${ASSET}"
                   length="${LENGTH}"
                   type="application/octet-stream"
                   sparkle:edSignature="${ED_SIG}"
@@ -413,13 +504,17 @@ jobs:
             cat "$OUTFILE"
           }
 
-          generate_appcast "Intel" "Zimi-Intel" "Zimi-Intel.dmg" "appcast-intel.xml"
-          generate_appcast "Apple Silicon" "Zimi-AppleSilicon" "Zimi-AppleSilicon.dmg" "appcast-arm64.xml"
+          MAC_MINSYS=$'\n            <sparkle:minimumSystemVersion>12.0</sparkle:minimumSystemVersion>'
+          generate_appcast "Intel" "Zimi-Intel/Zimi-Intel.dmg" "Zimi-Intel.dmg" "appcast-intel.xml" "$MAC_MINSYS"
+          generate_appcast "Apple Silicon" "Zimi-AppleSilicon/Zimi-AppleSilicon.dmg" "Zimi-AppleSilicon.dmg" "appcast-arm64.xml" "$MAC_MINSYS"
+          # Windows enclosure is the Inno Setup installer; WinSparkle downloads
+          # and runs it to apply the update. No minimumSystemVersion line.
+          generate_appcast "Windows" "Zimi-windows-x64-Setup/Zimi-windows-x64-Setup.exe" "Zimi-windows-x64-Setup.exe" "appcast-windows.xml" ""
 
           # Commit and push to main
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add appcast-intel.xml appcast-arm64.xml
+          git add appcast-intel.xml appcast-arm64.xml appcast-windows.xml
           git diff --cached --quiet && echo "No appcast changes" || {
             git commit -m "Update appcasts for ${TAG}"
             git push origin main
@@ -492,3 +587,5 @@ jobs:
             Zimi-Linux-snap/*.snap
             Zimi-Intel/Zimi-Intel.dmg
             Zimi-AppleSilicon/Zimi-AppleSilicon.dmg
+            Zimi-windows-x64/Zimi-windows-x64.zip
+            Zimi-windows-x64-Setup/Zimi-windows-x64-Setup.exe

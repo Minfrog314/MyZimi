@@ -4,6 +4,7 @@ Handles search caching, SQLite title indexes, full-text search via Xapian,
 suggestion search, and article content reading.
 """
 
+import hashlib as _hashlib
 import json
 import logging
 import math
@@ -12,6 +13,7 @@ import re
 import sqlite3
 import threading
 import time
+import unicodedata
 
 from libzim.search import Query, Searcher
 from libzim.suggestion import SuggestionSearcher
@@ -76,6 +78,22 @@ _search_cache_lock = threading.Lock()
 SEARCH_CACHE_MAX = 100
 SEARCH_CACHE_TTL = 900  # 15 minutes base
 SEARCH_CACHE_TTL_ACTIVE = 1800  # 30 minutes if re-accessed
+
+
+def _search_cache_key(q, zim_scope_str, limit, fast):
+    """Build the search-result cache key for the CURRENT request.
+
+    The key folds in the request's allowlist identity so a restricted user can
+    never HIT results computed for an all-access (admin/anonymous) session, or
+    for a user with a different allowlist — the core multi-user invariant. Keyed
+    caching (not a bypass) is deliberate: restricted users still get cache hits,
+    they just get them from their OWN partition. ``allow`` is None for
+    admin/anonymous/all-access (allow_key None); a restricted allowlist becomes a
+    sorted tuple, so two users with identical allowlists correctly share entries.
+    """
+    allow = _srv.current_allow()
+    allow_key = None if allow is None else tuple(sorted(allow))
+    return (q.lower().strip(), zim_scope_str, limit, fast, allow_key)
 
 
 def _search_cache_get(key):
@@ -199,7 +217,7 @@ def _suggest_cache_restore():
     try:
         if not os.path.exists(_SUGGEST_CACHE_PATH):
             return 0
-        with open(_SUGGEST_CACHE_PATH) as f:
+        with open(_SUGGEST_CACHE_PATH, encoding="utf-8") as f:
             data = json.load(f)
         now = time.time()
         loaded = 0
@@ -1116,6 +1134,493 @@ def _dedup_results_by_title(results):
     return deduped
 
 
+# ---------------------------------------------------------------------------
+# "Did you mean" spelling correction (offline)
+# ---------------------------------------------------------------------------
+# When a search comes back nearly empty, offer a correction built entirely
+# from the words that already appear in ZIM titles — no dictionary ships with
+# Zimi, the vocabulary IS the library. Norvig-style edit-distance candidate
+# generation (deletes/transposes/replaces/inserts) keeps matching O(word),
+# not O(vocab), so it stays fast even against a 200k-word vocabulary. The
+# whole feature is fail-soft: any error, empty vocab, or a blown time budget
+# yields no suggestion, never an exception and never a slow search.
+
+_DYM_MIN_RESULTS = 30  # suggest alongside weak result sets too (additive; results
+# still show). A typo on a 100M-article library routinely still matches junk
+# in the teens-to-twenties (typo'd titles elsewhere, partial-word hits) —
+# "einstien" pulled 13 real results, "volcanoe eruption" pulls ~26 — so a
+# lower bar suppressed the correction even with a perfect candidate in hand.
+# Safe to raise: the freq-ratio guard (_DYM_FREQ_RATIO) already prevents a
+# well-spelled query from getting "corrected" just because it also has few
+# results.
+_DYM_BUDGET_S = 0.05  # ~50ms ceiling on per-query correction work
+_DYM_FREQ_RATIO = 10  # an in-vocab word is only "corrected" when a candidate
+# is at least this many times more common — Norvig-style confidence that lets
+# us fix a typo that itself snuck into the vocab (e.g. a misspelled title)
+# without ever touching a genuinely common word.
+_VOCAB_MAX_WORDS = 200_000  # cap on distinct vocabulary words held in memory
+_VOCAB_MIN_WORD_LEN = 3  # ignore 1-2 char fragments (noise, not misspellings)
+# One-time ceiling on the lazy vocab scan when there's no usable cache on
+# disk (see _vocab_cache_load / _vocab_cache_save below). Generous on
+# purpose: this runs on a background daemon thread (see _ensure_vocab), off
+# the request path, and only ever pays this cost once per library state —
+# every later restart with an unchanged library hits the persisted cache
+# instead. Measured NAS throughput is ~50k+ rows/sec, so scanning every
+# index up to the per-file row cap below is a few minutes worst case; 300s
+# gives that room to actually finish instead of bailing mid-library.
+_VOCAB_BUILD_BUDGET_S = 300.0
+# Per-file cap on rows sampled, independent of the overall time budget. A
+# single giant index (English Wikipedia's ~27M titles) can otherwise eat the
+# entire budget before any other index — including much smaller, equally
+# relevant ones — ever gets opened. This cap now bounds a STRIDE SAMPLE
+# spread across the whole file (see _vocab_stride), not a contiguous
+# prefix: a 3M-row prefix of a 27M-row Wikipedia table sees only the
+# alphabetically- or insertion-order-first titles, and misses common words
+# like "mitochondria" or "photosynthesis" entirely — they simply aren't in
+# that prefix, however far it reads. Sampling every k-th row
+# instead gives a word occurring even a few dozen times across the whole
+# file a real chance to be sampled and survive lossy-counting eviction.
+_VOCAB_MAX_ROWS_PER_FILE = 3_000_000
+_VOCAB_FETCH_BATCH_SIZE = 5000  # sqlite fetchmany() page size during the scan
+# Lossy-counting admission: when the word cap is hit, count==1 entries (the
+# one-off proper nouns and IDs that dominate large title sets) are swept out
+# to make room, and scanning continues — this is what lets genuinely common
+# words admitted later in the scan still get counted, instead of the cap
+# freezing on whichever words happened to appear first. If a sweep frees
+# less than this fraction of the cap, the vocab has saturated (what's left
+# is mostly count>=2) and the scan stops for good.
+_VOCAB_EVICT_MIN_FRACTION = 0.10
+_VOCAB_CACHE_FILENAME = "dym_vocab.json"
+_VOCAB_CACHE_PATH = os.path.join(_srv.ZIMI_DATA_DIR, _VOCAB_CACHE_FILENAME)
+# Bump whenever the vocab-building algorithm changes in a way that makes an
+# on-disk cache from an older version invalid even though the underlying
+# title indexes haven't changed — lossy-counting admission and stride
+# sampling (see _vocab_stride) each changed which words a scan of the same
+# files produces. Folded into _vocab_signature so a stale-algorithm cache is
+# rebuilt transparently rather than loaded forever.
+_VOCAB_BUILDER_VERSION = 3
+_DIST2_MAX_LEN = 7  # only try edit-distance-2 on words this short or shorter
+_DYM_ALPHABET = "abcdefghijklmnopqrstuvwxyz0123456789"
+_word_split_re = re.compile(r"[^a-z0-9]+")
+# Split a query into alternating [gap, word, gap, word, ...]; odd indices are
+# words (the capturing group), so separators/case survive reconstruction. The
+# class is Unicode-aware (\w) on purpose: an accented run like "café" must stay
+# one token, not fragment into "caf" + "é" (folding the fragment would glue a
+# stray accent back on, e.g. "café" -> "cafeé"). Non-ASCII tokens are then
+# skipped for correction in _did_you_mean.
+_query_token_re = re.compile(r"(\w+)")
+
+_vocab = None  # {word: count}; None until built, a dict once built (empty on failure)
+_vocab_lock = threading.Lock()
+_vocab_builder_thread = None  # daemon thread building the vocab; test hook for .join()
+
+
+def _ascii_fold(s):
+    """Lowercased, accent-stripped ASCII form. 'Café' -> 'cafe'."""
+    return (
+        unicodedata.normalize("NFKD", s.lower())
+        .encode("ascii", "ignore")
+        .decode("ascii")
+    )
+
+
+def _evict_singleton_words(vocab):
+    """Sweep-delete every count==1 entry from `vocab`, in place.
+
+    Returns the number removed. Used both mid-scan (lossy-counting admission
+    when the word cap is hit) and once at the end (final prune — singletons
+    are noise for correction and just bloat the persisted cache)."""
+    singles = [w for w, c in vocab.items() if c == 1]
+    for w in singles:
+        del vocab[w]
+    return len(singles)
+
+
+def _vocab_stride(conn, cap):
+    """Row stride for near-uniform sampling of one title index.
+
+    Returns k such that reading every k-th row (by rowid) stays within
+    `cap` rows total, spread across the WHOLE file rather than a contiguous
+    prefix. A word occurring even a few dozen times across a 27M-row
+    Wikipedia table has a real chance of landing in that spread; a
+    contiguous prefix scan only ever sees whatever happened to be inserted
+    first. k=1 (every row, unfiltered — identical to a plain scan) when the
+    file is already at or under the cap, or when the row count can't be
+    estimated (MAX(rowid) failed or the table is empty); the per-file row
+    cap in _build_vocab still bounds how much gets read either way, so k=1
+    is always a safe fallback, never a correctness issue."""
+    try:
+        row = conn.execute("SELECT MAX(rowid) FROM titles").fetchone()
+    except Exception:
+        return 1
+    est_rows = row[0] if row else None
+    if not est_rows:
+        return 1
+    return max(1, math.ceil(est_rows / cap))
+
+
+def _build_vocab():
+    """Scan the SQLite title indexes into a {word: count} vocabulary.
+
+    Opens a FRESH connection per index (sqlite objects aren't shareable across
+    threads). Bounded three ways: a distinct-word cap, a per-file row cap, and
+    an overall wall-clock budget — whichever hits first stops that file (row
+    cap) or the whole scan (word cap / budget). Files are scanned largest-first
+    (by byte size) so the richest indexes (Wikipedia-scale) contribute first;
+    each file's rows are then STRIDE-SAMPLED (see _vocab_stride) rather than
+    read as a contiguous prefix, so the per-file row cap buys breadth across
+    the WHOLE file, not just its first N rows — a word occurring only
+    occasionally across a huge index still has a real chance to be sampled.
+    The word cap uses lossy-counting admission (see
+    _evict_singleton_words): hitting it triggers a singleton sweep rather
+    than freezing outright, so words seen later in the scan can still be
+    counted — a first-come cap otherwise fills entirely with one-off proper
+    nouns from a huge index before anything looks "common". A final sweep
+    after the whole scan drops any remaining singletons (noise for
+    correction, dead weight in the persisted cache). Returns whatever was
+    gathered (possibly empty). Never raises; a broken index is skipped.
+    Always logs the outcome at info level, including the empty case, so a
+    starved scan is visible in production rather than silently returning
+    nothing."""
+    deadline = time.monotonic() + _VOCAB_BUILD_BUDGET_S
+    vocab = {}
+    index_dir = _TITLE_INDEX_DIR
+    if not os.path.isdir(index_dir):
+        log.info("Did-you-mean vocab: no title index dir at %s", index_dir)
+        return vocab
+    try:
+        fnames = [f for f in os.listdir(index_dir) if f.endswith(".db")]
+    except Exception as e:
+        log.info("Did-you-mean vocab: cannot list %s: %s", index_dir, e)
+        return vocab
+    fnames.sort(key=lambda f: os.path.getsize(os.path.join(index_dir, f)), reverse=True)
+    total_files = len(fnames)
+    files_scanned = 0
+    rows_scanned = 0
+    at_cap = False
+    for fname in fnames:
+        if at_cap or time.monotonic() > deadline:
+            break
+        db_path = os.path.join(index_dir, fname)
+        try:
+            conn = sqlite3.connect(db_path, timeout=2)
+        except Exception as e:
+            log.debug("Vocab: cannot open %s: %s", fname, e)
+            continue
+        files_scanned += 1
+        rows_this_file = 0
+        try:
+            k = _vocab_stride(conn, _VOCAB_MAX_ROWS_PER_FILE)
+            if k > 1:
+                # SQLite filters the modulo C-side — Python still only ever
+                # sees up to the row cap, but spread across the whole file.
+                cur = conn.execute(
+                    "SELECT title_lower FROM titles WHERE (rowid % ?) = 0", (k,)
+                )
+            else:
+                cur = conn.execute("SELECT title_lower FROM titles")
+            while (
+                not at_cap
+                and rows_this_file < _VOCAB_MAX_ROWS_PER_FILE
+                and time.monotonic() <= deadline
+            ):
+                rows = cur.fetchmany(_VOCAB_FETCH_BATCH_SIZE)
+                if not rows:
+                    break
+                rows_this_file += len(rows)
+                for (title_lower,) in rows:
+                    if not title_lower:
+                        continue
+                    for w in _word_split_re.split(_ascii_fold(title_lower)):
+                        # Skip short fragments and bare numbers (years, page
+                        # ids) — not spelling-correctable, just cap pressure.
+                        if len(w) < _VOCAB_MIN_WORD_LEN or w.isdigit():
+                            continue
+                        if w in vocab:
+                            vocab[w] += 1
+                        elif not at_cap:
+                            vocab[w] = 1
+                            if len(vocab) >= _VOCAB_MAX_WORDS:
+                                freed = _evict_singleton_words(vocab)
+                                if freed < _VOCAB_MAX_WORDS * _VOCAB_EVICT_MIN_FRACTION:
+                                    at_cap = True
+        except Exception as e:
+            log.debug("Vocab: scan failed for %s: %s", fname, e)
+        finally:
+            rows_scanned += rows_this_file
+            try:
+                conn.close()
+            except Exception:
+                pass
+    budget_hit = time.monotonic() > deadline
+    pruned = _evict_singleton_words(
+        vocab
+    )  # final prune: singletons are noise, drop them
+    log.info(
+        "Did-you-mean vocab: %d words (%d singletons pruned) from %d/%d index "
+        "files, %d rows (budget_hit=%s, at_cap=%s)",
+        len(vocab),
+        pruned,
+        files_scanned,
+        total_files,
+        rows_scanned,
+        budget_hit,
+        at_cap,
+    )
+    return vocab
+
+
+def _vocab_signature(index_dir):
+    """Fingerprint of the title indexes a vocab would be built from.
+
+    Sorted (filename, size, mtime) triples plus _VOCAB_BUILDER_VERSION,
+    hashed. Any index added, removed, resized, or rewritten changes this —
+    it's how a persisted vocab cache (see _vocab_cache_load) knows it's
+    stale. So does a builder-version bump, which invalidates every existing
+    cache even though the indexes on disk haven't moved — that's what lets an
+    algorithm change replace a cache built by the old one instead of loading
+    it forever. Returns
+    None if the directory can't be listed, which callers treat as "cache
+    unusable"."""
+    try:
+        fnames = sorted(f for f in os.listdir(index_dir) if f.endswith(".db"))
+    except OSError:
+        return None
+    parts = [f"builder:{_VOCAB_BUILDER_VERSION}"]
+    for f in fnames:
+        try:
+            st = os.stat(os.path.join(index_dir, f))
+        except OSError:
+            continue
+        # Full float precision on mtime, not truncated to whole seconds — a
+        # quick reindex can rewrite a file within the same second and still
+        # need to invalidate the cache.
+        parts.append(f"{f}:{st.st_size}:{st.st_mtime!r}")
+    return _hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
+
+
+def _vocab_cache_save(vocab, sig):
+    """Persist a built vocab to disk so future starts can skip the scan.
+
+    Fail-soft: a write error is logged and otherwise ignored — the vocab
+    still works in memory for this process, it just won't survive restart."""
+    try:
+        _srv._atomic_write_json(_VOCAB_CACHE_PATH, {"sig": sig, "words": vocab})
+        log.info(
+            "Did-you-mean vocab: persisted %d words to %s",
+            len(vocab),
+            _VOCAB_CACHE_PATH,
+        )
+    except Exception as e:
+        log.info("Did-you-mean vocab: persist failed: %s", e)
+
+
+def _vocab_cache_load():
+    """Load a persisted vocab if its signature matches the current indexes.
+
+    Returns the {word: count} dict on a hit, or None (caller should rebuild)
+    on a missing file, signature mismatch, or any error — a corrupted or
+    stale cache is just treated as absent, never raised."""
+    try:
+        if not os.path.exists(_VOCAB_CACHE_PATH):
+            return None
+        with open(_VOCAB_CACHE_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        sig = _vocab_signature(_TITLE_INDEX_DIR)
+        if sig is None or data.get("sig") != sig:
+            return None
+        words = data.get("words")
+        if not isinstance(words, dict):
+            return None
+        return words
+    except Exception as e:
+        log.info("Did-you-mean vocab: cache load failed: %s", e)
+        return None
+
+
+def _vocab_build_worker():
+    """Load the vocab from disk if valid, else build it and persist. Never raises.
+
+    A build error (or a broken index) caches an empty vocab so we don't retry
+    on every query and never surface an exception to callers. A successful
+    fresh build is persisted to disk (see _vocab_cache_save) so the next
+    process start hits _vocab_cache_load instead of re-scanning every index."""
+    global _vocab
+    cached = _vocab_cache_load()
+    if cached is not None:
+        with _vocab_lock:
+            _vocab = cached
+        log.info(
+            "Did-you-mean vocab: loaded %d words from cache (%s)",
+            len(cached),
+            _VOCAB_CACHE_PATH,
+        )
+        return
+    try:
+        built = _build_vocab()
+    except Exception as e:
+        log.info("Did-you-mean vocab: build raised %s", e)
+        built = {}
+    with _vocab_lock:
+        _vocab = built if built is not None else {}
+    if built:
+        sig = _vocab_signature(_TITLE_INDEX_DIR)
+        if sig is not None:
+            _vocab_cache_save(built, sig)
+
+
+def _ensure_vocab():
+    """Return the cached vocabulary, or None while it is still being built.
+
+    Non-blocking by design: an uncached build can take up to
+    _VOCAB_BUILD_BUDGET_S (a cache hit is near-instant, see
+    _vocab_cache_load), and the sparse-search trigger runs inside
+    search_all — on the MCP path that happens while holding the global
+    libzim lock, so a synchronous build would stall every libzim op. The
+    first call kicks off a single daemon builder thread (guarded by
+    _vocab_lock so only one ever starts) and returns None immediately; later
+    sparse searches see the completed vocab. The 50ms per-query budget therefore
+    holds for every search, including the first."""
+    global _vocab, _vocab_builder_thread
+    with _vocab_lock:
+        if _vocab is not None:
+            return _vocab
+        if _vocab_builder_thread is None or not _vocab_builder_thread.is_alive():
+            _vocab_builder_thread = threading.Thread(
+                target=_vocab_build_worker, name="zimi-dym-vocab", daemon=True
+            )
+            _vocab_builder_thread.start()
+        return None
+
+
+def _join_vocab_build(timeout=5.0):
+    """Block until the background vocab builder finishes, if one is running.
+
+    Tests only — lets a test wait out the async build it kicked off."""
+    t = _vocab_builder_thread
+    if t is not None:
+        t.join(timeout)
+
+
+def _reset_vocab():
+    """Drop the cached vocabulary so the next call rebuilds. Tests only."""
+    global _vocab, _vocab_builder_thread
+    _join_vocab_build()  # let any in-flight builder finish before we clear state
+    with _vocab_lock:
+        _vocab = None
+        _vocab_builder_thread = None
+
+
+def _edits1(word):
+    """All strings one edit away from `word` (Norvig). Bounded by |word|."""
+    splits = [(word[:i], word[i:]) for i in range(len(word) + 1)]
+    deletes = [L + R[1:] for L, R in splits if R]
+    transposes = [L + R[1] + R[0] + R[2:] for L, R in splits if len(R) > 1]
+    replaces = [L + c + R[1:] for L, R in splits if R for c in _DYM_ALPHABET]
+    inserts = [L + c + R for L, R in splits for c in _DYM_ALPHABET]
+    return set(deletes + transposes + replaces + inserts)
+
+
+def _best_correction(word, vocab, deadline=None, freq_ratio=None):
+    """Best in-vocab correction for `word`, or None. Frequency breaks ties.
+
+    Distance-1 first; distance-2 only for short words (candidate set stays
+    bounded) and only if the time budget allows.
+
+    If `word` is itself in `vocab`, it's left alone UNLESS `freq_ratio` is
+    given: then a same-or-lower-distance candidate must be at least
+    `freq_ratio` times more common than `word` before it "corrects" an
+    already-valid word. This is what lets a typo that snuck into the vocab
+    (e.g. a misspelled ZIM title, seen a handful of times) get corrected to
+    the far more common correct spelling, while a genuinely common word
+    (whose count dwarfs any near-miss) is never touched."""
+    if not word:
+        return None
+    own_count = vocab.get(word)
+    if own_count is not None and freq_ratio is None:
+        return None
+
+    def _pick(cands):
+        if not cands:
+            return None
+        best = max(cands, key=lambda w: vocab[w])
+        if own_count is None or vocab[best] >= freq_ratio * own_count:
+            return best
+        return None
+
+    cands = [w for w in _edits1(word) if w in vocab and w != word]
+    picked = _pick(cands)
+    if picked:
+        return picked
+    if len(word) <= _DIST2_MAX_LEN and (
+        deadline is None or time.monotonic() <= deadline
+    ):
+        cands2 = set()
+        for e1 in _edits1(word):
+            for e2 in _edits1(e1):
+                if e2 in vocab and e2 != word:
+                    cands2.add(e2)
+        return _pick(cands2)
+    return None
+
+
+def _did_you_mean(query_str, vocab, deadline):
+    """Correct misspelled words in `query_str` against `vocab`.
+
+    Returns the whole query with corrections swapped in, or None if nothing
+    was corrected (or the differences are only case). Bails silently if the
+    time budget is exceeded mid-correction."""
+    if not vocab or not query_str:
+        return None
+    parts = _query_token_re.split(query_str)
+    corrected_any = False
+    out = []
+    for i, part in enumerate(parts):
+        if i % 2 == 0:  # separator/gap — keep verbatim
+            out.append(part)
+            continue
+        if not part.isascii():
+            # Token carries non-ASCII word chars (accents, Cyrillic, CJK).
+            # Folding it and correcting risks inventing a hybrid, so keep it
+            # verbatim — never mangle. (Tokenization already keeps such runs
+            # whole, e.g. "café" is one token, not "caf" + "é".)
+            out.append(part)
+            continue
+        folded = _ascii_fold(part)
+        if len(folded) >= _VOCAB_MIN_WORD_LEN and folded not in STOP_WORDS:
+            if time.monotonic() > deadline:
+                return None
+            # freq_ratio lets an in-vocab word still be corrected when a much
+            # more common candidate exists (see _best_correction docstring).
+            corr = _best_correction(folded, vocab, deadline, freq_ratio=_DYM_FREQ_RATIO)
+            if corr and corr != folded:
+                out.append(corr)
+                corrected_any = True
+                continue
+        out.append(part)
+    if not corrected_any:
+        return None
+    suggestion = "".join(out)
+    if suggestion.strip().lower() == query_str.strip().lower():
+        return None
+    return suggestion
+
+
+def _maybe_did_you_mean(query_str):
+    """Compute a spelling suggestion for a sparse query, or None. Fail-soft."""
+    if not query_str or not query_str.strip():
+        return None
+    try:
+        vocab = _ensure_vocab()
+        if not vocab:  # None (still building) or empty (fail-soft) → no suggestion
+            return None
+        deadline = time.monotonic() + _DYM_BUDGET_S
+        return _did_you_mean(query_str, vocab, deadline)
+    except Exception as e:
+        log.debug("did_you_mean failed for %r: %s", query_str, e)
+        return None
+
+
 def search_all(query_str, limit=5, filter_zim=None, fast=False):
     """Search across all ZIM files, a specific one, or a list.
 
@@ -1215,7 +1720,6 @@ def search_all(query_str, limit=5, filter_zim=None, fast=False):
                 log.debug(
                     "Suggest search failed for %s query %r: %s", name, query_str, e
                 )
-                pass
 
         if len(target_names) == 1:
             _search_one_zim(target_names[0])
@@ -1337,6 +1841,17 @@ def search_all(query_str, limit=5, filter_zim=None, fast=False):
     }
     if detected_lang:
         result["detected_language"] = detected_lang
+    # "Did you mean" — only on the full path (the fast path is a partial,
+    # progressive pass), and only when results are sparse. Additive field.
+    # Suppressed for restricted (allowlisted) sessions: the vocab is built
+    # globally from every ZIM's title index, so a correction could surface a
+    # title-word that only appears in a ZIM outside the user's allowlist — a
+    # small but real cross-allowlist leak. Admin/anonymous/all-access
+    # (current_allow() is None) keep the feature.
+    if not fast and len(deduped) < _DYM_MIN_RESULTS and _srv.current_allow() is None:
+        suggestion = _maybe_did_you_mean(query_str)
+        if suggestion:
+            result["did_you_mean"] = suggestion
     return result
 
 
@@ -1350,7 +1865,14 @@ def read_article(zim_name, article_path, max_length=None):
 
     archive = _srv.get_archive(zim_name) or _srv.open_archive(zims[zim_name])
     try:
-        entry = archive.get_entry_by_path(article_path)
+        try:
+            entry = archive.get_entry_by_path(article_path)
+        except KeyError:
+            # Single-page docs (devdocs): 'index#anchor' → serve base entry 'index'.
+            base_path, fragment = _srv.split_entry_fragment(article_path)
+            if not fragment:
+                raise
+            entry = archive.get_entry_by_path(base_path)
         item = entry.get_item()
         raw = bytes(item.content)
 
@@ -1382,6 +1904,175 @@ def read_article(zim_name, article_path, max_length=None):
         }
     except KeyError:
         return {"error": f"Article '{article_path}' not found in {zim_name}"}
+
+
+# ---------------------------------------------------------------------------
+# RAG chunking (GET /chunks + MCP get_chunks)
+# ---------------------------------------------------------------------------
+# Deterministic, embedding-free chunking so RAG clients can build their own
+# vector stores against a stable ID space. No embeddings live in this repo
+# (audit rule); we only slice text and hash it. Same ZIM + same params → byte
+# identical IDs on every server, and a ZIM update flips content_rev so every
+# derived chunk ID changes — cache invalidation for free.
+
+CHUNK_SIZE_MIN = 200
+CHUNK_SIZE_MAX = 4000
+CHUNK_SIZE_DEFAULT = 1200
+CHUNK_OVERLAP_DEFAULT = 120
+# Ceiling on the stripped text a single /chunks request will process. This
+# bounds per-request amplification the same way READ_MAX_LENGTH does for /read:
+# without it a multi-MB zimgit PDF would drive a full-text allocation plus a
+# giant chunk-array JSON on one call. 500k chars is ~100 chunks at defaults —
+# far larger than virtually any real encyclopedia article, so genuine content
+# is never truncated; only pathological inputs get capped.
+CHUNK_MAX_TEXT = 500_000
+_CONTENT_REV_LEN = 12  # sha256(stripped_text) prefix
+_CHUNK_ID_LEN = 16  # sha256(id components) prefix
+_CHUNK_SEP = "\n\n"  # paragraph joiner in the canonical stripped text
+
+# Block-level boundaries whose *closing* tag (or <br>) ends a paragraph. Split
+# the raw HTML on these first, then strip each piece, so paragraph structure
+# survives strip_html's whitespace collapse.
+_BLOCK_BOUNDARY_RE = re.compile(
+    r"(?i)</(?:p|div|li|h[1-6]|section|article|blockquote|tr|pre|figcaption|dd|dt)>"
+    r"|<br\s*/?>"
+)
+
+
+def _paragraphs_from_html(html_text):
+    """Split HTML into stripped, non-empty paragraph strings on block boundaries."""
+    return [
+        t
+        for t in (strip_html(part) for part in _BLOCK_BOUNDARY_RE.split(html_text))
+        if t
+    ]
+
+
+def _split_span(text, start, end, size):
+    """Split [start, end) into spans each <= size chars, breaking at spaces.
+
+    Used to hard-split a single oversize paragraph. Falls back to a mid-word cut
+    only when a window contains no space at all.
+    """
+    spans = []
+    s = start
+    while end - s > size:
+        brk = text.rfind(" ", s, s + size + 1)
+        if brk <= s:
+            brk = s + size  # no space in window — hard cut
+        spans.append((s, brk))
+        s = brk
+        while s < end and text[s] == " ":
+            s += 1
+    if s < end:
+        spans.append((s, end))
+    return spans
+
+
+def chunk_article(
+    zim_name, path, size=CHUNK_SIZE_DEFAULT, overlap=CHUNK_OVERLAP_DEFAULT
+):
+    """Chunk an article's stripped text into deterministic, RAG-ready segments.
+
+    Paragraph-aware: pack block paragraphs up to `size` chars, hard-splitting any
+    oversize paragraph at word boundaries; each chunk after the first is prefixed
+    with the previous chunk's last `overlap` chars. `start`/`end` are char offsets
+    into the canonical stripped text. Clamps params (size 200–4000, overlap
+    0–size/2) rather than erroring. Returns {"error": "not_found"} for an unknown
+    zim or path so the route can map it to 404.
+    """
+    size = max(CHUNK_SIZE_MIN, min(int(size), CHUNK_SIZE_MAX))
+    overlap = max(0, min(int(overlap), size // 2))
+
+    zims = _srv.get_zim_files()
+    if zim_name not in zims:
+        return {"error": "not_found"}
+
+    archive = _srv.get_archive(zim_name) or _srv.open_archive(zims[zim_name])
+    try:
+        try:
+            entry = archive.get_entry_by_path(path)
+        except KeyError:
+            # Single-page docs (devdocs): 'index#anchor' → chunk base entry 'index'.
+            base_path, fragment = _srv.split_entry_fragment(path)
+            if not fragment:
+                raise
+            entry = archive.get_entry_by_path(base_path)
+        item = entry.get_item()
+        raw = bytes(item.content)
+        title = entry.title
+        if item.mimetype == "application/pdf":
+            plain = extract_pdf_text(raw, max_length=CHUNK_MAX_TEXT)
+            paragraphs = [p for p in (b.strip() for b in plain.splitlines()) if p]
+        else:
+            paragraphs = _paragraphs_from_html(raw.decode("UTF-8", errors="replace"))
+    except KeyError:
+        return {"error": "not_found"}
+
+    stripped_text = _CHUNK_SEP.join(paragraphs)
+    # Cap the canonical text BEFORE hashing so content_rev (and thus chunk IDs)
+    # stay deterministic for capped content. If the cut lands mid-paragraph,
+    # drop the partial trailing paragraph so chunk offsets align to real breaks.
+    truncated = len(stripped_text) > CHUNK_MAX_TEXT
+    if truncated:
+        stripped_text = stripped_text[:CHUNK_MAX_TEXT]
+        cut = stripped_text.rfind(_CHUNK_SEP)
+        if cut > 0:
+            stripped_text = stripped_text[:cut]
+        paragraphs = stripped_text.split(_CHUNK_SEP)
+    content_rev = _hashlib.sha256(stripped_text.encode("utf-8")).hexdigest()[
+        :_CONTENT_REV_LEN
+    ]
+
+    # Word-bounded units: each paragraph's span into stripped_text, hard-split if
+    # it alone exceeds `size`. Units tile the text (separators fall between them).
+    units = []
+    pos = 0
+    for i, para in enumerate(paragraphs):
+        if i > 0:
+            pos += len(_CHUNK_SEP)
+        units.extend(_split_span(stripped_text, pos, pos + len(para), size))
+        pos += len(para)
+
+    # Greedily pack units into chunks bounded by `size` (offsets into stripped_text).
+    spans = []
+    cur_start = cur_end = None
+    for s, e in units:
+        if cur_start is None:
+            cur_start, cur_end = s, e
+        elif e - cur_start <= size:
+            cur_end = e
+        else:
+            spans.append((cur_start, cur_end))
+            cur_start, cur_end = s, e
+    if cur_start is not None:
+        spans.append((cur_start, cur_end))
+
+    chunks = []
+    for seq, (start, end) in enumerate(spans):
+        core = stripped_text[start:end]
+        if seq > 0 and overlap:
+            prev_start, prev_end = spans[seq - 1]
+            prefix = stripped_text[max(prev_start, prev_end - overlap) : prev_end]
+            text = prefix + core
+        else:
+            text = core
+        cid = _hashlib.sha256(
+            f"{zim_name}|{path}|{content_rev}|{seq}|{size}|{overlap}".encode("utf-8")
+        ).hexdigest()[:_CHUNK_ID_LEN]
+        chunks.append({"id": cid, "seq": seq, "start": start, "end": end, "text": text})
+
+    return {
+        "zim": zim_name,
+        "path": path,
+        "title": title,
+        "size": size,
+        "overlap": overlap,
+        "content_rev": content_rev,
+        "truncated": truncated,
+        "total_chunks": len(chunks),
+        "chunks": chunks,
+    }
 
 
 def get_catalog(zim_name):
@@ -1568,6 +2259,106 @@ def _pick_html_entry(archive, paths):
     return None
 
 
+# On-this-day event lines look like "1777 – <event text>" under the
+# Events/Births/Deaths sections of a Wikipedia "Month_Day" page. Following a
+# random link off such a page frequently lands on the generic background topic
+# of an event (e.g. American Revolution) rather than a date-anchored article, so
+# the card feels broken. We instead parse the event lines and pick the article
+# the event actually names, returning the event context alongside it.
+_OTD_DASH = "–—-"  # en-dash, em-dash, hyphen — Wikipedia uses en-dash
+_otd_line_re = re.compile(
+    r"^\s*(\d{1,4}(?:\s*BC)?)\s*[" + _OTD_DASH + r"]\s*(.+)$", re.DOTALL
+)
+_otd_year_re = re.compile(r"^\d{1,4}(?:\s*BC)?$")
+_OTD_TEXT_CAP = 240  # keep event blurbs card-sized
+_OTD_SCAN_CAP = 600000  # bound the regex scan on huge Month_Day pages
+
+
+def _otd_norm_link(href):
+    """Normalize a Wikipedia anchor href to a bare ZIM article path.
+
+    Handles ZIM-relative (./Foo, ../A/Foo, A/Foo) and absolute
+    (https://en.wikipedia.org/wiki/Foo) forms; drops fragments and queries.
+    The caller retries with an "A/" prefix, so we strip a leading namespace.
+    """
+    href = href.split("#")[0].split("?")[0]
+    href = re.sub(r"^https?://[^/]+/wiki/", "", href)
+    href = re.sub(r"^(?:\.\./|\./)+", "", href)
+    href = re.sub(r"^(?:A/|/wiki/|/)", "", href)
+    return href
+
+
+def _extract_otd_events(page_html):
+    """Parse date-anchored event lines from a Wikipedia "Month_Day" page.
+
+    Returns a list of {"year", "text", "link"} in document order, covering the
+    Events/Births/Deaths sections. For each line, "link" is the most specific
+    (longest-text) non-year article link on that line, so the pick is an
+    article the event names — not a random topic off the page. Fail-soft: any
+    parse trouble yields [].
+    """
+    try:
+        # Bound the scan to the dated sections: from the "Events" heading to the
+        # first of Holidays/References/See also/External links (or a cap). Lines
+        # in those sections are all "YEAR – ..." shaped; nav/holidays lines are
+        # not year-prefixed and get filtered out anyway.
+        # Anchor on the section HEADING tag (<h2 id="Events">Events…), not any
+        # bare ">Events<" — the latter also matches table-of-contents chrome.
+        start = re.search(r"<h[2-4][^>]*>(?:\s|<[^>]+>)*Events\b", page_html)
+        scan = page_html[start.start() :] if start else page_html
+        end = re.search(
+            r"<h[2-4][^>]*>(?:\s|<[^>]+>)*"
+            r"(?:Holidays and observances|Holidays|References|See also"
+            r"|External links)\b",
+            scan,
+        )
+        scan = scan[: end.start()] if end else scan[:_OTD_SCAN_CAP]
+        events = []
+        for li in re.findall(r"<li\b[^>]*>(.*?)</li>", scan, re.DOTALL | re.IGNORECASE):
+            # Drop <sup> footnote/citation markers before flattening so they
+            # don't leave "[ 19 ]" litter in the sentence.
+            li = re.sub(
+                r"<sup\b[^>]*>.*?</sup>", "", li, flags=re.DOTALL | re.IGNORECASE
+            )
+            plain = strip_html(li)
+            plain = re.sub(r"\[\s*\d+\s*\]", "", plain)  # any remaining [1] marks
+            plain = re.sub(r"\s+([,.;:])", r"\1", plain).strip()
+            m = _otd_line_re.match(plain)
+            if not m:
+                continue
+            year, text = m.group(1).strip(), m.group(2).strip()
+            if len(text) < 3:
+                continue
+            if len(text) > _OTD_TEXT_CAP:
+                text = text[:_OTD_TEXT_CAP].rsplit(" ", 1)[0] + "…"
+            # Pick the most specific link on the line: longest anchor text that
+            # isn't a bare year (year-page links are skipped entirely).
+            best_link, best_len = None, 0
+            for href, inner in re.findall(
+                r'<a\b[^>]*href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',
+                li,
+                re.DOTALL | re.IGNORECASE,
+            ):
+                atext = strip_html(inner)
+                if not atext or _otd_year_re.match(atext):
+                    continue
+                link = _otd_norm_link(href)
+                if not link or _otd_year_re.match(link.replace("_", " ")):
+                    continue
+                if ":" in link or re.search(
+                    r"\.(png|jpg|jpeg|gif|svg|ico)$", link, re.IGNORECASE
+                ):
+                    continue  # File:/Category: namespaces and images
+                if len(atext) > best_len:
+                    best_link, best_len = link, len(atext)
+            if best_link:
+                events.append({"year": year, "text": text, "link": best_link})
+        return events
+    except Exception as e:
+        log.debug("On-this-day event parse failed: %s", e)
+        return []
+
+
 def _get_dated_entry(archive, zim_name, mmdd, rng=None):
     """Try to find an article for today's date in date-based or content ZIMs.
 
@@ -1621,11 +2412,41 @@ def _get_dated_entry(archive, zim_name, mmdd, rng=None):
                 if entry.is_redirect:
                     entry = entry.get_redirect_entry()
                 raw = bytes(entry.get_item().content)
-                date_page_html = raw.decode("utf-8", errors="replace")[:100000]
+                # Full body (already in memory) so the Events/Births/Deaths
+                # sections aren't truncated on big Month_Day pages.
+                date_page_html = raw.decode("utf-8", errors="replace")
                 break
             except KeyError:
                 continue
         if date_page_html:
+            # Preferred: pick an article a dated event actually names, and carry
+            # the event context (year + sentence) back so the card can show the
+            # date even when the target article never restates it.
+            events = _extract_otd_events(date_page_html)
+            _rng = rng or _random
+            _rng.shuffle(events)
+            for ev in events:
+                for prefix in ["A/", ""]:
+                    try:
+                        entry = archive.get_entry_by_path(prefix + ev["link"])
+                        if entry.is_redirect:
+                            entry = entry.get_redirect_entry()
+                        item = entry.get_item()
+                        if not (item.mimetype or "").startswith("text/html"):
+                            continue
+                        title = entry.title or ""
+                        if _meta_title_re.search(title) or len(title) < 3:
+                            continue
+                        return {
+                            "path": entry.path,
+                            "title": title,
+                            "event_year": ev["year"],
+                            "event_text": ev["text"],
+                        }
+                    except (KeyError, Exception):
+                        # Subset ZIMs may not hold the target — try next line.
+                        continue
+            # Fallback: no event line resolved — follow a random internal link.
             # Extract article links from the date page
             links = re.findall(
                 r'href=["\'](?:\./|A/)?([^"\'#/][^"\'#]*)["\']', date_page_html

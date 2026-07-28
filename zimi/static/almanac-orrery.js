@@ -36,6 +36,112 @@ function _planetPosition(name, T) {
 
 var _orreryPlanetPositions = []; // [{name, x, y, r}] in CSS pixels for hover
 
+var _orrerySunPos = null; // {x, y, r} in CSS pixels — the Sun is always at center
+
+// ── Deep-link a tapped body to its installed article ──
+// Interaction model (restored to pre-1.8 behaviour, with the link ADDED not
+// substituted):
+//   • A TAP does exactly what it always did — a planet launches its rocket
+//     transit, a probe opens its detail card. Nothing is demoted to a menu.
+//   • Bodies whose only affordance is their article (Earth, the belts) open it
+//     on tap.
+//   • The HOVER tooltip keeps the info it always showed AND, when the body's
+//     curated Q-ID resolved against the installed library, renders the body
+//     NAME as a dotted-amber link (.alm-link idiom). On touch the same tooltip is shown after the
+//     tap, so the link is reachable without a hover.
+//   • A SECOND tap on the same, already-selected body (whose article resolved)
+//     opens that article — the discoverable touch path, added alongside the
+//     tooltip name-link, not replacing the first-tap action.
+
+var _orrerySelectedKey = null; // link key of the body a first tap selected
+
+// Belt annulus hit zones, recorded on each draw (asteroid + Kuiper belts). Each
+// is {key, rIn, rOut} in CSS pixels measured from the canvas centre.
+var _orreryBeltZones = [];
+
+// Find the hit target at a canvas position, or null. The Sun (small, fixed at
+// center) and planets/probes win over the belts (they sit inside/over the
+// bands); belts — and the heliopause ring — are broad/thin ring zones.
+function _orreryHitTest(mx, my, tolerance) {
+  if (_orrerySunPos) {
+    var sdx = mx - _orrerySunPos.x, sdy = my - _orrerySunPos.y;
+    if (sdx * sdx + sdy * sdy < (_orrerySunPos.r + tolerance) * (_orrerySunPos.r + tolerance)) {
+      return { type: 'sun', data: _orrerySunPos };
+    }
+  }
+  for (var i = 0; i < _orreryPlanetPositions.length; i++) {
+    var p = _orreryPlanetPositions[i];
+    var dx = mx - p.x, dy = my - p.y;
+    if (dx * dx + dy * dy < (p.r + tolerance) * (p.r + tolerance)) return { type: 'planet', data: p };
+  }
+  for (var j = 0; j < _voyagerPositions.length; j++) {
+    var v = _voyagerPositions[j];
+    var vdx = mx - v.x, vdy = my - v.y;
+    if (vdx * vdx + vdy * vdy < (v.r + tolerance + 6) * (v.r + tolerance + 6)) return { type: 'voyager', data: v };
+  }
+  if (_orreryCanvas && _orreryBeltZones.length) {
+    var c = (_orreryCanvas.clientWidth || 0) / 2;
+    var brx = mx - c, bry = my - c;
+    var rr = Math.sqrt(brx * brx + bry * bry);
+    for (var b = 0; b < _orreryBeltZones.length; b++) {
+      var bz = _orreryBeltZones[b];
+      if (rr >= bz.rIn - tolerance && rr <= bz.rOut + tolerance) {
+        return { type: 'belt', data: { key: bz.key, labelKey: bz.labelKey, x: mx, y: my, r: 0 } };
+      }
+    }
+  }
+  return null;
+}
+
+// AlmanacLinks key for a hit-test result, or null for un-mappable bodies.
+function _orreryLinkKey(hit) {
+  if (!hit) return null;
+  if (hit.type === 'sun') return 'planet:sun';
+  if (hit.type === 'planet') return 'planet:' + hit.data.name.toLowerCase();
+  if (hit.type === 'voyager') return 'probe:' + hit.data.name.toLowerCase().replace(/[^a-z0-9]+/g, '');
+  if (hit.type === 'belt') return hit.data.key;
+  return null;
+}
+
+// The resolved article for a hit (null when not a link / batch not yet landed).
+function _orreryLinkFor(hit) {
+  var key = _orreryLinkKey(hit);
+  return (key && window.AlmanacLinks) ? window.AlmanacLinks.linkFor(key) : null;
+}
+
+function _orreryOpenLink(key) { if (key && window.AlmanacLinks) window.AlmanacLinks.open(key); }
+
+// Tap handler for mouse + touch. Restores the pre-1.8 direct actions: a planet
+// launches its transit, a probe opens its detail card. A body whose only
+// affordance is its article (Earth, a belt) opens it. Returns the hit so the
+// touch path can raise the info+link tooltip afterward. The article link is
+// never on this path — it lives in the tooltip (as the body name).
+function _orreryTap(mx, my, tolerance) {
+  var hit = _orreryHitTest(mx, my, tolerance);
+  if (!hit) { _orrerySelectedKey = null; return null; }
+  var linkKey = _orreryLinkKey(hit);
+  var resolved = !!_orreryLinkFor(hit);
+  // Second tap on the same, already-selected body (whose article resolved)
+  // opens it — the discoverable touch path, using the same open as the tooltip
+  // name-link. A no-link body has no selection, so it never reaches here.
+  if (resolved && linkKey && linkKey === _orrerySelectedKey) {
+    _orreryOpenLink(linkKey);
+    return hit;
+  }
+  if (hit.type === 'planet') {
+    if (hit.data.name !== 'Earth') _orreryLaunchRocket(hit.data.name); // fly, exactly as before
+    else _orreryOpenLink(_orreryLinkKey(hit));                          // Earth: no transit → article
+  } else if (hit.type === 'voyager') {
+    _showVoyagerCard(hit.data.idx);                                     // probe: detail card, as before
+  } else if (hit.type === 'belt' || hit.type === 'sun') {
+    _orreryOpenLink(_orreryLinkKey(hit));                               // belt/Sun/heliopause: article only
+  }
+  // Remember the selection only when its article resolved, so a second tap has
+  // somewhere to go (no link → no second-tap open, never a search).
+  _orrerySelectedKey = resolved ? linkKey : null;
+  return hit;
+}
+
 function _initOrrery() {
   var canvas = document.getElementById('almanac-orrery');
   if (!canvas) return;
@@ -52,35 +158,68 @@ function _initOrrery() {
   _orreryDpr = dpr;
   _orrerySpeedLabel = document.getElementById('orrery-speed-label');
   _orrerySliderEl = document.getElementById('orrery-slider');
+  _orrerySelectedKey = null;
   _drawOrrery(canvas, dpr);
 
-  // Hover tooltip for planet names
+  // Hover tooltip: the body stats with the body NAME as a dotted-amber link when
+  // its curated Q-ID resolved. The tooltip box itself takes pointer events (see
+  // CSS) and a grace period (_ORRERY_TIP_GRACE_MS) keeps it open while the
+  // pointer crosses the small gap between the body and the box — long enough to
+  // reach and click the link, without lingering once the pointer is truly gone.
+  var _ORRERY_TIP_GRACE_MS = 300;
   var tooltip = document.getElementById('orrery-tooltip');
   if (!tooltip) {
     tooltip = document.createElement('div');
     tooltip.id = 'orrery-tooltip';
-    tooltip.style.cssText = 'position:absolute;pointer-events:none;background:rgba(0,0,0,0.75);color:#ccc;font-size:11px;padding:3px 8px;border-radius:4px;display:none;white-space:nowrap;z-index:10;backdrop-filter:blur(4px)';
     wrap.style.position = 'relative';
     wrap.appendChild(tooltip);
+    tooltip.addEventListener('click', function (e) {
+      var el = e.target;
+      var key = el && el.getAttribute ? el.getAttribute('data-alm-key') : null;
+      if (key) { e.stopPropagation(); _orreryOpenLink(key); }
+    });
   }
-  // Helper: find hit target (planet or voyager) at mouse position
-  function _orreryHitTest(mx, my, tolerance) {
-    for (var i = 0; i < _orreryPlanetPositions.length; i++) {
-      var p = _orreryPlanetPositions[i];
-      var dx = mx - p.x, dy = my - p.y;
-      if (dx * dx + dy * dy < (p.r + tolerance) * (p.r + tolerance)) return { type: 'planet', data: p };
+  var _tipHideTimer = null;
+  function _cancelTipHide() { if (_tipHideTimer) { clearTimeout(_tipHideTimer); _tipHideTimer = null; } }
+  function _hideTip() { _cancelTipHide(); tooltip.style.display = 'none'; }
+  function _tipHasLink() { return !!tooltip.querySelector('.alm-link'); }
+  function _scheduleTipHide(ms) { _cancelTipHide(); _tipHideTimer = setTimeout(function () { tooltip.style.display = 'none'; }, ms); }
+
+  // Info for a hit, split so the NAME can carry the link idiom while the trailing
+  // stats stay plain text: { name, rest } where `rest` includes its leading ' · '.
+  function _tipInfo(hit) {
+    if (hit.type === 'sun') return { name: t('alm_sun'), rest: '' };
+    if (hit.type === 'planet') {
+      var rest = '';
+      if (hit.data.name !== 'Earth') {
+        var days = Math.round(_hohmannDays(_PLANETS['Earth'].a, _PLANETS[hit.data.name].a));
+        rest = (days < 365) ? ' · ' + t('alm_transfer_days', { n: days })
+                            : ' · ' + t('alm_transfer_years', { n: (days / 365.25).toFixed(1) });
+      }
+      return { name: _tp(hit.data.name), rest: rest };
     }
-    for (var i = 0; i < _voyagerPositions.length; i++) {
-      var v = _voyagerPositions[i];
-      var dx = mx - v.x, dy = my - v.y;
-      if (dx * dx + dy * dy < (v.r + tolerance + 6) * (v.r + tolerance + 6)) return { type: 'voyager', data: v };
+    if (hit.type === 'voyager') {
+      var sig = _signalDelay(hit.data.dist);
+      return { name: hit.data.name, rest: ' · ' + hit.data.dist.toFixed(1) + ' AU · ' +
+        _fmtDuration(sig.h, sig.m) + ' ' + t('alm_signal_delay') };
     }
-    return null;
+    if (hit.type === 'belt') return { name: t(hit.data.labelKey), rest: '' };
+    return { name: '', rest: '' };
   }
 
-  // Place the tooltip beside the target, but keep it inside the orrery box —
-  // near the rim it would otherwise run off the edge (probes especially).
-  function _placeTip(hit) {
+  // Render + place the tip beside the target, clamped inside the orrery box.
+  function _showTip(hit) {
+    _cancelTipHide();
+    var linkKey = _orreryLinkFor(hit) ? _orreryLinkKey(hit) : null;
+    var info = _tipInfo(hit);
+    // The body NAME is the link — a subtle dotted-amber underline (the almanac
+    // link idiom), no separate "Wikipedia" line. AlmanacLinks.wrap yields the
+    // same .alm-link span used everywhere else; the click handler above only
+    // acts when the click target carries data-alm-key, so hovering/clicking
+    // elsewhere in the box is inert.
+    var nameHtml = _almEsc(info.name);
+    if (linkKey) nameHtml = window.AlmanacLinks.wrap(linkKey, nameHtml);
+    tooltip.innerHTML = '<span class="orrery-tip-info">' + nameHtml + _almEsc(info.rest) + '</span>';
     tooltip.style.display = 'block';
     var maxX = wrap.clientWidth, maxY = wrap.clientHeight;
     var tw = tooltip.offsetWidth, th = tooltip.offsetHeight;
@@ -92,67 +231,72 @@ function _initOrrery() {
     tooltip.style.top = ty + 'px';
   }
 
+  // Keep the tip alive while the pointer is on the name link.
+  tooltip.onmouseenter = _cancelTipHide;
+  tooltip.onmouseleave = _hideTip;
+
   canvas.onmousemove = function(e) {
     var rect = canvas.getBoundingClientRect();
     var mx = e.clientX - rect.left, my = e.clientY - rect.top;
     var hit = _orreryHitTest(mx, my, 8);
-    if (hit && hit.type === 'planet') {
-      var label = _tp(hit.data.name);
-      if (hit.data.name !== 'Earth') {
-        var days = Math.round(_hohmannDays(_PLANETS['Earth'].a, _PLANETS[hit.data.name].a));
-        if (days < 365) label += ' · ' + t('alm_transfer_days', { n: days });
-        else label += ' · ' + t('alm_transfer_years', { n: (days / 365.25).toFixed(1) });
-      }
-      tooltip.textContent = label;
-      _placeTip(hit);
-      canvas.style.cursor = hit.data.name !== 'Earth' ? 'pointer' : 'default';
-    } else if (hit && hit.type === 'voyager') {
-      var d = hit.data.dist;
-      var sig = _signalDelay(d);
-      tooltip.textContent = hit.data.name + ' · ' + d.toFixed(1) + ' AU · ' + _fmtDuration(sig.h, sig.m) + ' ' + t('alm_signal_delay');
-      _placeTip(hit);
-      canvas.style.cursor = 'pointer';
+    if (hit) {
+      _showTip(hit);
+      // Pointer for anything actionable: a launchable planet, a probe, a belt,
+      // or an Earth/other body whose article resolved.
+      var actionable = (hit.type === 'planet' && hit.data.name !== 'Earth') ||
+        hit.type === 'voyager' || !!_orreryLinkFor(hit);
+      canvas.style.cursor = actionable ? 'pointer' : 'default';
     } else {
-      tooltip.style.display = 'none';
+      // Grace period so the pointer can reach the tip's link before it hides.
+      if (_tipHasLink()) _scheduleTipHide(_ORRERY_TIP_GRACE_MS); else _hideTip();
       canvas.style.cursor = 'default';
     }
   };
-  canvas.onmouseleave = function() { tooltip.style.display = 'none'; };
+  canvas.onmouseleave = function() { if (_tipHasLink()) _scheduleTipHide(_ORRERY_TIP_GRACE_MS); else _hideTip(); };
 
-  // Click planet to launch rocket, or Voyager to show detail card
+  // A tap does the body's direct action (fly / detail card / open article),
+  // exactly as before. The mouse path lets hover manage the tip.
   canvas.onclick = function(e) {
     var rect = canvas.getBoundingClientRect();
-    var mx = e.clientX - rect.left, my = e.clientY - rect.top;
-    var hit = _orreryHitTest(mx, my, 10);
-    if (hit && hit.type === 'planet' && hit.data.name !== 'Earth') {
-      _orreryLaunchRocket(hit.data.name);
-      tooltip.style.display = 'none';
-    } else if (hit && hit.type === 'voyager') {
-      _showVoyagerCard(hit.data.idx);
-      tooltip.style.display = 'none';
-    } else {
-      _hideVoyagerCard();
-    }
+    _orreryTap(e.clientX - rect.left, e.clientY - rect.top, 10);
   };
 
-  // Touch support for mobile — tap planet to launch, tap Voyager for detail
+  // Touch support. A touchstart→touchend that moved more than a few px is a
+  // scroll/drag, not a tap. On a hit we preventDefault to kill the synthetic
+  // click, then show the info+link tooltip so touch users can reach the link.
+  var _orreryTouchStart = null;
+  canvas.addEventListener('touchstart', function(e) {
+    if (e.touches.length === 1) _orreryTouchStart = { x: e.touches[0].clientX, y: e.touches[0].clientY };
+  }, { passive: true });
   canvas.addEventListener('touchend', function(e) {
     if (e.changedTouches.length === 0) return;
     var touch = e.changedTouches[0];
+    if (_orreryTouchStart) {
+      var moved = Math.abs(touch.clientX - _orreryTouchStart.x) + Math.abs(touch.clientY - _orreryTouchStart.y);
+      _orreryTouchStart = null;
+      if (moved > 12) return; // a drag/scroll, not a tap
+    }
     var rect = canvas.getBoundingClientRect();
     var mx = touch.clientX - rect.left, my = touch.clientY - rect.top;
     var hit = _orreryHitTest(mx, my, 14);
-    if (hit && hit.type === 'planet') {
-      e.preventDefault();
-      _orreryLaunchRocket(hit.data.name);
-    } else if (hit && hit.type === 'voyager') {
-      e.preventDefault();
-      _showVoyagerCard(hit.data.idx);
-    }
+    if (hit) e.preventDefault();
+    _orreryTap(mx, my, 14);
+    // Surface the info+link tip after the tap (touch has no hover); a tap on
+    // empty space dismisses it.
+    if (hit && _orreryLinkFor(hit)) _showTip(hit); else _hideTip();
   });
 
   // Initial date display
   _orreryUpdateDate();
+}
+
+// Deterministic seeded PRNG (Park-Miller minimal-standard LCG) — every
+// decorative starfield in the almanac (orrery, horizon scene, star chart) is
+// generated from one of these rather than Math.random, so a layout is stable
+// across frames/re-inits and only ever changes if its seed does.
+function _lcgRand(seed) {
+  var s = seed;
+  return function () { s = (s * 16807) % 2147483647; return s / 2147483647; };
 }
 
 // Pre-computed orrery background stars (computed once, not per frame)
@@ -160,8 +304,7 @@ var _orreryBgStars = null;
 
 function _ensureOrreryStars(W, dpr) {
   if (_orreryBgStars && _orreryBgStars.W === W) return _orreryBgStars.stars;
-  var ss = 73;
-  function sr() { ss = (ss * 16807) % 2147483647; return ss / 2147483647; }
+  var sr = _lcgRand(73);
   var stars = [];
   for (var i = 0; i < 40; i++) {
     stars.push({ x: sr() * W, y: sr() * W, b: 0.03 + sr() * 0.06, r: (0.3 + sr() * 0.4) * dpr });
@@ -211,8 +354,10 @@ function _drawOrrery(canvas, dpr) {
     ctx.stroke();
   }
 
-  // Faint labelled band helper (asteroid + Kuiper belts).
-  var _belt = function (auIn, auOut, fill, labelCol, label) {
+  // Faint labelled band helper (asteroid + Kuiper belts). Records each band's
+  // annulus (CSS px) so the tap/hover hit-test can open its article.
+  _orreryBeltZones = [];
+  var _belt = function (auIn, auOut, fill, labelCol, label, key, labelKey) {
     var rIn = _orrR(auIn, z) * W, rOut = _orrR(auOut, z) * W, rMid = (rIn + rOut) / 2;
     ctx.save();
     ctx.beginPath();
@@ -224,17 +369,18 @@ function _drawOrrery(canvas, dpr) {
     ctx.fillText(label, cx, cy - rMid);
     ctx.textBaseline = 'alphabetic';
     ctx.restore();
+    if (key) _orreryBeltZones.push({ key: key, labelKey: labelKey, rIn: rIn / dpr, rOut: rOut / dpr });
   };
 
   // Asteroid belt — a faint band in the Mars–Jupiter gap.
-  _belt(2.1, 3.3, 'rgba(200,190,170,0.06)', 'rgba(200,190,170,0.5)', t('alm_asteroid_belt'));
+  _belt(2.1, 3.3, 'rgba(200,190,170,0.06)', 'rgba(200,190,170,0.5)', t('alm_asteroid_belt'), 'belt:asteroid', 'alm_asteroid_belt');
 
   // Deep-space reference rings — fade in as the view eases out (z), giving the
   // probes something to be "beyond".
   if (z > 0.02) {
     ctx.save();
     ctx.globalAlpha = z;
-    var _refRing = function (au, col, dash, label) {
+    var _refRing = function (au, col, dash, label, key, labelKey) {
       var rr = _orrR(au, z) * W;
       ctx.save();
       ctx.beginPath(); ctx.arc(cx, cy, rr, 0, Math.PI * 2);
@@ -248,15 +394,22 @@ function _drawOrrery(canvas, dpr) {
         ctx.fillText(label, cx, cy - rr - 3 * dpr);
       }
       ctx.restore();
+      // A thin ring (not a filled band) still gets a narrow hit zone around its
+      // drawn line, same annulus scheme the belts use.
+      if (key) {
+        var ringTol = 4 * dpr;
+        _orreryBeltZones.push({ key: key, labelKey: labelKey, rIn: (rr - ringTol) / dpr, rOut: (rr + ringTol) / dpr });
+      }
     };
-    _belt(_KUIPER_INNER_AU, _KUIPER_OUTER_AU, 'rgba(120,160,220,0.05)', 'rgba(150,180,230,0.55)', t('alm_kuiper_belt'));
+    _belt(_KUIPER_INNER_AU, _KUIPER_OUTER_AU, 'rgba(120,160,220,0.05)', 'rgba(150,180,230,0.55)', t('alm_kuiper_belt'), 'belt:kuiper', 'alm_kuiper_belt');
     _refRing(_HELIO_TERMINATION_AU, 'rgba(255,180,60,0.22)', true, null);
-    _refRing(_HELIOPAUSE_AU, 'rgba(120,200,255,0.30)', true, t('alm_heliopause'));
+    _refRing(_HELIOPAUSE_AU, 'rgba(120,200,255,0.30)', true, t('alm_heliopause'), 'belt:heliopause', 'alm_heliopause');
     ctx.restore();
   }
 
   // Sun — large luminous glow, Apple Watch style
   var sunR = W * 0.022;
+  _orrerySunPos = { x: cx / dpr, y: cy / dpr, r: sunR / dpr }; // hover/tap hit zone (CSS px)
 
   // Wide outer haze
   var haze = ctx.createRadialGradient(cx, cy, 0, cx, cy, W * 0.14);

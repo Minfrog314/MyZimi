@@ -66,6 +66,7 @@ import os
 import re
 import shutil
 import sys
+import tempfile
 import threading
 import time
 from http.server import ThreadingHTTPServer
@@ -86,7 +87,7 @@ except ImportError:
 # SSL context using certifi CA bundle (PyInstaller bundles lack system certs)
 SSL_CTX = ssl.create_default_context(cafile=certifi.where())
 
-ZIMI_VERSION = "1.7.4"
+ZIMI_VERSION = "1.8.0"
 
 # Standing maintenance cadence: catalog TTL is 24h and UPnP leases are
 # 24h — run every 12h so both stay fresh at half-life.
@@ -103,8 +104,8 @@ def start_background_services(http_port):
     ALL of this; BT only worked there via the lazy download-time spawn).
 
     Everything network-ish runs on background threads: nothing here may
-    delay READY / the first request. A squatted aria2 RPC port once
-    stalled startup for minutes. All parts fail soft."""
+    delay READY / the first request. Starting the BT engine once stalled
+    startup for minutes. All parts fail soft."""
     global _background_services_started
     if _background_services_started:
         return
@@ -116,16 +117,16 @@ def start_background_services(http_port):
     # settings — cheap, so it stays synchronous.
     p2p.set_prefs_path(os.path.join(ZIMI_DATA_DIR, "bt", "prefs.json"))
 
-    # Registered unconditionally, not just when the startup spawn succeeds:
-    # the sidecar can come up LATER (port-change respawn, mirror enable,
-    # lazy download-time spawn), and those paths orphaned aria2c on exit
-    # when startup had failed. shutdown_backend no-ops without a backend.
+    # Registered unconditionally, not just when the startup start succeeds:
+    # the session can come up LATER (port change, mirror enable, lazy
+    # download-time start). shutdown_backend saves fastresume and no-ops
+    # without a backend.
     import atexit
 
     atexit.register(p2p.shutdown_backend)
     # Registered AFTER shutdown_backend so it runs BEFORE it (atexit is
-    # LIFO): the final accounting pass reads aria2's upload counters while
-    # the sidecar is still alive, so a clean shutdown loses no upload.
+    # LIFO): the final accounting pass reads the engine's upload counters
+    # while the session is still alive, so a clean shutdown loses no upload.
     from zimi import library as _lib_flush
 
     atexit.register(_lib_flush.flush_seed_accounting)
@@ -149,10 +150,11 @@ def start_background_services(http_port):
 
             _disc.start(
                 http_port=http_port,
-                # Advertise the port aria2 actually listens on — get_bt_port()
-                # honors the ZIMI_BT blob's port= and the persisted UI pref;
-                # reading the raw env told peers 6881 while the sidecar (and
-                # the NAT probe) used the configured port.
+                # Advertise the port the engine actually listens on —
+                # get_bt_port() honors the ZIMI_BT blob's port= and the
+                # persisted UI pref; reading the raw env told peers 6881
+                # while the session (and the NAT probe) used the configured
+                # port.
                 bt_port=p2p.get_bt_port(),
                 zim_count=len(list_zims()),
                 version=ZIMI_VERSION,
@@ -180,7 +182,7 @@ def start_background_services(http_port):
             _lib.mirror_sync()
             _lib.archive_catalog_torrents()
             _lib.ensure_magnets_for_installed()
-            # Continuous upload books: sample aria2 every 30s so the ledger
+            # Continuous upload books: sample the engine every 30s so the ledger
             # tracks lifetime upload closely and the ratio cap is enforced
             # within half a minute, not at the 12h maintenance cadence.
             threading.Thread(
@@ -356,6 +358,79 @@ def _migrate_data_files():
                 except OSError:
                     pass
 
+    # 4. Stray .torrent companions in ZIM_DIR → ZIMI_DATA_DIR/bt/torrents
+    _migrate_stray_torrent_files()
+
+
+def _migrate_stray_torrent_files():
+    """Move any ``*.torrent`` companions out of ZIM_DIR into the cache dir.
+
+    Torrent metadata belongs under ``ZIMI_DATA_DIR/bt/torrents`` — never beside
+    the ZIMs. Older installs (aria2-era, pre-1.8) left ``<name>.zim.torrent``
+    next to the ZIM; those are bencoded metadata, not ZIMs, so a health scan
+    flags them and zimcheck chokes on one with "Invalid magic number", looking
+    like ZIM corruption (#38). Move them once — non-recursive listdir, never a
+    walk — repoint any torrents-manifest record that referenced the old
+    in-library path, and log a single summary line. Idempotent."""
+    try:
+        strays = [f for f in os.listdir(ZIM_DIR) if f.endswith(".torrent")]
+    except OSError:
+        return
+    if not strays:
+        return
+    tdir = os.path.join(ZIMI_DATA_DIR, "bt", "torrents")
+    try:
+        os.makedirs(tdir, exist_ok=True)
+    except OSError:
+        return
+    moved = {}  # old ZIM_DIR path -> new bt/torrents path
+    for fn in strays:
+        src = os.path.join(ZIM_DIR, fn)
+        dst = os.path.join(tdir, fn)
+        if os.path.exists(dst):
+            # A good copy is already archived — drop the in-library litter.
+            try:
+                os.remove(src)
+                moved[os.path.normpath(src)] = dst
+            except OSError:
+                pass
+            continue
+        try:
+            os.replace(src, dst)  # same-filesystem fast path
+        except OSError:
+            try:
+                shutil.copy2(src, dst)
+                os.remove(src)
+            except OSError:
+                continue
+        moved[os.path.normpath(src)] = dst
+    if not moved:
+        return
+    # Repoint any manifest record whose torrent_file pointed into ZIM_DIR.
+    manifest_path = os.path.join(ZIMI_DATA_DIR, "bt", "torrents.json")
+    try:
+        with open(manifest_path, encoding="utf-8") as f:
+            manifest = json.load(f)
+    except (OSError, ValueError):
+        manifest = None
+    if isinstance(manifest, dict):
+        changed = False
+        for entry in manifest.values():
+            if not isinstance(entry, dict):
+                continue
+            tf = entry.get("torrent_file")
+            if tf and os.path.normpath(tf) in moved:
+                entry["torrent_file"] = moved[os.path.normpath(tf)]
+                changed = True
+        if changed:
+            try:
+                _atomic_write_json(manifest_path, manifest)
+            except OSError:
+                pass
+    log.info(
+        "Moved %d stray .torrent file(s) out of ZIM_DIR into bt/torrents", len(moved)
+    )
+
 
 # ============================================================================
 # Constants & Shared Utilities
@@ -387,9 +462,25 @@ def _atomic_write_json(path, data, indent=None):
     Used for all persistent state files to prevent corruption from
     crashes or concurrent writes. indent=None for compact output.
     """
-    tmp = path + ".tmp"
+    # Unique temp name per write: a fixed "<path>.tmp" collides when two
+    # threads write the same target concurrently — the second os.replace races
+    # against the first's rename/unlink and can fail or observe a torn file.
+    directory = os.path.dirname(path) or "."
+    prefix = os.path.basename(path) + "."
     try:
-        with open(tmp, "w") as f:
+        fd, tmp = tempfile.mkstemp(dir=directory, prefix=prefix, suffix=".tmp")
+        # mkstemp creates 0600 and os.replace carries that mode onto the
+        # target — which would silently strip group/world read from state
+        # files (e.g. .zimi_cache.json inspected host-side over SSH).
+        # Restore the umask-style default the old open()-based writer had.
+        # POSIX-only: Windows has no fchmod and no meaningful mode bits.
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, 0o644)
+    except OSError as e:
+        log.warning("Atomic write failed for %s: %s", path, e)
+        return
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(
                 data,
                 f,
@@ -400,6 +491,10 @@ def _atomic_write_json(path, data, indent=None):
         os.replace(tmp, path)
     except OSError as e:
         log.warning("Atomic write failed for %s: %s", path, e)
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
 
 
 # MIME type fallback for ZIM entries with empty mimetype
@@ -439,7 +534,30 @@ MIME_FALLBACK = {
     ".flac": "audio/flac",
     ".vtt": "text/vtt",
     ".srt": "text/plain",
+    # Map tiles / geodata. OSM map ZIMs (Leaflet / MapLibre) store vector
+    # tiles as .pbf|.mvt; a loader that inspects Content-Type needs protobuf,
+    # not octet-stream. Raster (.png) tiles already covered above.
+    ".pbf": "application/x-protobuf",
+    ".mvt": "application/x-protobuf",
+    ".geojson": "application/geo+json",
+    ".topojson": "application/json",
 }
+
+
+def split_entry_fragment(path):
+    """Split a ZIM entry path at its first URL fragment ('#').
+
+    Single-page docs (notably devdocs ZIMs like devdocs_en_markdown) surface
+    suggestion/title-index paths of the form ``index#backslash`` where the real
+    ZIM entry is ``index`` and ``#backslash`` is an in-page fragment. Callers use
+    this to fall back to the base entry when a lookup for the full string fails.
+
+    Returns ``(base_path, fragment)`` with the fragment excluding the '#', or
+    ``(path, "")`` when there is no fragment."""
+    hash_idx = path.find("#")
+    if hash_idx == -1:
+        return path, ""
+    return path[:hash_idx], path[hash_idx + 1 :]
 
 
 def _namespace_fallbacks(path):
@@ -521,12 +639,17 @@ def _history_file_path():
 def _load_history():
     """Load event history from disk. Returns list of event dicts, newest first."""
     try:
-        with open(_history_file_path()) as f:
+        with open(_history_file_path(), encoding="utf-8") as f:
             data = json.load(f)
         if isinstance(data, list):
             return data
-    except (FileNotFoundError, json.JSONDecodeError):
-        pass
+    except FileNotFoundError:
+        pass  # fresh install — no history yet
+    except (OSError, json.JSONDecodeError) as e:
+        # Unreadable/corrupt (e.g. a bind mount owned by the wrong uid raising
+        # PermissionError/EIO) must degrade to empty, not 500 the request and
+        # look like data loss. Log so the real problem stays visible.
+        log.warning("Could not read history file, returning empty: %s", e)
     return []
 
 
@@ -552,19 +675,78 @@ def _collections_file_path():
 def _load_collections():
     """Load collections from disk. Returns default structure if missing."""
     try:
-        with open(_collections_file_path()) as f:
+        with open(_collections_file_path(), encoding="utf-8") as f:
             data = json.load(f)
         if data.get("version") != 1:
             return {"version": 1, "favorites": [], "collections": {}}
         return data
-    except (FileNotFoundError, json.JSONDecodeError, KeyError):
-        return {"version": 1, "favorites": [], "collections": {}}
+    except FileNotFoundError:
+        pass  # fresh install — no collections yet
+    except (OSError, json.JSONDecodeError, KeyError) as e:
+        # Unreadable/corrupt data dir must degrade to the empty default rather
+        # than 500 /collections and blank the user's bookmarks (issue #36).
+        log.warning("Could not read collections file, returning default: %s", e)
+    return {"version": 1, "favorites": [], "collections": {}}
 
 
 def _save_collections(data):
     """Save collections to disk (atomic write via rename)."""
     data["version"] = 1
     _atomic_write_json(_collections_file_path(), data, indent=2)
+
+
+# ── Library layout: per-ZIM category overrides + home section order (#37) ──
+#
+# Storage: ZIMI_DATA_DIR/library_layout.json —
+#   {"overrides": {"<zim name>": "<category>"}, "section_order": ["cat:<key>"|"col:<name>", ...]}
+# Overrides win over the _categorize_zim heuristic; section_order drives the
+# home page ordering (unlisted sections append in default order). Reads are
+# public (ride /list); writes are auth-gated /manage endpoints.
+_library_layout_lock = threading.Lock()
+
+#: Section-order keys are namespaced so categories and collections can share one
+#: ordered list without colliding (a collection named "Books" != category Books).
+_SECTION_KEY_RE = re.compile(r"^(cat:|col:).+")
+#: Defensive caps so a hostile/buggy client can't write an unbounded file.
+_LAYOUT_MAX_OVERRIDES = 5000
+_LAYOUT_MAX_ORDER = 500
+_LAYOUT_STR_MAX = 128
+
+
+def _library_layout_file_path():
+    """Path to the library-layout JSON file."""
+    return os.path.join(ZIMI_DATA_DIR, "library_layout.json")
+
+
+def _load_library_layout():
+    """Load library layout from disk. Fail-soft to the empty default.
+
+    A missing or corrupt file must degrade to ``{"overrides": {}, "section_order": []}``
+    rather than 500 /list — the whole home page renders from this, so a bad read
+    can never be allowed to blank the library.
+    """
+    empty = {"overrides": {}, "section_order": []}
+    try:
+        with open(_library_layout_file_path(), encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return empty
+        overrides = data.get("overrides")
+        order = data.get("section_order")
+        return {
+            "overrides": overrides if isinstance(overrides, dict) else {},
+            "section_order": order if isinstance(order, list) else [],
+        }
+    except FileNotFoundError:
+        pass  # fresh install — no layout yet
+    except (OSError, json.JSONDecodeError) as e:
+        log.warning("Could not read library layout, returning default: %s", e)
+    return empty
+
+
+def _save_library_layout(data):
+    """Save library layout to disk (atomic write via rename)."""
+    _atomic_write_json(_library_layout_file_path(), data, indent=2)
 
 
 _ISO639_3_TO_1 = {
@@ -614,8 +796,55 @@ _ISO639_3_TO_1 = {
 # Persistent cache in .zimi_cache.json enables instant startup on subsequent runs.
 # Archives are opened lazily (on first search/read) instead of all at once.
 _CACHE_VERSION = 2  # bumped for language metadata
+# Self-heal thresholds for the "whole library badged New" bug: a full cache
+# rebuild once stamped first_seen=now for every ZIM at once. first_seen values
+# within this window are treated as "the same instant" (a rebuild), and a stamp
+# is only trusted if it lands within the mtime tolerance of the file itself.
+# A full rebuild stamps entries across the whole scan, which takes ~13s per 66
+# ZIMs on NAS spinning disks — the bucket must swallow an entire slow scan or
+# the majority test splits across buckets and the heal never fires. Safe to be
+# generous: the per-entry mtime tolerance below is the guard that protects
+# genuine batch downloads, the bucket is only a pre-filter.
+_MASS_STAMP_WINDOW = 120.0  # seconds
+_MASS_STAMP_MTIME_TOL = 3600.0  # first_seen must be within 1h of file mtime to be real
 _zim_list_cache = None
 _zim_files_cache = None  # {name: path} — cached at startup, ZIM dir is read-only
+
+# ── Per-request ZIM allow context (multi-user v1) ────────────────────────────
+# When a named USER (not admin, not anonymous) is logged in, the request's ZIM
+# view is restricted to their allowlist. ThreadingHTTPServer runs one thread per
+# request, so a thread-local is naturally request-scoped; http.do_GET/do_POST set
+# it from zimi.users.request_allow() and clear it in a finally. A value of None
+# means all-access (admin/anonymous/all-access user) — the common case, and what
+# background threads (indexing, downloads) always see since they never set it.
+# get_zim_files() and list_zims() consult it so every dict-based read path
+# (search_all, read_article, chunk_article, resolve_almanac_qids, /list) is
+# filtered from one place; zim_allowed() covers the two spots that bypass them.
+_request_ctx = threading.local()
+
+
+def set_request_allow(allow):
+    """Set the current request's ZIM allow set (a set of names) or None for all."""
+    _request_ctx.allow = allow
+
+
+def clear_request_allow():
+    """Clear the request allow context (always call in a finally)."""
+    _request_ctx.allow = None
+
+
+def current_allow():
+    """The current request's allow set, or None for all-access."""
+    return getattr(_request_ctx, "allow", None)
+
+
+def zim_allowed(name):
+    """True if `name` is visible to the current request. Gates the paths that
+    don't flow through get_zim_files() (pooled /w/ content, direct list reads)."""
+    allow = current_allow()
+    return allow is None or name in allow
+
+
 _cache_generation = 0  # incremented on load_cache(force=True) — used in ETags
 _archive_pool = {}  # {name: Archive} — kept open for fast search
 _archive_lock = threading.Lock()  # protects _archive_pool writes in threaded mode
@@ -758,12 +987,18 @@ def _scan_zim_files():
 
 
 def get_zim_files():
-    """Get ZIM file mapping. Uses startup cache (ZIM dir is read-only mount)."""
+    """Get ZIM file mapping. Uses startup cache (ZIM dir is read-only mount).
+
+    When a restricted user is logged in (current_allow() is not None), the mapping
+    is filtered to their allowlist — a fresh dict, never a mutation of the cache.
+    This is the single choke point every dict-based read path flows through."""
     global _zim_files_cache
-    if _zim_files_cache is not None:
+    if _zim_files_cache is None:
+        _zim_files_cache = _scan_zim_files()
+    allow = current_allow()
+    if allow is None:
         return _zim_files_cache
-    _zim_files_cache = _scan_zim_files()
-    return _zim_files_cache
+    return {k: v for k, v in _zim_files_cache.items() if k in allow}
 
 
 def open_archive(path):
@@ -782,32 +1017,49 @@ def list_zims(use_cache=True):
     """List all available ZIM files with metadata. Uses startup cache when available."""
     global _zim_list_cache
     if use_cache and _zim_list_cache is not None:
-        return _zim_list_cache
+        allow = current_allow()
+        if allow is None:
+            return _zim_list_cache
+        # Restricted user: return a filtered copy, never mutate the shared cache.
+        return [z for z in _zim_list_cache if z.get("name") in allow]
 
     zims = get_zim_files()
     info = []
     for name, path in zims.items():
         size_bytes = os.path.getsize(path)
+        article_count = None
         try:
             archive = open_archive(path)
             entry_count = archive.entry_count
+            try:
+                article_count = archive.article_count
+            except Exception:
+                article_count = None
         except Exception as e:
             log.debug("Failed to open archive for listing %s: %s", name, e)
             entry_count = "?"
-        info.append(
-            {
-                "name": name,
-                "file": os.path.basename(path),
-                "size_gb": round(size_bytes / (1024**3), 3),
-                "size_bytes": size_bytes,
-                "entries": entry_count,
-            }
-        )
+        entry = {
+            "name": name,
+            "file": os.path.basename(path),
+            "size_gb": round(size_bytes / (1024**3), 3),
+            "size_bytes": size_bytes,
+            "entries": entry_count,
+        }
+        if article_count is not None:
+            entry["article_count"] = article_count
+        info.append(entry)
     return info
 
 
 def get_archive(name):
-    """Get a cached archive handle, or open it fresh. Thread-safe."""
+    """Get a cached archive handle, or open it fresh. Thread-safe.
+
+    Fails closed for a restricted user: a ZIM outside their allowlist resolves to
+    None (as if not installed), gating every archive-based content path (/w/,
+    /snippet, /catalog, /article-languages, /random) including already-pooled
+    handles. Background/admin requests have current_allow()==None → no change."""
+    if not zim_allowed(name):
+        return None
     if name in _archive_pool:
         return _archive_pool[name]
     zims = get_zim_files()
@@ -834,7 +1086,7 @@ def _cache_file_path():
 def _load_disk_cache():
     """Load persistent metadata cache from disk. Returns {filename: metadata} or None."""
     try:
-        with open(_cache_file_path()) as f:
+        with open(_cache_file_path(), encoding="utf-8") as f:
             data = json.load(f)
         if data.get("version") != _CACHE_VERSION:
             return None
@@ -873,9 +1125,17 @@ def _extract_zim_metadata(name, path):
     has_icon = False
     main_path = ""
     archive = None
+    article_count = None
     try:
         archive = open_archive(path)
         entry_count = archive.entry_count
+        # Real article count (user-facing content entries, excluding redirects
+        # and non-article assets). Additive over `entries` (all user entries):
+        # cards/info panels prefer this when present, fall back to entry_count.
+        try:
+            article_count = archive.article_count
+        except Exception:
+            article_count = None
         for key in archive.metadata_keys:
             try:
                 val = bytes(archive.get_metadata(key))
@@ -936,7 +1196,134 @@ def _extract_zim_metadata(name, path):
         "category": _categorize_zim(name),
         "main_path": main_path,
     }
+    if article_count is not None:
+        info["article_count"] = article_count
     return info, archive
+
+
+def _self_heal_mass_first_seen(info, file_cache, zims):
+    """Repair a library-wide first_seen stamp left by a full cache rebuild.
+
+    A pre-fix rebuild stamped ``first_seen = now`` for every ZIM at once, so the
+    whole library badged "New". Detect that fingerprint — a majority of entries
+    sharing one first_seen instant that does NOT match their file mtimes — and
+    re-derive each affected stamp from the file's own mtime. Mutates ``info`` and
+    ``file_cache`` in place; returns True if anything was repaired.
+
+    The mtime check is the safety guard: a genuine batch download (10 ZIMs
+    pulled within seconds) also shares one first_seen, but there the files' own
+    mtimes match that instant, so those are left untouched.
+    """
+    stamped = [e for e in info if e.get("first_seen")]
+    if len(stamped) < 4:
+        return False  # too small a library to distinguish a rebuild from reality
+    from collections import Counter
+
+    buckets = Counter(round(e["first_seen"] / _MASS_STAMP_WINDOW) for e in stamped)
+    bucket_key, count = buckets.most_common(1)[0]
+    if count <= len(stamped) * 0.5:
+        return False  # no dominant shared instant → not a mass rebuild
+
+    now = time.time()
+    repaired = 0
+    for e in info:
+        fs = e.get("first_seen")
+        if not fs or round(fs / _MASS_STAMP_WINDOW) != bucket_key:
+            continue
+        path = zims.get(e["name"])
+        if not path:
+            continue
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            continue
+        # Stamp is plausible if it lands near the file's own mtime — leave it.
+        if abs(fs - mtime) <= _MASS_STAMP_MTIME_TOL:
+            continue
+        new_fs = min(mtime, now)
+        e["first_seen"] = new_fs
+        fc = file_cache.get(e["file"])
+        if fc is not None:
+            fc["first_seen"] = new_fs
+        repaired += 1
+
+    if repaired:
+        log.info(
+            "first_seen self-heal: re-derived %d/%d ZIM stamps from file mtime "
+            "(a full cache rebuild had stamped them all at once)",
+            repaired,
+            len(stamped),
+        )
+    return repaired > 0
+
+
+def _self_heal_update_stamps(info, file_cache):
+    """Repair 'New' badges on ZIMs that were actually UPDATED before the
+    dated-filename inherit fix landed.
+
+    The pre-fix updater re-stamped ``first_seen=now`` and left ``updated_at``
+    unset when an update arrived under a new dated filename, so a genuinely
+    updated ZIM badges 'New' instead of 'Updated' — indistinguishable from a
+    fresh install by its stamps alone. The persistent event history IS the
+    authority: it records an ``updated`` event per real update. For any ZIM the
+    history says was updated, sync its cache stamps to that truth — set
+    ``updated_at`` from the update event and pull ``first_seen`` back to the
+    earliest recorded event so ``updated_at > first_seen`` and the badge reads
+    'Updated', matching the activity log. Only touches ZIMs with a recorded
+    update event, so it can never misfire on a real fresh install. Mutates
+    ``info`` and ``file_cache`` in place; returns True if anything changed."""
+    try:
+        history = _load_history()
+    except Exception:
+        return False
+    if not history:
+        return False
+    # Per logical ZIM name: earliest recorded event (install) and latest update.
+    earliest = {}
+    latest_update = {}
+    for ev in history:
+        ts = ev.get("ts")
+        name = ev.get("name")
+        if not ts or not name:
+            continue
+        if name not in earliest or ts < earliest[name]:
+            earliest[name] = ts
+        if ev.get("event") == "updated" and (
+            name not in latest_update or ts > latest_update[name]
+        ):
+            latest_update[name] = ts
+    if not latest_update:
+        return False
+    repaired = 0
+    for e in info:
+        new_ua = latest_update.get(e.get("name"))
+        if not new_ua:
+            continue
+        # Already correctly flagged 'Updated' (updated_at > first_seen)? Leave it.
+        if (e.get("updated_at") or 0) > (e.get("first_seen") or 0):
+            continue
+        # first_seen must precede the update. Prefer the earliest recorded event;
+        # if the only record IS the update (original install predates history),
+        # nudge first_seen just below it so the ordering — hence badge — is right.
+        new_fs = min(earliest.get(e.get("name"), new_ua), new_ua)
+        if new_fs >= new_ua:
+            new_fs = new_ua - 1
+        if e.get("updated_at") == new_ua and e.get("first_seen") == new_fs:
+            continue
+        e["updated_at"] = new_ua
+        e["first_seen"] = new_fs
+        fc = file_cache.get(e["file"])
+        if fc is not None:
+            fc["updated_at"] = new_ua
+            fc["first_seen"] = new_fs
+        repaired += 1
+    if repaired:
+        log.info(
+            "update-stamp self-heal: re-flagged %d ZIM(s) as 'Updated' from the "
+            "event history (pre-fix updates had mis-stamped them 'New')",
+            repaired,
+        )
+    return repaired > 0
 
 
 def load_cache(force=False):
@@ -954,11 +1341,35 @@ def load_cache(force=False):
         _cache_generation += 1
     zims = _zim_files_cache
 
-    disk_cache = None if force else _load_disk_cache()
+    # Always load the persisted cache. Even on a forced rebuild we re-scan every
+    # archive (fresh metadata) but must carry each ZIM's first_seen/updated_at
+    # forward — otherwise a rebuild re-stamps the whole library and every ZIM
+    # badges "New" at once (the bug this fix closes).
+    disk_cache = _load_disk_cache()
 
     info = []
     scanned = 0
+    backfilled = 0  # legacy entries whose first_seen we filled from file mtime
     file_cache = {}  # for saving back to disk
+
+    # Index prior cache entries by date-stripped short name. ZIM filenames carry
+    # a date (…_2026-07.zim); an update downloads a NEW dated filename, so the
+    # cache — keyed by full filename — misses and the update masquerades as a
+    # brand-new install (first_seen≈now, no updated_at → badges "New" not
+    # "Updated"). This lets the cache-miss path recognise that a new filename is
+    # the SAME logical ZIM as a known one, inherit its original first_seen, and
+    # stamp updated_at. Keep the earliest first_seen per name (true install).
+    prior_by_name = {}
+    if disk_cache:
+        for _fn, _ce in disk_cache.items():
+            if not isinstance(_ce, dict):
+                continue
+            _sn = _zim_short_name(_fn)
+            _prev = prior_by_name.get(_sn)
+            if _prev is None or (_ce.get("first_seen") or float("inf")) < (
+                _prev.get("first_seen") or float("inf")
+            ):
+                prior_by_name[_sn] = _ce
 
     for name, path in zims.items():
         filename = os.path.basename(path)
@@ -975,18 +1386,53 @@ def load_cache(force=False):
         # library). A ZIM already known (even if its file changed on an update)
         # keeps its original stamp; a ZIM present in a pre-feature cache with no
         # stamp is treated as long-installed, not retroactively "new".
+        # A new filename whose date-stripped name matches a known ZIM is an
+        # UPDATE arriving under a new dated filename, not a first install.
+        prior = prior_by_name.get(name) if cached is None else None
+        prior_first_seen = prior.get("first_seen") if prior else None
+        is_update_rename = cached is None and prior_first_seen is not None
         if cached is None:
-            first_seen = time.time()
+            if is_update_rename:
+                # Same logical ZIM, newer file: inherit the ORIGINAL first_seen
+                # (never re-stamp it) so updated_at>first_seen and the badge
+                # reads "Updated", matching the activity log.
+                first_seen = prior_first_seen
+            else:
+                # First time Zimi has ever seen this file. Stamp first_seen from
+                # the file's own mtime — NOT wall-clock now. A genuinely new
+                # download has mtime≈now, so it still lights up "New"; but a full
+                # cache rebuild of an old library (force=True, or a
+                # corrupt/unreadable cache.json) now re-derives quiet, honest
+                # stamps from the files instead of badging the whole library at
+                # once. min() guards against future mtimes.
+                first_seen = min(mtime, time.time())
         else:
             first_seen = cached.get("first_seen")
+            # Legacy cache entries (written before #34) carry no first_seen.
+            # Backfill from the ZIM file's own mtime so a recently-downloaded
+            # ZIM lights up "Recently added" on an already-established library,
+            # while a long-installed file (old mtime) stays quiet. Persisted by
+            # the cache-hit write-back below, so it's computed once. If the file
+            # vanished mid-scan, leave it None rather than stamping "now".
+            if first_seen is None:
+                try:
+                    first_seen = os.path.getmtime(path)
+                    backfilled += 1
+                except OSError:
+                    first_seen = None
         # An already-known ZIM whose file changed on disk is an update — stamp
         # updated_at so the UI can flag it "Updated" (distinct from "New").
-        cache_hit = bool(
+        file_unchanged = bool(
             cached and cached.get("mtime") == mtime and cached.get("size") == size
         )
+        # Skip re-opening the archive only on a normal load; a forced rebuild
+        # re-scans even unchanged files, but must not mistake that for a change.
+        cache_hit = file_unchanged and not force
         if cached is None:
-            updated_at = None
-        elif cache_hit:
+            # Brand-new install → no update stamp; an update-under-new-filename
+            # → stamp updated_at=now (it's a change to an already-known ZIM).
+            updated_at = time.time() if is_update_rename else None
+        elif file_unchanged:
             updated_at = cached.get("updated_at")
         else:
             updated_at = time.time()
@@ -1013,6 +1459,10 @@ def load_cache(force=False):
             }
             if "has_qids" in cached:
                 entry["has_qids"] = cached["has_qids"]
+            # Additive: real article count. Absent in caches built before this
+            # field existed — the UI falls back to `entries` when it's missing.
+            if cached.get("article_count") is not None:
+                entry["article_count"] = cached["article_count"]
             info.append(entry)
             cached_out = dict(cached)
             if first_seen is not None:
@@ -1043,17 +1493,28 @@ def load_cache(force=False):
                 "has_icon": entry["has_icon"],
                 "main_path": entry["main_path"],
             }
+            if entry.get("article_count") is not None:
+                new_cached["article_count"] = entry["article_count"]
             if first_seen is not None:
                 new_cached["first_seen"] = first_seen
             if updated_at is not None:
                 new_cached["updated_at"] = updated_at
             file_cache[filename] = new_cached
 
+    # Self-heal a library that a pre-fix rebuild already mass-stamped. The code
+    # fix above stops NEW rebuilds from doing it, but existing disk caches still
+    # carry first_seen=<rebuild instant> for every ZIM; repair them from mtime.
+    healed = _self_heal_mass_first_seen(info, file_cache, zims)
+    # Repair 'New' badges on ZIMs the event history proves were UPDATED before
+    # the dated-filename inherit fix (pre-fix updates mis-stamped them 'New').
+    healed_updates = _self_heal_update_stamps(info, file_cache)
+
     _zim_list_cache = info
     elapsed = time.time() - t0
 
-    # Persist cache if we scanned anything new
-    if scanned > 0 or disk_cache is None:
+    # Persist cache if we scanned anything new, backfilled a legacy first_seen
+    # (so the mtime stamp is computed once), or repaired mass-stamped entries.
+    if scanned > 0 or backfilled > 0 or disk_cache is None or healed or healed_updates:
         _save_disk_cache(file_cache)
 
     cached_count = len(info) - scanned
@@ -1180,19 +1641,23 @@ def main():
         print(f"ZIM Reader API starting on port {args.port}")
         print(f"ZIM directory: {ZIM_DIR}")
         load_cache()
-        # Clean up stale partial downloads (>24h old)
-        for tmp in glob.glob(os.path.join(ZIM_DIR, "*.zim.tmp")):
+        # Startup partial-download sweep. Keep partials that a download record
+        # still wants (resume_pending_downloads() picks those up via Range).
+        # For the rest (orphaned), auto-delete only the stale ones (>24h) — a
+        # recent orphaned partial is left in place so the user can re-add it and
+        # resume; the interactive "clean up" action can clear it on demand.
+        from zimi import library as _lib
+
+        _protected, _orphaned = _lib.classify_partials()
+        for info in _protected:
+            log.info("Partial download found (resumable): %s", info["filename"])
+        for info in _orphaned:
+            if info["age_hours"] * 3600 <= 86400:
+                log.info("Partial download found (orphaned): %s", info["filename"])
+                continue
             try:
-                age = time.time() - os.path.getmtime(tmp)
-                if age > 86400:
-                    os.remove(tmp)
-                    log.info(
-                        "Cleaned up stale partial download: %s", os.path.basename(tmp)
-                    )
-                else:
-                    log.info(
-                        "Partial download found (resumable): %s", os.path.basename(tmp)
-                    )
+                os.remove(os.path.join(ZIM_DIR, info["filename"]))
+                log.info("Cleaned up stale partial download: %s", info["filename"])
             except OSError:
                 pass
         warm_indexes()
@@ -1213,8 +1678,8 @@ def main():
                     "Library management enabled (no password — set one in Settings for public servers)"
                 )
         # docker stop / systemd / CI teardown send SIGTERM, which by default
-        # kills Python without running atexit — orphaning the aria2 sidecar
-        # (which then squats the RPC port and wedges the next startup).
+        # kills Python without running atexit — skipping the clean engine
+        # shutdown that flushes fastresume + the final upload accounting.
         # Route it through sys.exit so cleanup handlers run.
         import signal
 
@@ -1270,7 +1735,7 @@ def get_hot_zims():
     path = _hot_zims_file()
     if os.path.exists(path):
         try:
-            with open(path) as f:
+            with open(path, encoding="utf-8") as f:
                 data = json.load(f)
             if isinstance(data, list):
                 return [s for s in data if isinstance(s, str) and s]
@@ -1436,6 +1901,7 @@ from zimi.search import (  # noqa: E402, F401
     # Search / suggest caches (dicts + constants + functions)
     _search_cache,
     SEARCH_CACHE_MAX,
+    _search_cache_key,
     _search_cache_get,
     _search_cache_put,
     _search_cache_clear,
@@ -1472,6 +1938,11 @@ from zimi.search import (  # noqa: E402, F401
     _clean_query,
     search_all,
     read_article,
+    chunk_article,
+    CHUNK_SIZE_MIN,
+    CHUNK_SIZE_MAX,
+    CHUNK_SIZE_DEFAULT,
+    CHUNK_OVERLAP_DEFAULT,
     suggest,
     extract_pdf_text,
     get_catalog,
@@ -1501,6 +1972,9 @@ from zimi.interlang import (  # noqa: E402, F401
     _qid_cache_store,
     _qid_find_in_zim,
     _qid_has_index,
+    # Almanac deep-links (closed-set Q-ID → article batch resolution)
+    resolve_almanac_qids,
+    ALMANAC_QID_BATCH_MAX,
     # Cross-ZIM resolution
     _domain_zim_map,
     _xzim_refs,

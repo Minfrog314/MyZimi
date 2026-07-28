@@ -58,7 +58,11 @@ def _password_file():
 
 
 def _get_manage_password_hash():
-    """Get password hash from env var or file."""
+    """Get password hash from env var or file.
+
+    The password file holds the hash on its first line; an OPTIONAL username
+    may follow on the second line (see _file_username). Only the first line is
+    the hash, so legacy single-line files keep working unchanged."""
     global _env_pw_hash_cache
     # Env var takes priority (Docker deployments)
     pw = os.environ.get("ZIMI_MANAGE_PASSWORD", "")
@@ -68,8 +72,8 @@ def _get_manage_password_hash():
         return _env_pw_hash_cache
     # Fall back to password file (set via UI)
     try:
-        with open(_password_file()) as f:
-            stored = f.read().strip()
+        with open(_password_file(), encoding="utf-8") as f:
+            stored = f.readline().strip()  # first line only — line 2 is username
         # Empty or too-short to be a valid hash — treat as no password
         if not stored or len(stored) < 10:
             return ""
@@ -78,12 +82,52 @@ def _get_manage_password_hash():
         return ""
 
 
-def _set_manage_password(pw):
-    """Save hashed password to file, or clear it. Uses atomic write."""
+def _file_username():
+    """Optional username stored on the second line of the password file, or ''.
+
+    A plain identifier (not a secret) — legacy files have no second line and
+    return ''. Env var ZIMI_MANAGE_USER (see _get_manage_user) overrides this."""
+    try:
+        with open(_password_file(), encoding="utf-8") as f:
+            lines = f.read().split("\n")
+        if len(lines) >= 2:
+            return lines[1].strip()
+    except (FileNotFoundError, OSError):
+        pass
+    return ""
+
+
+def _get_manage_user():
+    """Configured management username, or '' if none. Env var wins over file.
+
+    OPTIONAL: when '' the login accepts any username (pure keychain UX);
+    when set, the login username must match it case-insensitively. Original
+    case is preserved for display; matching is done case-folded by callers."""
+    env_user = os.environ.get("ZIMI_MANAGE_USER", "").strip()
+    if env_user:
+        return env_user
+    return _file_username()
+
+
+def _set_manage_password(pw, username=None):
+    """Save hashed password to file (line 1) with an optional username (line 2),
+    or clear the file. Uses atomic write.
+
+    username semantics: None preserves whatever username the file already had
+    (so a plain password change never wipes it); '' clears it; a non-empty
+    string sets it. Clearing the password (pw falsy) clears username too."""
     pf = _password_file()
     tmp = pf + ".tmp"
-    with open(tmp, "w") as f:
-        f.write(_hash_pw(pw) if pw else "")
+    if not pw:
+        content = ""  # cleared — no hash, no username
+    else:
+        if username is None:
+            username = _file_username()  # preserve existing on a bare pw change
+        content = _hash_pw(pw)
+        if username and username.strip():
+            content += "\n" + username.strip()
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(content)
     os.replace(tmp, pf)
     log.info("Manage password %s", "set" if pw else "cleared")
 
@@ -99,7 +143,7 @@ def _get_api_token():
     if env_token:
         return env_token
     try:
-        with open(_api_token_file()) as f:
+        with open(_api_token_file(), encoding="utf-8") as f:
             return f.read().strip()
     except (FileNotFoundError, OSError):
         return ""
@@ -112,7 +156,7 @@ def _generate_api_token():
     token = secrets.token_urlsafe(32)
     tf = _api_token_file()
     tmp = tf + ".tmp"
-    with open(tmp, "w") as f:
+    with open(tmp, "w", encoding="utf-8") as f:
         f.write(token)
     os.replace(tmp, tf)
     log.info("API token generated")
@@ -141,12 +185,101 @@ def _verify_password(candidate, stored_pw):
     return hmac.compare_digest(_hash_pw(candidate, salt), stored_pw)
 
 
+def verify_admin_credentials(username, password):
+    """Verify a (username, password) pair against the ADMIN account, header-free.
+
+    Used by the unified /login endpoint so admin creds entered in the same modal
+    as user creds still authenticate. Mirrors _check_manage_auth's password +
+    optional-username gate, but takes explicit values instead of reading headers.
+    Returns False on a passwordless instance (nothing to log into as admin).
+    """
+    stored_pw = _get_manage_password_hash()
+    if not stored_pw:
+        return False
+    if not _verify_password(password, stored_pw):
+        return False
+    configured_user = _get_manage_user()
+    if configured_user:
+        return (username or "").strip().casefold() == configured_user.strip().casefold()
+    return True
+
+
+#: Returned by _check_manage_auth when the only reason a request is denied is
+#: that the instance has NO password and the client is non-private. There is no
+#: password to enter, so the UI must explain rather than prompt (see issue #36).
+PUBLIC_LOCKED = "public_locked"
+
+
+def _primary_admin_authorized(handler):
+    """True if the request carries PRIMARY-admin credentials: the password-file
+    account (password hash or configured username+password) or the API token,
+    OR a private client on a passwordless instance (legacy open admin).
+
+    The primary admin is the top of the hierarchy — the only account that can
+    manage other admins and that no secondary admin can delete or demote.
+    """
+    stored_pw = _get_manage_password_hash()
+    if not stored_pw:
+        # Passwordless: LAN/loopback clients are the (only) primary admin.
+        return handler._is_private_client()
+
+    auth = handler.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        return False
+    candidate = auth[7:]
+
+    # API token — a machine credential, carries no username gate (keeps
+    # existing scripts/agents working unchanged).
+    stored_token = _get_api_token()
+    if stored_token and hmac.compare_digest(candidate, stored_token):
+        return True
+
+    # Password — plus, when a username is configured, it must match.
+    if _verify_password(candidate, stored_pw):
+        configured_user = _get_manage_user()
+        if configured_user:
+            provided = handler.headers.get("X-Zimi-User", "")
+            if provided.strip().casefold() != configured_user.strip().casefold():
+                # Wrong/missing username reads exactly like a wrong password:
+                # generic denial, no username-enumeration signal.
+                return False
+        return True
+    return False
+
+
+def _secondary_admin_authorized(handler):
+    """True if the request is a SECONDARY admin: a users.json account with
+    role=admin, authenticated by its session token (Bearer or cookie). They get
+    manage powers, but the hierarchy in ``_handle_users_post`` still bars them
+    from touching the primary admin or managing other admins."""
+    from zimi import users as _users
+
+    name = _users.resolve_request_user(handler)
+    return bool(name) and _users.is_admin_user(name)
+
+
+def admin_kind(handler):
+    """Classify an authorized manage request: ``'primary'`` (password-file /
+    API-token / passwordless-private), ``'secondary'`` (role=admin session), or
+    ``None`` (not an admin). Drives the primary-only hierarchy checks."""
+    if _primary_admin_authorized(handler):
+        return "primary"
+    if _secondary_admin_authorized(handler):
+        return "secondary"
+    return None
+
+
 def _check_manage_auth(handler):
-    """Check authorization for manage endpoints. Returns True if unauthorized.
+    """Check authorization for manage endpoints. Returns a truthy value if
+    unauthorized (``True`` for a genuine password/token requirement,
+    ``PUBLIC_LOCKED`` for the passwordless-but-non-private case), ``None`` if
+    authorized.
 
     Auth model:
-    - No password set → open access
-    - Password set → Bearer token must match password or API token
+    - No password set → open access for private clients; non-private clients
+      are locked (PUBLIC_LOCKED) until a password is set from the LAN
+    - Password set → Bearer token must match password or API token (PRIMARY
+      admin), OR a role=admin session token (SECONDARY admin)
     - API token is optional (requires password to be set first)
     """
     stored_pw = _get_manage_password_hash()
@@ -157,24 +290,138 @@ def _check_manage_auth(handler):
         # clients must set a password first (from the LAN).
         if handler._is_private_client():
             return None
-        return True
+        return PUBLIC_LOCKED
 
-    auth = handler.headers.get("Authorization", "")
-    if not auth.startswith("Bearer "):
-        return True  # password required, no credentials
-
-    candidate = auth[7:]
-
-    # Accept API token (cheap constant-time check first)
-    stored_token = _get_api_token()
-    if stored_token and hmac.compare_digest(candidate, stored_token):
+    if _primary_admin_authorized(handler) or _secondary_admin_authorized(handler):
         return None
-
-    # Accept password
-    if _verify_password(candidate, stored_pw):
-        return None
-
     return True
+
+
+def _manage_auth_challenge(handler):
+    """Return the ``(status, body)`` to send for a denied manage request, or
+    ``None`` when the client is authorized.
+
+    Distinguishes the two failure modes that used to both surface as a bare
+    ``401 needs_password`` and left the SPA prompting for a password that does
+    not exist (issue #36):
+
+    - passwordless instance, non-private client → ``403 public_locked`` with
+      ``needs_password: False`` (nothing to enter; the UI explains instead)
+    - password/token required or wrong → ``401 unauthorized`` with
+      ``needs_password: True`` (the UI prompts, exactly as before)
+    """
+    result = _check_manage_auth(handler)
+    if result is None:
+        return None
+    if result == PUBLIC_LOCKED:
+        return (403, {"error": "public_locked", "needs_password": False})
+    return (401, {"error": "unauthorized", "needs_password": True})
+
+
+def _cache_info_payload():
+    """Size breakdown of the Zimi data dir (indexes + caches, NOT the ZIM
+    library). Walks only the small-file-count data dir — never the ZIM files.
+
+    Returns the original {caches, total_bytes} shape (backward compatible)
+    plus:
+      - data_dir_total_bytes: everything under the data dir
+      - breakdown: ordered segments for the stacked bar (title/qid indexes,
+        catalog caches, staging, other) — each {key, size_bytes[, count]}
+      - top_zims: largest per-ZIM title-index contributors, largest first
+    """
+    import glob as _glob
+
+    data_dir = _srv.ZIMI_DATA_DIR
+
+    def _dir_size(path):
+        total = 0
+        for f in _glob.glob(os.path.join(path, "**"), recursive=True):
+            if os.path.isfile(f):
+                try:
+                    total += os.path.getsize(f)
+                except OSError:
+                    pass
+        return total
+
+    def _file_size(path):
+        try:
+            return os.path.getsize(path)
+        except OSError:
+            return 0
+
+    def _index_dir_stats(path):
+        """(total bytes, .db file count) for an index directory, (0, 0) if absent."""
+        if not os.path.isdir(path):
+            return 0, 0
+        return _dir_size(path), len(_glob.glob(os.path.join(path, "*.db")))
+
+    titles_dir = os.path.join(data_dir, "titles")
+    title_bytes, title_count = _index_dir_stats(titles_dir)
+    qid_bytes, qid_count = _index_dir_stats(os.path.join(data_dir, "qids"))
+    metadata_bytes = _file_size(os.path.join(data_dir, "cache.json"))
+    suggest_bytes = _file_size(os.path.join(data_dir, "suggest_cache.json"))
+
+    # Catalog caches = the JSON metadata/catalog files at the data-dir root
+    # (metadata cache, suggest cache, offline catalog, history, layout, …).
+    catalog_bytes = 0
+    if os.path.isdir(data_dir):
+        for f in _glob.glob(os.path.join(data_dir, "*.json")):
+            catalog_bytes += _file_size(f)
+
+    # Staging = in-progress downloads. May live outside the data dir (env
+    # override), so track whether it's already counted in the dir walk.
+    from zimi import p2p as _p2p
+
+    staging_dir = _p2p.get_staging_dir(data_dir)
+    staging_bytes = _dir_size(staging_dir) if os.path.isdir(staging_dir) else 0
+    staging_in_data = os.path.abspath(staging_dir).startswith(
+        os.path.abspath(data_dir) + os.sep
+    )
+
+    data_total = _dir_size(data_dir) if os.path.isdir(data_dir) else 0
+    accounted = (
+        title_bytes
+        + qid_bytes
+        + catalog_bytes
+        + (staging_bytes if staging_in_data else 0)
+    )
+    other_bytes = max(0, data_total - accounted)
+
+    # Top per-ZIM contributors: title-index files are one .db per ZIM.
+    top_zims = []
+    if os.path.isdir(titles_dir):
+        sizes = []
+        for f in _glob.glob(os.path.join(titles_dir, "*.db")):
+            name = os.path.basename(f)[: -len(".db")]
+            sizes.append({"name": name, "size_bytes": _file_size(f)})
+        sizes.sort(key=lambda s: s["size_bytes"], reverse=True)
+        top_zims = sizes[:6]
+
+    caches = {
+        "title_indexes": {
+            "path": "titles/",
+            "size_bytes": title_bytes,
+            "count": title_count,
+        },
+        "qid_indexes": {"path": "qids/", "size_bytes": qid_bytes, "count": qid_count},
+        "metadata_cache": {"path": "cache.json", "size_bytes": metadata_bytes},
+        "suggest_cache": {"path": "suggest_cache.json", "size_bytes": suggest_bytes},
+    }
+    breakdown = [
+        {"key": "title_indexes", "size_bytes": title_bytes, "count": title_count},
+        {"key": "qid_indexes", "size_bytes": qid_bytes, "count": qid_count},
+        {"key": "catalog_caches", "size_bytes": catalog_bytes},
+        {"key": "staging", "size_bytes": staging_bytes},
+        {"key": "other", "size_bytes": other_bytes},
+    ]
+    bar_total = sum(seg["size_bytes"] for seg in breakdown)
+    return {
+        "caches": caches,
+        "total_bytes": sum(c["size_bytes"] for c in caches.values()),
+        "data_dir_total_bytes": bar_total,
+        "breakdown": breakdown,
+        "top_zims": top_zims,
+    }
 
 
 # ============================================================================
@@ -221,8 +468,9 @@ def handle_manage_get(handler, parsed, params):
         handler.end_headers()
         handler.wfile.write(data)
         return
-    if _check_manage_auth(handler):
-        return handler._json(401, {"error": "unauthorized", "needs_password": True})
+    challenge = _manage_auth_challenge(handler)
+    if challenge:
+        return handler._json(*challenge)
 
     if parsed.path == "/manage/status":
         zim_count = len(_srv.get_zim_files())
@@ -280,6 +528,31 @@ def handle_manage_get(handler, parsed, params):
 
     elif parsed.path == "/manage/usage":
         return handler._json(200, _srv._get_usage_stats())
+
+    elif parsed.path == "/manage/users":
+        # Named user accounts (multi-user v1) — admin-only (gated above). Returns
+        # the roster (no password hashes) plus the installed ZIM names so the
+        # admin UI can build the per-user allowlist multi-select.
+        from zimi import users as _users
+
+        return handler._json(
+            200,
+            {
+                "users": _users.list_users(),
+                "zims": sorted(_srv.get_zim_files().keys()),
+                # The PRIMARY admin (password-file account) is not stored in
+                # users.json — surface it as a synthetic, non-deletable row so
+                # the UI can show "the admin" alongside the named users.
+                "primary_admin": {
+                    "name": _get_manage_user() or "admin",
+                    "role": "admin",
+                    "primary": True,
+                },
+                # Which kind of admin is viewing — the client hides admin-only
+                # controls (creating/managing other admins) for secondaries.
+                "self_kind": admin_kind(handler),
+            },
+        )
 
     elif parsed.path == "/manage/catalog":
         query = param("q", "")
@@ -344,16 +617,23 @@ def handle_manage_get(handler, parsed, params):
         idx = _srv._get_title_index_status_brief()
         downloads = _srv._get_downloads()
         # _get_downloads() shape: queued items have queued=True, in-flight
-        # items have queued=False + done=False + paused=False (see
-        # library.py:1209,1234). Earlier draft filtered on a `status` key
-        # that doesn't exist on real download objects — the test stub had it
-        # wrong. Active = actively transferring; queued is a separate bucket.
-        active_dl = sum(
-            1
+        # items have queued=False + done=False + paused=False. There is no
+        # `status` key on a real download object. Active = actively
+        # transferring; queued is a separate bucket.
+        active = [
+            d
             for d in downloads
             if not d.get("done") and not d.get("paused") and not d.get("queued")
-        )
+        ]
+        active_dl = len(active)
         queued_dl = sum(1 for d in downloads if d.get("queued"))
+        # Name of the first in-flight download so the topbar badge tooltip can
+        # read "1 downloading — <name>" instead of a bare count. Base filename
+        # (sans .zim) — recognizable without a catalog lookup on a 5s poll.
+        first_name = ""
+        if active:
+            fn = active[0].get("filename", "") or ""
+            first_name = fn[:-4] if fn.endswith(".zim") else fn
         seeding_count = 0
         try:
             from zimi import p2p as _p2p
@@ -378,7 +658,11 @@ def handle_manage_get(handler, parsed, params):
                     "total": idx.get("total", 0),
                     "current": idx.get("building_now"),
                 },
-                "downloads": {"active": active_dl, "queued": queued_dl},
+                "downloads": {
+                    "active": active_dl,
+                    "queued": queued_dl,
+                    "name": first_name,
+                },
                 "seeding": {"torrents": seeding_count},
             },
         )
@@ -420,6 +704,18 @@ def handle_manage_get(handler, parsed, params):
                 200, {"enabled": False, "ratio_cap": 0.0, "upload_kb": 0}
             )
 
+    elif parsed.path == "/manage/health":
+        # Library health report — poll status of the on-demand check.
+        from zimi import health as _health
+
+        return handler._json(200, _health.get_state())
+
+    elif parsed.path == "/manage/export-bookmarks":
+        # Save-to-ZIM export — poll status of the on-demand export.
+        from zimi import zimwriter as _zw
+
+        return handler._json(200, _zw.get_export_state())
+
     elif parsed.path == "/manage/peers/list":
         try:
             from zimi import p2p_discovery as _disc
@@ -440,57 +736,7 @@ def handle_manage_get(handler, parsed, params):
         return handler._json(200, {"history": _srv._load_history()})
 
     elif parsed.path == "/manage/cache-info":
-        import glob as _glob
-
-        data_dir = _srv.ZIMI_DATA_DIR
-
-        def _dir_size(path):
-            total = 0
-            for f in _glob.glob(os.path.join(path, "**"), recursive=True):
-                if os.path.isfile(f):
-                    total += os.path.getsize(f)
-            return total
-
-        titles_dir = os.path.join(data_dir, "titles")
-        qids_dir = os.path.join(data_dir, "qids")
-        caches = {
-            "title_indexes": {
-                "path": "titles/",
-                "size_bytes": _dir_size(titles_dir) if os.path.isdir(titles_dir) else 0,
-                "count": (
-                    len(_glob.glob(os.path.join(titles_dir, "*.db")))
-                    if os.path.isdir(titles_dir)
-                    else 0
-                ),
-            },
-            "qid_indexes": {
-                "path": "qids/",
-                "size_bytes": _dir_size(qids_dir) if os.path.isdir(qids_dir) else 0,
-                "count": (
-                    len(_glob.glob(os.path.join(qids_dir, "*.db")))
-                    if os.path.isdir(qids_dir)
-                    else 0
-                ),
-            },
-            "metadata_cache": {
-                "path": "cache.json",
-                "size_bytes": (
-                    os.path.getsize(os.path.join(data_dir, "cache.json"))
-                    if os.path.exists(os.path.join(data_dir, "cache.json"))
-                    else 0
-                ),
-            },
-            "suggest_cache": {
-                "path": "suggest_cache.json",
-                "size_bytes": (
-                    os.path.getsize(os.path.join(data_dir, "suggest_cache.json"))
-                    if os.path.exists(os.path.join(data_dir, "suggest_cache.json"))
-                    else 0
-                ),
-            },
-        }
-        total = sum(c["size_bytes"] for c in caches.values())
-        return handler._json(200, {"caches": caches, "total_bytes": total})
+        return handler._json(200, _cache_info_payload())
 
     elif parsed.path == "/manage/hot":
         # Pro: list of hot ZIMs + which env source controls them.
@@ -533,6 +779,14 @@ def handle_manage_get(handler, parsed, params):
         torrents = []
         total_up = 0
         total_down = 0
+        # Mirror seeds carry no ratio cap; personal seeds stop at cap x size.
+        # The cap is a single global (per-torrent goal = cap x that file's
+        # size), computed client-side from ratio_cap + the file size we send.
+        mirror_on = p2p.is_mirror_enabled()
+        ratio_cap = p2p.get_seed_ratio_cap()
+        from zimi import library as _lib
+
+        ledger = _lib.seed_ledger_snapshot()
         # Drop finished/errored results (e.g. broken-ZIM torrents that can't
         # resolve) so they don't linger in the seeding panel. Best-effort.
         purge = getattr(backend, "purge_stopped", None)
@@ -548,7 +802,7 @@ def handle_manage_get(handler, parsed, params):
                 if files and isinstance(files, list) and files[0].get("path"):
                     fpath = files[0]["path"]
                 fname = os.path.basename(fpath)
-                # Skip aria2's own .torrent metadata fetches — noise.
+                # Skip anything that isn't a ZIM (stray .torrent noise).
                 if not fname.endswith(".zim"):
                     continue
                 completed = int(raw.get("completedLength", 0))
@@ -560,7 +814,7 @@ def handle_manage_get(handler, parsed, params):
                 # without this a BT download double-surfaces (one download
                 # card AND one "seed" card for the same .zim under "All").
                 # Only skip when we KNOW it's still downloading: total known,
-                # not yet complete, and aria2 hasn't flagged it a seeder.
+                # not yet complete, and the engine hasn't flagged it a seeder.
                 total = int(raw.get("totalLength", 0))
                 seeder = raw.get("seeder") in ("true", True)
                 if (
@@ -577,6 +831,15 @@ def handle_manage_get(handler, parsed, params):
                     snag = raw.get("errorMessage", "") or "error"
                 elif fpath and not os.path.exists(fpath):
                     snag = "file missing"
+                # Lifetime upload from the ledger (survives restarts) — at
+                # least this session's count. file_size prefers the torrent's
+                # total; completedLength is the seeding-file fallback.
+                led = ledger.get(fname, {})
+                cumulative = max(int(led.get("uploaded", 0) or 0), uploaded)
+                file_size = total or completed
+                is_mirror = mirror_on or led.get("origin") == "mirror"
+                # Personal seeds have a byte goal (cap x size); mirror = none.
+                cap_bytes = 0 if is_mirror else int(ratio_cap * file_size)
                 torrents.append(
                     {
                         "id": raw.get("gid", ""),
@@ -584,7 +847,11 @@ def handle_manage_get(handler, parsed, params):
                         "state": state,
                         "snag": snag,
                         "completed_bytes": completed,
+                        "file_size_bytes": file_size,
                         "uploaded_bytes": uploaded,
+                        "cumulative_uploaded_bytes": cumulative,
+                        "cap_bytes": cap_bytes,
+                        "mirror": is_mirror,
                         "ratio": round(ratio, 3),
                         "peers": int(raw.get("connections", 0)),
                         "down_speed": int(raw.get("downloadSpeed", 0)),
@@ -601,7 +868,8 @@ def handle_manage_get(handler, parsed, params):
             200,
             {
                 "enabled": p2p.is_seeding_enabled(),
-                "ratio_cap": p2p.get_seed_ratio_cap(),
+                "ratio_cap": ratio_cap,
+                "mirror": mirror_on,
                 "disk_pressure": p2p.should_pause_for_disk_pressure(_srv.ZIM_DIR),
                 "torrents": torrents,
                 "totals": {
@@ -614,29 +882,26 @@ def handle_manage_get(handler, parsed, params):
 
     elif parsed.path == "/manage/bt-status":
         # Surface the BT engine state so the user can self-diagnose:
-        # is it enabled, did the binary start, is the port reachable?
+        # enabled? libtorrent importable on this install? session up?
         from zimi import p2p
 
         enabled = p2p.is_torrent_enabled()
-        backend_name = p2p.get_backend_name()
-        binary_present = bool(p2p.find_aria2c()) if backend_name == "aria2" else None
+        engine_importable = p2p._lt() is not None
 
-        # Live state — peek only. A status view must never spawn the sidecar
-        # (with BT on by default that would mean every settings visit).
+        # Live state — peek only. A status view must never start the
+        # engine (with BT on by default that would mean every settings
+        # visit spins up a session).
         backend = p2p.peek_backend() if enabled else None
-        # A crashed sidecar leaves the cached backend object in place, so
-        # "backend is not None" alone would keep reporting a green "running"
-        # dot over a dead engine. Gate liveness on the actual process.
-        sidecar_alive = backend is not None and backend.is_alive()
+        engine_alive = backend is not None and backend.is_alive()
 
         if not enabled:
             status = "off"
         elif backend is not None:
             status = "ready"
-        elif binary_present is False:
+        elif not engine_importable:
             status = "unavailable"
         else:
-            # Binary present, sidecar just not started yet — it spawns at
+            # Importable, session just not started yet — it starts at
             # boot or on first download, so report ready-to-torrent.
             status = "ready"
         hint = None
@@ -644,8 +909,9 @@ def handle_manage_get(handler, parsed, params):
             hint = "BT downloads disabled (ZIMI_BT=off). HTTP is used instead."
         elif status == "unavailable":
             hint = (
-                "aria2c not found — downloads fall back to HTTP. "
-                "Install aria2 to torrent and share load with the Kiwix mirrors."
+                "libtorrent isn't importable on this install — downloads "
+                "fall back to HTTP. Install libtorrent to torrent and share "
+                "load with the Kiwix mirrors."
             )
 
         from zimi import p2p_nat
@@ -655,17 +921,16 @@ def handle_manage_get(handler, parsed, params):
             {
                 "status": status,
                 "enabled": enabled,
-                "backend": backend_name,
+                "backend": "libtorrent",
                 "bt_port": p2p.get_bt_port(),
                 "staging_dir": p2p.get_staging_dir(_srv.ZIMI_DATA_DIR),
-                "binary_present": binary_present,
+                "engine_importable": engine_importable,
                 "hint": hint,
                 "upnp_enabled": p2p.is_upnp_enabled(),
                 "upnp_env_locked": p2p.is_upnp_env_locked(),
-                # True only when the sidecar PROCESS is actually up — "ready"
-                # alone is optimistic (binary present counts) and a crashed
-                # sidecar leaves the object cached. CI gates on this.
-                "sidecar_running": sidecar_alive,
+                # True only when the session is actually up — "ready" alone
+                # is optimistic (importable counts). The UI reads this key.
+                "sidecar_running": engine_alive,
                 "bt_port_env_locked": p2p.is_bt_port_env_locked(),
                 # Cached: the probe runs at startup and on explicit recheck
                 "nat": p2p_nat.last_status() or None,
@@ -674,6 +939,57 @@ def handle_manage_get(handler, parsed, params):
 
     else:
         return handler._json(404, {"error": "not found"})
+
+
+def _handle_users_post(handler, data):
+    """Admin-only user CRUD (multi-user v1). action ∈ {create, delete,
+    set-password, set-allowlist, set-role}. Errors are returned generically; on
+    success the fresh roster (no hashes) is echoed so the UI re-renders in one
+    round trip. Reaching here means the admin-auth challenge already passed.
+
+    Hierarchy (see ``users`` module docstring): only the PRIMARY admin may
+    manage admin-role accounts. A SECONDARY admin can CRUD regular users but
+    cannot create/modify/delete any admin, and NO admin can mutate the primary
+    account (it lives in the password file, not users.json)."""
+    from zimi import users as _users
+
+    action = data.get("action", "")
+    name = data.get("name", "")
+    kind = admin_kind(handler)  # 'primary' | 'secondary' (auth already passed)
+    role = data.get("role")
+
+    # The primary admin is a synthetic row — no CRUD action may target it.
+    primary_name = _get_manage_user() or "admin"
+    if name and name.strip().casefold() == primary_name.strip().casefold():
+        return handler._json(403, {"error": "cannot modify the primary admin"})
+
+    # Only the primary admin manages admin-role accounts. A secondary admin
+    # cannot create an admin, nor touch an existing admin-role user.
+    if kind != "primary":
+        targets_admin_role = role == "admin"
+        touches_existing_admin = bool(name) and _users.is_admin_user(name)
+        if targets_admin_role or touches_existing_admin:
+            return handler._json(
+                403, {"error": "only the primary admin manages admins"}
+            )
+
+    if action == "create":
+        ok, err = _users.create_user(
+            name, data.get("password", ""), data.get("allowlist"), role=role
+        )
+    elif action == "delete":
+        ok, err = _users.delete_user(name)
+    elif action == "set-password":
+        ok, err = _users.set_password(name, data.get("password", ""))
+    elif action == "set-allowlist":
+        ok, err = _users.set_allowlist(name, data.get("allowlist"))
+    elif action == "set-role":
+        ok, err = _users.set_role(name, role, data.get("allowlist"))
+    else:
+        return handler._json(400, {"error": "unknown action"})
+    if not ok:
+        return handler._json(400, {"error": err or "operation failed"})
+    return handler._json(200, {"status": "ok", "users": _users.list_users()})
 
 
 # ============================================================================
@@ -700,20 +1016,37 @@ def handle_manage_post(handler, parsed, data):
             cur = data.get("current", "")
             if not cur or not _verify_password(cur, stored):
                 return handler._json(401, {"error": "Current password is incorrect"})
+        else:
+            # Initial setup: there is no current password to verify, so the
+            # public-lock is the only thing between a public client and a
+            # full instance takeover. Gate it exactly like the rest of
+            # manage — private clients set the first password, public clients
+            # get 403 public_locked (must set it from the LAN).
+            challenge = _manage_auth_challenge(handler)
+            if challenge:
+                return handler._json(*challenge)
         new_pw = data.get("password", "").strip()
         if not new_pw and _get_api_token():
             return handler._json(
                 400, {"error": "Revoke the API token before removing the password"}
             )
-        _set_manage_password(new_pw)
+        # OPTIONAL username stored alongside the hash. Absent field → None →
+        # _set_manage_password preserves any existing username. When the env
+        # var owns the username, the file copy is inert (env wins on read), so
+        # we simply don't persist it.
+        new_user = data.get("username")
+        if new_user is not None and os.environ.get("ZIMI_MANAGE_USER", "").strip():
+            new_user = None
+        _set_manage_password(new_pw, username=new_user)
         return handler._json(
             200, {"status": "password set" if new_pw else "password cleared"}
         )
 
     # API token management — requires existing auth + password must be set
     if parsed.path == "/manage/generate-token":
-        if _check_manage_auth(handler):
-            return handler._json(401, {"error": "unauthorized", "needs_password": True})
+        challenge = _manage_auth_challenge(handler)
+        if challenge:
+            return handler._json(*challenge)
         if not _get_manage_password_hash():
             return handler._json(
                 400, {"error": "Set a password before generating an API token"}
@@ -721,12 +1054,17 @@ def handle_manage_post(handler, parsed, data):
         token = _generate_api_token()
         return handler._json(200, {"token": token})
     if parsed.path == "/manage/revoke-token":
-        if _check_manage_auth(handler):
-            return handler._json(401, {"error": "unauthorized", "needs_password": True})
+        challenge = _manage_auth_challenge(handler)
+        if challenge:
+            return handler._json(*challenge)
         _revoke_api_token()
         return handler._json(200, {"status": "token revoked"})
-    if _check_manage_auth(handler):
-        return handler._json(401, {"error": "unauthorized", "needs_password": True})
+    challenge = _manage_auth_challenge(handler)
+    if challenge:
+        return handler._json(*challenge)
+
+    if parsed.path == "/manage/users":
+        return _handle_users_post(handler, data)
 
     if parsed.path == "/manage/download":
         url = data.get("url", "")
@@ -798,6 +1136,21 @@ def handle_manage_post(handler, parsed, data):
             return handler._json(400, {"error": "Download already finished"})
         return handler._json(code, {"status": status, "id": dl_id})
 
+    elif parsed.path == "/manage/switch-direct":
+        # Escape hatch for a slow BitTorrent swarm: abandon BT for this
+        # download and pull it over HTTP instead.
+        dl_id = data.get("id", "")
+        from zimi.library import _switch_to_direct
+
+        status, code = _switch_to_direct(dl_id)
+        if status == "not_found":
+            return handler._json(404, {"error": "Download not found"})
+        if status == "already_done":
+            return handler._json(400, {"error": "Download already finished"})
+        if status == "not_bt":
+            return handler._json(400, {"error": "Download is not using BitTorrent"})
+        return handler._json(code, {"status": status, "id": dl_id})
+
     elif parsed.path == "/manage/clear-downloads":
         with _srv._download_lock:
             to_remove = [k for k, v in _srv._active_downloads.items() if v.get("done")]
@@ -851,6 +1204,39 @@ def handle_manage_post(handler, parsed, data):
             _t.Thread(target=_srv._build_all_qid_indexes, daemon=True).start()
             return handler._json(200, {"status": "started", "target": "qid"})
         return handler._json(400, {"error": "unknown action"})
+
+    elif parsed.path == "/manage/health-check":
+        # Kick off the library health report on a worker thread.
+        from zimi import health as _health
+
+        started, msg = _health.start_check()
+        return handler._json(
+            200, {"status": "started" if started else "running", "detail": msg}
+        )
+
+    elif parsed.path == "/manage/export-bookmarks":
+        # Save bookmarks to a standalone ZIM. The client POSTs its localStorage
+        # bookmark list (client-side only — server has no copy).
+        from zimi import zimwriter as _zw
+
+        bookmarks = data.get("bookmarks")
+        if not isinstance(bookmarks, list) or not bookmarks:
+            return handler._json(400, {"error": "No bookmarks to export"})
+        if len(bookmarks) > 500:
+            return handler._json(400, {"error": "Too many bookmarks (max 500)"})
+        cleaned = [
+            {
+                "zim": str(b.get("zim", "")),
+                "path": str(b.get("path", "")),
+                "title": str(b.get("title", "")),
+            }
+            for b in bookmarks
+            if isinstance(b, dict)
+        ]
+        started, msg = _zw.start_export(cleaned)
+        return handler._json(
+            200, {"status": "started" if started else "busy", "detail": msg}
+        )
 
     elif parsed.path == "/manage/build-fts":
         zim_name = data.get("name", "")
@@ -915,11 +1301,11 @@ def handle_manage_post(handler, parsed, data):
             _srv._search_cache_clear()
             _srv._suggest_cache_clear()
             _srv._clean_stale_title_indexes()
-            # Stop seeding the file we just deleted. Without this the aria2
-            # torrent keeps advertising (and hash-check failing) the missing
-            # file until the 12h maintenance pass or a restart. peek_backend()
-            # no-ops when BT is off, so this is safe unconditionally; run it off
-            # the response thread since it makes RPC round-trips.
+            # Stop seeding the file we just deleted. Without this the engine
+            # keeps advertising (and hash-check failing) the missing file
+            # until the 12h maintenance pass or a restart. peek_backend()
+            # no-ops when BT is off, so this is safe unconditionally; run it
+            # off the response thread.
             try:
                 from zimi import library as _lib
 
@@ -932,18 +1318,23 @@ def handle_manage_post(handler, parsed, data):
             return handler._json(500, {"error": "Failed to delete file"})
 
     elif parsed.path == "/manage/cleanup-tmp":
-        # Remove partial (.tmp) downloads
+        # Remove only genuinely orphaned partials. Defense in depth: even if a
+        # stale client posts this, never delete an active, queued, or
+        # resumable-with-progress .zim.tmp the user still wants.
+        from zimi import library as _lib
+
+        _protected, orphaned = _lib.classify_partials()
         removed = []
-        for f in os.listdir(_srv.ZIM_DIR):
-            if f.endswith(".zim.tmp"):
-                try:
-                    fpath = os.path.join(_srv.ZIM_DIR, f)
-                    size = os.path.getsize(fpath)
-                    os.remove(fpath)
-                    removed.append({"filename": f, "size_bytes": size})
-                    log.info("Cleaned up partial download: %s", f)
-                except OSError:
-                    pass
+        for info in orphaned:
+            fpath = os.path.join(_srv.ZIM_DIR, info["filename"])
+            try:
+                os.remove(fpath)
+                removed.append(
+                    {"filename": info["filename"], "size_bytes": info["size_bytes"]}
+                )
+                log.info("Cleaned up orphaned partial download: %s", info["filename"])
+            except OSError:
+                pass
         return handler._json(200, {"removed": removed})
 
     elif parsed.path == "/manage/update":
@@ -1231,12 +1622,12 @@ def handle_manage_post(handler, parsed, data):
                 )
             changed["seed_ratio"] = ratio
             # Apply the new cap to every live library seed, not just future
-            # adds — aria2 even stops seeds already past the new ratio.
+            # adds — the ledger stops seeds already past the new ratio.
             from zimi import library as _lib_ratio
 
             threading.Thread(target=_lib_ratio.apply_seed_policy, daemon=True).start()
         # Global bandwidth caps (KB/s, 0 = unlimited). Applied live to the
-        # running sidecar so a new limit takes effect without a respawn.
+        # running session so a new limit takes effect without a restart.
         for _field, _envlock in (
             ("bt_up_kb", p2p.is_bt_up_env_locked),
             ("bt_down_kb", p2p.is_bt_down_env_locked),
@@ -1293,6 +1684,61 @@ def handle_manage_post(handler, parsed, data):
             log.warning("set_hot_zims rejected payload: %s", e)
             return handler._json(400, {"error": "invalid hot_zims payload"})
         return handler._json(200, {"hot_zims": valid, "saved": len(valid)})
+
+    elif parsed.path == "/manage/library-layout":
+        # Per-ZIM category overrides + home section order (#37). Merge-patch:
+        # `overrides` is merged key-by-key (empty string clears an entry back to
+        # the heuristic); `section_order` fully replaces when present. Either key
+        # may be omitted so "Move to…" and "Reorder" send minimal payloads.
+        overrides = data.get("overrides")
+        order = data.get("section_order")
+        if overrides is None and order is None:
+            return handler._json(400, {"error": "nothing to update"})
+        if overrides is not None:
+            if (
+                not isinstance(overrides, dict)
+                or len(overrides) > _srv._LAYOUT_MAX_OVERRIDES
+            ):
+                return handler._json(400, {"error": "invalid overrides"})
+            for k, v in overrides.items():
+                if (
+                    not isinstance(k, str)
+                    or not isinstance(v, str)
+                    or len(k) > _srv._LAYOUT_STR_MAX
+                    or len(v) > _srv._LAYOUT_STR_MAX
+                ):
+                    return handler._json(400, {"error": "invalid overrides"})
+        if order is not None:
+            if not isinstance(order, list) or len(order) > _srv._LAYOUT_MAX_ORDER:
+                return handler._json(400, {"error": "invalid section_order"})
+            for s in order:
+                if (
+                    not isinstance(s, str)
+                    or len(s) > _srv._LAYOUT_STR_MAX
+                    or not _srv._SECTION_KEY_RE.match(s)
+                ):
+                    return handler._json(400, {"error": "invalid section_order"})
+        with _srv._library_layout_lock:
+            layout = _srv._load_library_layout()
+            if overrides is not None:
+                merged = dict(layout.get("overrides", {}))
+                for k, v in overrides.items():
+                    if v == "":
+                        merged.pop(k, None)  # empty value = revert to heuristic
+                    else:
+                        merged[k] = v
+                layout["overrides"] = merged
+            if order is not None:
+                layout["section_order"] = list(order)
+            _srv._save_library_layout(layout)
+        return handler._json(
+            200,
+            {
+                "status": "ok",
+                "overrides": layout.get("overrides", {}),
+                "section_order": layout.get("section_order", []),
+            },
+        )
 
     else:
         return handler._json(404, {"error": "not found"})

@@ -9,7 +9,91 @@ var _activeSkyLoop = null;  // reference to the closure-bound _skyLoop inside _i
 
 var _skyStartTime = 0;
 
-function _initSkyScene(now, lat, lon) {
+// Live scene state the RAF loop reads each frame. Split out of the old closure
+// so the time scrubber can swap in a new instant (sun/moon/stars for a scrubbed
+// datetime) without tearing down the loop or reallocating the canvas -- only
+// these few astronomical values are recomputed per scrub frame. See
+// _skySetInstant: that is the whole per-frame cost of dragging through time.
+var _skyState = null;
+
+// Moon glide — when the focus time jumps (scrub, wheel/key step, "Go", Back to
+// Now), the moon eases to its new sky position instead of snapping there.
+// Duration is fixed regardless of jump size, so scrubbing years ahead still
+// takes MOON_TWEEN_MS -- a graceful sweep rather than a blur -- and small steps
+// (one wheel notch, one arrow key) get the same easing so mixed inputs feel
+// consistent.
+var MOON_TWEEN_MS = 500;
+
+function _moonEaseOut(p) { return 1 - Math.pow(1 - p, 3); }
+
+// Shortest signed delta (degrees) from `from` to `to`, wrapping at 360 -- so
+// azimuth/parallactic tweening sweeps the short way around the 0/360 seam
+// instead of the long way when a jump straddles it.
+function _angleDelta(from, to) { return ((to - from) % 360 + 540) % 360 - 180; }
+
+// Sample the moon's tweened state at time `ts` (a performance.now()/rAF
+// timestamp). Position (altitude/azimuth/parallactic) eases geometrically;
+// phase is sampled from REAL astronomy at the interpolated instant via
+// _moonAnimPhaseAt, so the lit fraction sweeps its true path across the jump
+// rather than snapping. The re-shade this costs is bounded by
+// _moonSpriteCanvas's cache (illumination rounded to 1%): at the sky moon's
+// ~14 px radius a full sweep is a few dozen tiny sprites, generated once.
+function _skyMoonAt(s, ts) {
+  var anim = s.moonAnim;
+  if (!anim) return s.moonData;
+  var p = (ts - anim.start) / MOON_TWEEN_MS;
+  if (p >= 1) { s.moonAnim = null; return s.moonData; }
+  var e = _moonEaseOut(Math.max(0, p));
+  var fp = anim.from.pos, tp = anim.to.pos;
+  return {
+    pos: {
+      altitude: fp.altitude + (tp.altitude - fp.altitude) * e,
+      azimuth: fp.azimuth + _angleDelta(fp.azimuth, tp.azimuth) * e,
+      parallactic: fp.parallactic + _angleDelta(fp.parallactic, tp.parallactic) * e
+    },
+    phase: _moonAnimPhaseAt(anim.fromTime, anim.toTime, e)
+  };
+}
+
+// (Re)target the moon's glide toward `toMoonData` (the focus instant `toTime`),
+// sampling the CURRENT interpolated position as the new start. A rapid sequence
+// of scrub frames or key/wheel steps thus glides continuously toward whatever
+// the latest target is, instead of snapping back and re-launching each time.
+// The phase sweep restarts from the previous focus time so it, too, chains.
+function _skyMoonRetarget(s, toMoonData, ts, fromTime, toTime) {
+  s.moonAnim = { from: _skyMoonAt(s, ts), to: toMoonData, start: ts, fromTime: fromTime, toTime: toTime };
+  s.moonData = toMoonData;
+  s.nowTime = toTime;
+}
+
+// Recompute the frozen celestial values (sun, moon, stars, horizon label) for
+// an instant. The RAF loop's `elapsed` still drives the decorative twinkle and
+// waves; everything astronomical comes from here. Cheap: a handful of trig
+// calls plus one pass over the bright-star catalogue.
+function _skyFrame(now, lat, lon, cw, ch) {
+  var sunPos = _sunPosition(now, lat, lon);
+  var moonPos0 = _moonPosition(now, lat, lon);
+  var moonM0 = _moonPhase(now);
+  var projStars = _projectStars(now, lat, lon, cw, ch);
+  var altStr = sunPos.altitude.toFixed(1);
+  var labelText = sunPos.altitude > 0
+    ? t('alm_sun') + ' ' + altStr + '°'
+    : t('alm_sun') + ' ' + t('alm_below_horizon') + ' (' + altStr + '°)';
+  if (moonPos0.altitude > -2) {
+    labelText += ' · ' + t('alm_moon') + ' ' + moonPos0.altitude.toFixed(1) + '° (' + moonM0.illumination + '%)';
+  } else {
+    labelText += ' · ' + t('alm_moon') + ' ' + t('alm_below_horizon');
+  }
+  return { sunPos: sunPos, moonData: { pos: moonPos0, phase: moonM0 }, projStars: projStars, labelText: labelText };
+}
+
+// `animateMoon` -- true only for a repaint that reinitializes this same canvas
+// for a NEW focus instant (scrub settle, wheel/key-step settle, "Go", Back to
+// Now). Live loads/resizes (no focus change, or a canvas that didn't exist a
+// moment ago) omit it and get the moon's real position immediately -- there is
+// nothing to glide from, and per-minute live drift must look exactly as it did
+// before this feature existed.
+function _initSkyScene(now, lat, lon, animateMoon) {
   var canvas = document.getElementById('almanac-sky-canvas');
   if (!canvas) return;
   var wrap = canvas.parentElement;
@@ -21,62 +105,83 @@ function _initSkyScene(now, lat, lon) {
   canvas.style.width = w + 'px';
   canvas.style.height = h + 'px';
 
-  var sunPos = _sunPosition(now, lat, lon);
-  _skyStartTime = performance.now();
-
-  // Build sky label text (rendered on the beach inside canvas)
-  var _skyLabelText = '';
-  var altStr = sunPos.altitude.toFixed(1);
-  _skyLabelText = sunPos.altitude > 0 ? t('alm_sun') + ' ' + altStr + '\u00b0' : t('alm_sun') + ' ' + t('alm_below_horizon') + ' (' + altStr + '\u00b0)';
-  var moonPos0 = _moonPosition(now, lat, lon);
-  var moonM0 = _moonPhase(now);
-  if (moonPos0.altitude > -2) {
-    _skyLabelText += ' \u00b7 ' + t('alm_moon') + ' ' + moonPos0.altitude.toFixed(1) + '\u00b0 (' + moonM0.illumination + '%)';
-  } else {
-    _skyLabelText += ' \u00b7 ' + t('alm_moon') + ' ' + t('alm_below_horizon');
-  }
-
-  var projStars = _projectStars(now, lat, lon, canvas.width, canvas.height);
-
-  // Pre-compute moon data (constant for this sky scene — now is frozen)
-  var moonData = { pos: moonPos0, phase: moonM0 };
-
-  // Screen-reader description of the sky scene. Updates once per
-  // render — the animation visuals are decorative; the values
-  // they're derived from are what matter.
-  var srEl = document.getElementById('almanac-sky-desc');
-  if (srEl) {
-    var when = now.toLocaleString(undefined, {
-      weekday: 'long', month: 'long', day: 'numeric', hour: 'numeric', minute: '2-digit'
-    });
-    // _tLookup falls back to English when a stale cached i18n file lacks
-    // these keys — raw key names must never be spoken or shown (issue #25).
-    var sunDesc = sunPos.altitude > 0
-      ? _tLookup('alm_sun', 'Sun') + ' ' + sunPos.altitude.toFixed(0) + '° ' + _tLookup('alm_a11y_above_horizon', 'above the horizon')
-      : _tLookup('alm_sun', 'Sun') + ' ' + _tLookup('alm_a11y_below_horizon', 'below the horizon');
-    var moonDesc;
-    if (moonPos0.altitude > -2) {
-      moonDesc = _tLookup('alm_moon', 'Moon') + ' ' + moonM0.illumination + '% ' + _tLookup('alm_a11y_illuminated', 'illuminated') +
-        ', ' + moonPos0.altitude.toFixed(0) + '° ' + _tLookup('alm_a11y_altitude', 'high');
-    } else {
-      moonDesc = _tLookup('alm_moon', 'Moon') + ' ' + _tLookup('alm_a11y_below_horizon', 'below the horizon');
-    }
-    var starsVisible = (projStars || []).filter(function(s) { return s.alt > 0; }).length;
-    var starsDesc = starsVisible > 0
-      ? starsVisible + ' ' + _tLookup('alm_a11y_stars_visible', 'stars visible')
-      : _tLookup('alm_a11y_no_stars', 'No stars currently above the horizon');
-    var skyFor = _tLookup('alm_a11y_sky_for', 'Almanac sky for {when}.').replace('{when}', when);
-    srEl.textContent = skyFor + ' ' + sunDesc + '. ' + moonDesc + '. ' + starsDesc + '.';
-  }
+  var f = _skyFrame(now, lat, lon, canvas.width, canvas.height);
+  var ts = performance.now();
+  // Carry any in-flight glide across the reinit boundary -- read from the
+  // OLD state (which _skySetInstant may have already been easing) before it's
+  // replaced, so a scrub's settle continues the same motion rather than
+  // reading as a second, smaller snap right after the drag's own motion.
+  var priorMoon = (animateMoon && _skyState) ? _skyMoonAt(_skyState, ts) : null;
+  var priorTime = (_skyState && _skyState.nowTime != null) ? _skyState.nowTime : now.getTime();
+  _skyStartTime = ts;
+  _skyState = {
+    canvas: canvas, dpr: dpr, now: now, nowTime: now.getTime(), lat: lat, lon: lon,
+    sunPos: f.sunPos, moonData: f.moonData, projStars: f.projStars, labelText: f.labelText,
+    moonAnim: null
+  };
+  if (priorMoon) _skyState.moonAnim = { from: priorMoon, to: f.moonData, start: ts, fromTime: priorTime, toTime: now.getTime() };
+  _skyUpdateDesc(_skyState);
 
   function _skyLoop(ts) {
+    var s = _skyState;
+    if (!s) return;
     var elapsed = (ts - _skyStartTime) / 1000;
-    _drawSkyScene(canvas, dpr, sunPos, now, lat, lon, elapsed, _skyLabelText, projStars, moonData);
+    var moonNow = _skyMoonAt(s, ts);
+    _drawSkyScene(s.canvas, s.dpr, s.sunPos, s.now, s.lat, s.lon, elapsed, s.labelText, s.projStars, moonNow);
+    // Drive the hero moon's time-travel sweep from this same loop (no second
+    // rAF). Defined in almanac.js, which loads after this file.
+    if (typeof _heroMoonTick === 'function') _heroMoonTick(ts);
     _almanacSkyRAF = requestAnimationFrame(_skyLoop);
   }
   _activeSkyLoop = _skyLoop;  // expose to _resumeAllRAF
   if (_almanacSkyRAF) cancelAnimationFrame(_almanacSkyRAF);
   _almanacSkyRAF = requestAnimationFrame(_skyLoop);
+}
+
+// Repaint the sky for a scrubbed instant WITHOUT restarting the loop or
+// resizing the canvas -- the running RAF picks up the new state on its next
+// frame. This is the efficiency contract of the time scrubber: per drag frame
+// we recompute only the sky's astronomical values (via _skyFrame); the heavy
+// almanac panels wait for release.
+function _skySetInstant(now) {
+  var s = _skyState;
+  if (!s) return;
+  var f = _skyFrame(now, s.lat, s.lon, s.canvas.width, s.canvas.height);
+  var fromTime = (s.nowTime != null) ? s.nowTime : now.getTime();
+  s.now = now;
+  s.sunPos = f.sunPos;
+  _skyMoonRetarget(s, f.moonData, performance.now(), fromTime, now.getTime());
+  s.projStars = f.projStars;
+  s.labelText = f.labelText;
+}
+
+// Screen-reader description of the sky scene. Updates on (re)init and on scrub
+// release -- the animation visuals are decorative; the values they're derived
+// from are what matter. _tLookup falls back to English when a stale cached
+// i18n file lacks these keys -- raw key names must never be spoken (issue #25).
+function _skyUpdateDesc(s) {
+  var srEl = document.getElementById('almanac-sky-desc');
+  if (!srEl) return;
+  var sunPos = s.sunPos, moonPos0 = s.moonData.pos, moonM0 = s.moonData.phase, projStars = s.projStars;
+  var when = s.now.toLocaleString(undefined, {
+    weekday: 'long', month: 'long', day: 'numeric', hour: 'numeric', minute: '2-digit'
+  });
+  var sunDesc = sunPos.altitude > 0
+    ? _tLookup('alm_sun', 'Sun') + ' ' + sunPos.altitude.toFixed(0) + '° ' + _tLookup('alm_a11y_above_horizon', 'above the horizon')
+    : _tLookup('alm_sun', 'Sun') + ' ' + _tLookup('alm_a11y_below_horizon', 'below the horizon');
+  var moonDesc;
+  if (moonPos0.altitude > -2) {
+    moonDesc = _tLookup('alm_moon', 'Moon') + ' ' + moonM0.illumination + '% ' + _tLookup('alm_a11y_illuminated', 'illuminated') +
+      ', ' + moonPos0.altitude.toFixed(0) + '° ' + _tLookup('alm_a11y_altitude', 'high');
+  } else {
+    moonDesc = _tLookup('alm_moon', 'Moon') + ' ' + _tLookup('alm_a11y_below_horizon', 'below the horizon');
+  }
+  var starsVisible = (projStars || []).filter(function(st) { return st.alt > 0; }).length;
+  var starsDesc = starsVisible > 0
+    ? starsVisible + ' ' + _tLookup('alm_a11y_stars_visible', 'stars visible')
+    : _tLookup('alm_a11y_no_stars', 'No stars currently above the horizon');
+  var skyFor = _tLookup('alm_a11y_sky_for', 'Almanac sky for {when}.').replace('{when}', when);
+  srEl.textContent = skyFor + ' ' + sunDesc + '. ' + moonDesc + '. ' + starsDesc + '.';
 }
 
 var _STARS = [
@@ -135,6 +240,19 @@ var _STAR_NAMES = {
   55: 'Fomalhaut', 56: 'Polaris'
 };
 
+// A few catalog labels don't normalize onto their AlmanacLinks key (which uses
+// the full proper name); map those explicitly. Everything else is the label
+// lowercased with non-alphanumerics collapsed to underscores.
+var _STAR_LINK_OVERRIDES = { 'Rigil Kent.': 'star:rigil_kentaurus' };
+
+// AlmanacLinks key for a catalog star index, or null if it has no proper name.
+function _starLinkKey(idx) {
+  var nm = _STAR_NAMES[idx];
+  if (!nm) return null;
+  if (_STAR_LINK_OVERRIDES[nm]) return _STAR_LINK_OVERRIDES[nm];
+  return 'star:' + nm.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/_+$/, '');
+}
+
 // Project catalog stars to canvas coordinates for current time/location
 function _projectStars(now, lat, lon, W, H) {
   var JD = _dateToJD(now.getTime());
@@ -180,6 +298,32 @@ function _drawConstellations(ctx, alpha, t, projStars) {
     }
   }
   ctx.restore();
+}
+
+// Decorative dim background starfield for the horizon scene — generated once
+// per canvas size (cached, like the orrery's own background stars) rather than
+// re-rolled every animation frame. These are pure ambiance (no real RA/Dec, no
+// link), filling out the naked-eye-dense look a ~60-catalog-star sky can't on
+// its own; _lcgRand (almanac-orrery.js) keeps them deterministic.
+var _skyBgStars = null;
+
+function _ensureSkyBgStars(W, H, dpr) {
+  if (_skyBgStars && _skyBgStars.W === W && _skyBgStars.H === H) return _skyBgStars.stars;
+  var sr = _lcgRand(42);
+  var count = 220;
+  var stars = [];
+  for (var i = 0; i < count; i++) {
+    stars.push({
+      x: sr() * W,
+      y: sr() * H * 0.55,
+      r: (0.25 + sr() * 0.35) * dpr,
+      freq: 0.8 + sr() * 2.0,
+      phase: sr() * 6.28,
+      base: 0.03 + sr() * 0.12
+    });
+  }
+  _skyBgStars = { W: W, H: H, stars: stars };
+  return stars;
 }
 
 function _drawSkyScene(canvas, dpr, sunPos, now, lat, lon, elapsed, labelText, projStars, moonData) {
@@ -240,21 +384,17 @@ function _drawSkyScene(canvas, dpr, sunPos, now, lat, lon, elapsed, labelText, p
   if (alt < 8) {
     var starOpacity = alt < -14 ? 1 : alt < -2 ? (-2 - alt) / 12 : Math.max(0, (8 - alt) / 20);
 
-    // Dim background stars — seeded PRNG for faint ambiance
-    var _seed = 42;
-    function _srand() { _seed = (_seed * 16807 + 0) % 2147483647; return _seed / 2147483647; }
-    for (var si = 0; si < 45; si++) {
-      var sx = _srand() * W;
-      var sy = _srand() * H * 0.55;
-      _srand();
-      var sr = 0.4 * dpr;
-      var twinkleFreq = 0.8 + _srand() * 2.0;
-      var twinklePhase = _srand() * 6.28;
-      var twinkle = Math.sin(t * twinkleFreq + twinklePhase) * 0.15;
-      var bsa = starOpacity * Math.max(0.03, 0.15 + twinkle);
-      _srand();
+    // Dim background stars — a cached deterministic field (only the twinkle,
+    // a sine over each star's cached phase/frequency, is recomputed per frame;
+    // the layout itself is generated once per canvas size, not re-rolled every
+    // RAF tick — see _ensureSkyBgStars).
+    var bgStars = _ensureSkyBgStars(W, H, dpr);
+    for (var si = 0; si < bgStars.length; si++) {
+      var bs = bgStars[si];
+      var twinkle = Math.sin(t * bs.freq + bs.phase) * 0.15;
+      var bsa = starOpacity * Math.max(0.03, bs.base + twinkle);
       ctx.beginPath();
-      ctx.arc(sx, sy, sr, 0, Math.PI * 2);
+      ctx.arc(bs.x, bs.y, bs.r, 0, Math.PI * 2);
       ctx.fillStyle = 'rgba(200,210,230,' + bsa.toFixed(3) + ')';
       ctx.fill();
     }
@@ -731,24 +871,75 @@ var _starChartViewLon = null;
 
 var _starChartDragged = false; // suppresses the tap-to-identify after a drag
 
+var _starChartSelectedKey = null; // the currently selected body's link key (2nd
+                                  // tap on the same one opens its article)
+
+var _scTouchPanning = false;      // a touch gesture began inside the disc
+
 function _starChartResetLoc() {
   _starChartViewLat = null;
   _starChartViewLon = null;
   _drawStarChart(_starChartTime());
 }
 
+// True when a client point falls within the inscribed disc of the square canvas
+// — the only region that owns the pan gesture. Corners belong to the page.
+function _insideChartDisc(canvas, clientX, clientY) {
+  var rect = canvas.getBoundingClientRect();
+  var px = clientX - rect.left - rect.width / 2;
+  var py = clientY - rect.top - rect.height / 2;
+  var R = Math.min(rect.width, rect.height) / 2;
+  return px * px + py * py <= R * R;
+}
+
 // Drag the chart to stand somewhere else on Earth. This is a preview only —
 // it never overwrites the saved location the rest of the almanac uses.
 function _initStarChartDrag(canvas) {
   var dragging = false, lastX = 0, lastY = 0, moved = 0;
+  // touch-action is `auto`, so a touch that starts in the square's corners
+  // scrolls the page normally. Containment lives in these listeners, not
+  // clip-path (which only clips hit-testing in some browsers, not Safari):
+  //   - touchstart records only whether the gesture began inside the disc; it
+  //     does NOT preventDefault, so a stationary tap still yields its click
+  //     (tap-to-identify / open the article).
+  //   - touchmove (non-passive) preventDefaults only for an inside-started
+  //     gesture, cancelling the page scroll so the pan owns it. A corner-started
+  //     gesture is left to scroll the page.
+  // Bound once — _initStarChartDrag re-runs per render, and addEventListener
+  // would otherwise stack duplicates (unlike the reassigned pointer handlers).
+  if (!canvas._scTouchBound) {
+    canvas._scTouchBound = true;
+    canvas.addEventListener('touchstart', function (e) {
+      var tt = e.touches[0];
+      _scTouchPanning = !!tt && _insideChartDisc(canvas, tt.clientX, tt.clientY);
+    }, { passive: true });
+    canvas.addEventListener('touchmove', function (e) {
+      if (_scTouchPanning) e.preventDefault();
+    }, { passive: false });
+    var _scTouchClear = function () { _scTouchPanning = false; };
+    canvas.addEventListener('touchend', _scTouchClear);
+    canvas.addEventListener('touchcancel', _scTouchClear);
+  }
   canvas.onpointerdown = function (e) {
+    // Only the circular disc is interactive. A press in the square's corners
+    // (outside the inscribed circle) must not start a rotation or capture the
+    // pointer — it belongs to the page (scroll). This mirrors the touch guard
+    // above and keeps mouse/stylus honest.
+    if (!_insideChartDisc(canvas, e.clientX, e.clientY)) return;
     dragging = true; moved = 0;
     lastX = e.clientX; lastY = e.clientY;
     _starChartDragged = false;
     if (canvas.setPointerCapture) { try { canvas.setPointerCapture(e.pointerId); } catch (err) {} }
   };
   canvas.onpointermove = function (e) {
-    if (!dragging) return;
+    if (!dragging) {
+      // Hover affordance: pointer cursor only over a body that resolves to an
+      // installed article. Plain (grab) cursor everywhere else.
+      var hr = canvas.getBoundingClientRect();
+      var over = _starChartBodyAt(e.clientX - hr.left, e.clientY - hr.top);
+      canvas.style.cursor = _starChartLinkFor(over) ? 'pointer' : '';
+      return;
+    }
     var dx = e.clientX - lastX, dy = e.clientY - lastY;
     lastX = e.clientX; lastY = e.clientY;
     moved += Math.abs(dx) + Math.abs(dy);
@@ -784,20 +975,44 @@ function _azCompass(az) {
   return pts[Math.round(((az % 360) + 360) % 360 / 45) % 8];
 }
 
-function _starChartClick(ev) {
-  if (_starChartDragged) { _starChartDragged = false; return; } // that was a pan
-  var canvas = document.getElementById('almanac-starchart');
-  var info = document.getElementById('alm-sc-info');
-  if (!canvas || !info) return;
-  var r = canvas.getBoundingClientRect();
-  var x = ev.clientX - r.left, y = ev.clientY - r.top;
+// Nearest drawn body within the tap radius of a canvas point, or null.
+function _starChartBodyAt(x, y) {
   var best = null, bestD = 18;
   for (var i = 0; i < _starChartBodies.length; i++) {
     var b = _starChartBodies[i];
     var d = Math.sqrt((b.x - x) * (b.x - x) + (b.y - y) * (b.y - y));
     if (d < bestD) { bestD = d; best = b; }
   }
-  info.innerHTML = best ? _almEsc(best.label) : '';
+  return best;
+}
+
+// The resolved article for a body, or null (no key / not in the installed
+// library / batch not yet landed).
+function _starChartLinkFor(body) {
+  return (body && body.key && window.AlmanacLinks) ? window.AlmanacLinks.linkFor(body.key) : null;
+}
+
+function _starChartClick(ev) {
+  if (_starChartDragged) { _starChartDragged = false; return; } // that was a pan
+  var canvas = document.getElementById('almanac-starchart');
+  var info = document.getElementById('alm-sc-info');
+  if (!canvas || !info) return;
+  var r = canvas.getBoundingClientRect();
+  var best = _starChartBodyAt(ev.clientX - r.left, ev.clientY - r.top);
+  if (!best) { info.innerHTML = ''; _starChartSelectedKey = null; return; }
+  var link = _starChartLinkFor(best);
+  // Second tap on the same, already-selected linkable body opens its installed
+  // article (closed-set authority — same open path the name-link hint uses).
+  if (link && best.key && best.key === _starChartSelectedKey) {
+    window.AlmanacLinks.open(best.key);
+    return;
+  }
+  // First tap selects: name it in the info line, carrying the dotted-amber link
+  // hint ONLY when its curated Q-ID actually resolved (no link → no hint, never
+  // a search). A resolved body is remembered so a second tap can open it.
+  var label = _almEsc(best.label);
+  info.innerHTML = link ? window.AlmanacLinks.wrap(best.key, label) : label;
+  _starChartSelectedKey = link ? best.key : null;
 }
 
 function _renderStarChart(baseNow) {
@@ -808,7 +1023,35 @@ function _renderStarChart(baseNow) {
   if (cv) _initStarChartDrag(cv);
   var info = document.getElementById('alm-sc-info');
   if (info) info.innerHTML = '';
+  _starChartSelectedKey = null;
   _drawStarChart(baseNow);
+}
+
+// Decorative dim background starfield for the planisphere disc — same idea as
+// _ensureSkyBgStars for the horizon scene: a cached, deterministic field (not
+// astronomically real, not linkable) so the disc reads as a real night sky
+// instead of the ~25-35 catalog stars typically above the horizon at once.
+// Cached by disc size only (not lat/lon/time), so panning/scrubbing is free.
+var _starChartBgStars = null;
+
+function _ensureStarChartBgStars(size) {
+  if (_starChartBgStars && _starChartBgStars.size === size) return _starChartBgStars.stars;
+  var sr = _lcgRand(137);
+  var count = 150;
+  var half = size / 2;
+  var stars = [];
+  for (var i = 0; i < count; i++) {
+    var ang = sr() * Math.PI * 2;
+    var rad = Math.sqrt(sr()) * (half - 16); // area-uniform over the disc, clear of the rim labels
+    stars.push({
+      x: half + Math.cos(ang) * rad,
+      y: half + Math.sin(ang) * rad,
+      r: 0.3 + sr() * 0.45,
+      a: 0.06 + sr() * 0.13
+    });
+  }
+  _starChartBgStars = { size: size, stars: stars };
+  return stars;
 }
 
 function _drawStarChart(now) {
@@ -878,6 +1121,20 @@ function _drawStarChart(now) {
   ctx.fillStyle = sky;
   ctx.fillRect(cx - R, cy - R, R * 2, R * 2);
   ctx.restore();
+
+  // Faint decorative background stars, clipped to the disc — ambiance only,
+  // drawn under the constellation lines and the real (linkable) catalog stars.
+  ctx.save();
+  ctx.beginPath(); ctx.arc(cx, cy, R, 0, Math.PI * 2); ctx.clip();
+  var bgStars = _ensureStarChartBgStars(size);
+  for (var bgi = 0; bgi < bgStars.length; bgi++) {
+    var bg = bgStars[bgi];
+    ctx.beginPath(); ctx.arc(bg.x, bg.y, bg.r, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(210,220,240,' + bg.a.toFixed(3) + ')';
+    ctx.fill();
+  }
+  ctx.restore();
+
   ctx.strokeStyle = 'rgba(120,140,180,0.35)';
   ctx.lineWidth = 1;
   ctx.beginPath(); ctx.arc(cx, cy, R, 0, Math.PI * 2); ctx.stroke();
@@ -927,7 +1184,7 @@ function _drawStarChart(now) {
       drawLabel(_STAR_NAMES[i], p.x, p.y, rad + 2);
     }
     _starChartBodies.push({
-      x: p.x, y: p.y,
+      x: p.x, y: p.y, key: _starLinkKey(i),
       label: (_STAR_NAMES[i] || t('alm_star')) + ' \u00b7 ' + p.alt.toFixed(0) + '\u00b0 ' +
              _azCompass(p.az) + ' \u00b7 mag ' + mag.toFixed(1)
     });
@@ -954,7 +1211,7 @@ function _drawStarChart(now) {
     ctx.font = 'bold 9px system-ui, sans-serif';
     drawLabel(_tp(nm), pp.x, pp.y, 5);
     _starChartBodies.push({
-      x: pp.x, y: pp.y,
+      x: pp.x, y: pp.y, key: 'planet:' + nm.toLowerCase(),
       label: _tp(nm) + ' \u00b7 ' + aa.alt.toFixed(0) + '\u00b0 ' + _azCompass(aa.az)
     });
     planetsUp.push(_tp(nm));
@@ -969,7 +1226,7 @@ function _drawStarChart(now) {
     ctx.beginPath(); ctx.arc(mpp.x, mpp.y, 4.5, 0, Math.PI * 2); ctx.fill();
     ctx.strokeStyle = 'rgba(0,0,0,0.3)'; ctx.lineWidth = 0.5; ctx.stroke();
     _starChartBodies.push({
-      x: mpp.x, y: mpp.y,
+      x: mpp.x, y: mpp.y, key: 'planet:moon',
       label: t('alm_the_moon') + ' \u00b7 ' + mp.altitude.toFixed(0) + '\u00b0 ' +
              _azCompass(mp.azimuth) + ' \u00b7 ' + _moonPhase(now).illumination + '%'
     });

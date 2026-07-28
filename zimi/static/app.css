@@ -79,9 +79,34 @@
   }
   .back-btn:hover,
   .random-btn:hover, .manage-btn:hover, .newtab-btn:hover, .library-btn:hover,
+  .reader-btn:hover,
   .catalog-lang-search-btn:hover,
   .lang-selector-btn:hover,
-  .library-btn.panel-open { color: var(--amber); border-color: var(--amber-border); background: var(--amber-glow); }
+  .library-btn.panel-open,
+  #readerview-btn[aria-pressed="true"],
+  #tts-btn.speaking { color: var(--amber); border-color: var(--amber-border); background: var(--amber-glow); }
+  /* Reader View ON: the book button becomes the settings affordance — a small
+     amber dot hints that a second tap opens the palette (not exits the mode). */
+  #readerview-btn.rv-on { position: relative; }
+  #readerview-btn.rv-on::after {
+    content: ''; position: absolute; top: 5px; right: 5px;
+    width: 5px; height: 5px; border-radius: 50%;
+    background: var(--amber); box-shadow: 0 0 0 2px var(--surface);
+  }
+  /* One-shot coachmark floated beside the book button on first Reader View. */
+  .reader-coach {
+    position: fixed; z-index: 9999; max-width: 220px;
+    background: var(--amber); color: #000; font-size: 12.5px; font-weight: 600;
+    line-height: 1.3; padding: 8px 11px; border-radius: 10px;
+    box-shadow: var(--shadow-popup); cursor: pointer;
+    opacity: 0; transform: translateY(-4px); transition: opacity .2s, transform .2s;
+  }
+  .reader-coach.visible { opacity: 1; transform: none; }
+  .reader-coach::before {
+    content: ''; position: absolute; top: -5px; right: 14px;
+    border-left: 6px solid transparent; border-right: 6px solid transparent;
+    border-bottom: 6px solid var(--amber);
+  }
 
   /* ── History trail dropdown ── */
   #history-trail {
@@ -133,6 +158,19 @@
     font-family: inherit; pointer-events: none; opacity: 0.7; transition: opacity 0.15s;
   }
   .topbar-search input:focus ~ .kbd { opacity: 0; }
+  /* Clear (×): shown only when the field has a value (placeholder hidden). The
+     kbd hint gives way to it so they never overlap. Pure CSS — the value drives
+     :placeholder-shown, including programmatic changes. */
+  .topbar-search .search-clear {
+    position: absolute; right: 8px; top: 50%; transform: translateY(-50%);
+    display: none; align-items: center; justify-content: center;
+    width: 22px; height: 22px; padding: 0; border: none; border-radius: 5px;
+    background: transparent; color: var(--text2); cursor: pointer;
+    transition: color 0.12s, background 0.12s;
+  }
+  .topbar-search .search-clear:hover { color: var(--amber); background: var(--amber-glow); }
+  .topbar-search input:not(:placeholder-shown) ~ .search-clear { display: flex; }
+  .topbar-search input:not(:placeholder-shown) ~ .kbd { opacity: 0; }
 
   /* ── Suggest dropdown ── */
   .suggest-dropdown {
@@ -147,7 +185,7 @@
   .suggest-item .sg-title { color: var(--text); }
   .suggest-item .sg-source { font-size: 11px; color: var(--text2); margin-top: 1px; }
 
-  .random-btn, .manage-btn, .newtab-btn, .library-btn, .lang-selector-btn {
+  .random-btn, .manage-btn, .newtab-btn, .library-btn, .lang-selector-btn, .reader-btn {
     display: flex; align-items: center; justify-content: center;
     color: var(--text2); flex-shrink: 0; width: 36px; height: 28px;
     border-radius: var(--radius); transition: color 0.2s, background 0.2s, border-color 0.2s;
@@ -156,6 +194,14 @@
   .random-btn, .manage-btn, .newtab-btn, .library-btn { text-decoration: none; font-size: 16px; }
   .lang-selector-btn { line-height: 1; }
   .newtab-btn { display: none; }
+  /* Reader-only controls (font size + read-aloud) — appear when an article is open */
+  .reader-btn { line-height: 1; }
+  /* The "A" glyph scales with the active font level as a live preview of the setting */
+  .reader-btn .font-glyph { font-weight: 700; font-size: 15px; transition: font-size 0.15s; }
+  /* Read-aloud button swaps between speaker and stop icons via the .speaking class */
+  #tts-btn .tts-icon-stop { display: none; }
+  #tts-btn.speaking .tts-icon-speak { display: none; }
+  #tts-btn.speaking .tts-icon-stop { display: inline; }
   .manage-btn { position: relative; }
   .random-btn .dice { display: inline-block; transition: transform 0.3s cubic-bezier(0.34, 1.56, 0.64, 1); }
   .random-btn:hover .dice { transform: rotate(20deg) scale(1.15); }
@@ -175,10 +221,9 @@
   .stats-bar .num { color: var(--amber); font-weight: 600; }
 
   /* ── Pills (categories + search source filters) ── */
-  .pills { display: flex; flex-wrap: wrap; gap: 6px; justify-content: center; margin-bottom: 20px; }
-  .pills-row { display: flex; gap: 6px; overflow-x: auto; overflow-y: hidden; -webkit-overflow-scrolling: touch; scrollbar-width: thin; scrollbar-color: var(--border) transparent; padding-bottom: 2px; width: 100%; }
-  .pills-row::-webkit-scrollbar { height: 4px; }
-  .pills-row::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+  .pills { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; justify-content: center; margin-bottom: 20px; }
+  .pills-row { display: flex; align-items: center; gap: 6px; overflow-x: auto; overflow-y: hidden; -webkit-overflow-scrolling: touch; scrollbar-width: none; padding-bottom: 2px; width: 100%; }
+  .pills-row::-webkit-scrollbar { display: none; }
   /* ── Catalog lang row (single-row scroll with search icon) ── */
   .catalog-lang-row { display: flex; align-items: center; gap: 6px; margin-bottom: 12px; overflow: hidden; }
   .catalog-lang-scroll { display: flex; gap: 6px; overflow-x: auto; overflow-y: hidden; flex: 1; min-width: 0; -webkit-overflow-scrolling: touch; scrollbar-width: none; padding: 2px 0; }
@@ -191,25 +236,48 @@
   }
   .catalog-lang-search-btn.expanded { width: 140px; border-color: var(--amber-border); background: var(--surface); justify-content: flex-start; gap: 6px; padding: 0 10px; }
   .catalog-lang-search-btn.expanded input { border: none; background: transparent; color: var(--text); font-size: 11px; outline: none; width: 100%; font-weight: 500; }
+  /* One base geometry for every filter/category/source/language/recency pill.
+     Variants (.cat-pill, .col-pill, .reorder-pill, .dl-filter-pill, .lang-pill…)
+     ride on top of .pill and may override colour/accent ONLY — never height,
+     padding, or font-size, so rows never render at mismatched heights. */
   .pill, .lang-pill {
+    display: inline-flex; align-items: center; gap: 5px; box-sizing: border-box;
+    min-height: 28px; padding: 6px 14px; font-size: 12px; line-height: 1;
     font-weight: 500; white-space: nowrap;
     background: var(--surface); border: 1px solid var(--border); border-radius: 20px;
     color: var(--text2); cursor: pointer; transition: color 0.2s, background 0.2s, border-color 0.2s;
   }
-  .pill { padding: 6px 14px; font-size: 12px; }
-  .lang-pill { padding: 4px 12px; font-size: 11px; }
   .pill:hover, .lang-pill:hover,
   .ci-variant-btn:hover, .flavor-pill:hover { border-color: var(--amber-border); color: var(--text); background: var(--amber-glow); }
   .pill.active, .lang-pill.active { background: linear-gradient(135deg, var(--amber), var(--amber2)); color: #000; border-color: transparent; font-weight: 600; }
-  .pill .pill-count { opacity: 0.55; font-size: 10px; }
+  /* Count chip: a subtle padded pill so the number reads as a distinct count and
+     never crowds the label or the pill's edge. The parent gap (5px) separates it
+     from the label; the padding gives the digits breathing room inside the chip. */
+  .pill .pill-count { opacity: 0.7; font-size: 10px; font-weight: 600; margin-left: 1px; padding: 1px 6px; background: rgba(255, 255, 255, 0.07); border-radius: 8px; }
   /* Dark chip on the amber active pill — amber-on-amber is unreadable */
-  .pill.active .pill-count { opacity: 1; background: rgba(0, 0, 0, 0.22); color: #000; padding: 0 5px; border-radius: 8px; }
+  .pill.active .pill-count { opacity: 1; background: rgba(0, 0, 0, 0.22); color: #000; padding: 1px 6px; border-radius: 8px; }
   .pill.dimmed, .lang-pill.dimmed { opacity: 0.35; pointer-events: none; }
   .pills-divider { width: 60px; height: 1px; background: var(--border); margin: 0 auto 4px; opacity: 0.5; }
+  /* Collection pills carry the layers glyph so they read as groupings, not
+     categories, in the filter row. */
+  .col-pill { display: inline-flex; align-items: center; gap: 5px; border-style: dashed; }
+  .col-pill-glyph { flex-shrink: 0; opacity: 0.8; }
+  /* "Reorder" is a link-OUT action (opens a separate view), not a filter —
+     amber outline + the trailing ↗ glyph set it apart. */
+  .reorder-pill { display: inline-flex; align-items: center; gap: 4px; color: var(--amber); border-color: var(--amber-border); border-style: dashed; background: var(--amber-glow); }
+  .reorder-pill:hover { color: var(--amber); border-color: var(--amber); background: var(--amber-glow); border-style: dashed; }
 
   /* ── Language pills (above source pills in search results) ── */
-  .lang-pills { display: flex; gap: 6px; overflow-x: auto; overflow-y: hidden; -webkit-overflow-scrolling: touch; scrollbar-width: none; padding-bottom: 2px; width: 100%; }
+  .lang-pills { display: flex; align-items: center; gap: 6px; overflow-x: auto; overflow-y: hidden; -webkit-overflow-scrolling: touch; scrollbar-width: none; padding-bottom: 2px; width: 100%; }
   .lang-pills::-webkit-scrollbar { display: none; }
+
+  /* ── Filter pills inside the search dropdown ── the recency + language pills
+     ride at the top of the suggestions panel, above RECENT, separated by a rule.
+     Each row keeps its own horizontal scroll (.pills-row / .lang-pills). */
+  .suggest-filters {
+    display: flex; flex-direction: column; gap: 6px;
+    padding: 8px 14px; border-bottom: 1px solid var(--border);
+  }
 
   /* ── Language banner (view-in-lang / download) ── */
   .lang-banner {
@@ -228,23 +296,180 @@
   .lang-banner-dismiss:hover { color: var(--text); }
 
   /* ── Language switch panel (ephemeral, bottom of reader) ── */
-  .manage-badge { position: absolute; top: 0; right: -2px; min-width: 14px; height: 14px; background: var(--amber); border-radius: 7px; pointer-events: none; font-size: 9px; font-weight: 700; color: #000; display: flex; align-items: center; justify-content: center; padding: 0 3px; box-sizing: border-box; }
   /* Mobile overflow menu */
   .topbar-more { display: none; background: none; border: none; color: var(--text2); font-size: 18px; cursor: pointer; padding: 4px 8px; border-radius: 6px; letter-spacing: 2px; }
   .topbar-more:hover { color: var(--text); background: var(--surface2); }
   .topbar-menu {
     display: none; position: absolute; inset-inline-end: 8px; top: 48px; z-index: 200;
-    background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
     box-shadow: 0 4px 16px rgba(0,0,0,0.3); min-width: 180px; padding: 4px 0;
+    /* With Reader View's settings inline the menu can get tall; cap it to the
+       viewport and scroll cleanly rather than overflow off-screen. */
+    max-height: calc(100vh - 56px); overflow-y: auto; -webkit-overflow-scrolling: touch;
   }
   .topbar-menu.visible { display: block; }
+  /* Inline Reader View settings inside the ⋯ menu — the rv-* rows own their own
+     compact layout; this wrapper just insets them from the menu edge and widens
+     the menu enough for the theme swatches / font pills to breathe. */
+  .topbar-menu .tbm-reader-settings { padding: 2px 6px 4px; min-width: 232px; }
   .topbar-menu-item {
     display: flex; align-items: center; gap: 10px; padding: 10px 14px;
     color: var(--text); font-size: 13px; cursor: pointer; border: none;
     background: none; width: 100%; text-align: start;
   }
   .topbar-menu-item:hover { background: var(--surface2); }
-  .topbar-menu-item svg { flex-shrink: 0; }
+  /* Every leading glyph occupies the same 16px box so the labels line up in a
+     single column — SVG icons are 16px, but the 🎲 emoji has a wider advance
+     and taller line box, which pushed the Random label out of alignment. */
+  .topbar-menu-item svg, .topbar-menu-item .dice { flex-shrink: 0; width: 16px; }
+  .topbar-menu-item .dice { line-height: 1; text-align: center; display: inline-block; }
+  /* Thin rule separating the reader-control group from the app-navigation group. */
+  .topbar-menu-divider { height: 1px; margin: 4px 0; background: var(--border); }
+  .topbar-menu-label { padding: 6px 12px 2px; font-size: 11px; color: var(--text2); text-transform: uppercase; letter-spacing: 0.04em; }
+
+  /* ── Reader header layout ──
+     While an article is open the inline Reader View / font / read-aloud / pop-out
+     controls fold into the ⋯ menu (on every viewport — mobile already did this
+     via the max-width rule; this brings desktop to parity). Flex `order` pins the
+     close X (the .manage-btn slot) to the far right, with ⋯ immediately before it,
+     so the header reads: title … ✕. */
+  body.reading #font-btn, body.reading #tts-btn,
+  body.reading #readerview-btn, body.reading #newtab-btn { display: none !important; }
+  body.reading .topbar-more { display: flex; order: 990; }
+  body.reading .manage-btn { order: 1000; }
+
+  /* ── Users management (multi-user v1) ── */
+  .ms-btn { padding: 6px 12px; font-size: 12px; font-family: inherit; color: var(--text2); background: none; border: 1px solid var(--border); border-radius: var(--radius); cursor: pointer; transition: all 0.15s; }
+  .ms-btn:hover { color: var(--amber); border-color: var(--amber-border); background: var(--amber-glow); }
+  .ms-btn-primary { color: var(--amber); border-color: var(--amber-border); background: var(--amber-glow); }
+  .ms-btn-primary:hover { color: #fff; background: var(--amber); border-color: var(--amber); }
+  .ms-btn-danger:hover { color: #ef4444; border-color: #ef444455; background: #ef444411; }
+  /* Users list — rows carry no controls at rest; every mutation lives behind a
+     single ⋯ menu (.ms-user-menu-btn, styled by .ci-gear). 4px grid throughout. */
+  .ms-users-intro { color: var(--text2); font-size: 13px; margin-bottom: 16px; }
+  .ms-users-list { margin-bottom: 4px; }
+  .ms-user-row { display: flex; align-items: center; gap: 8px; padding: 8px 0; border-bottom: 1px solid var(--border); }
+  .ms-user-main { flex: 1; min-width: 0; }
+  .ms-user-meta { color: var(--text2); font-size: 12px; }
+  .ms-user-menu-btn { flex-shrink: 0; }
+  .ms-user-addbar { margin-top: 16px; }
+  .ms-user-add { margin-top: 12px; display: flex; flex-direction: column; gap: 8px; max-width: 420px; }
+  .ms-user-add[hidden] { display: none; }  /* [hidden] must beat the display:flex above */
+  .ms-user-add input { padding: 8px 10px; font-size: 13px; font-family: inherit; color: var(--text); background: var(--surface2); border: 1px solid var(--border); border-radius: var(--radius); box-sizing: border-box; width: 100%; }
+  .ms-form-label { font-size: 12px; color: var(--text2); }
+  .ms-user-account { margin-top: 24px; border-top: 1px solid var(--border); padding-top: 16px; }
+  /* "Your Account" now leads the pane: no top border, and a divider below it
+     separates it from the other-users section. */
+  .ms-user-account-self { margin-top: 0; border-top: none; padding-top: 0; padding-bottom: 16px; border-bottom: 1px solid var(--border); margin-bottom: 20px; }
+  .ms-user-account-self .ms-user-row { border-bottom: none; }
+  /* Your-account actions: visible Change password / Log out buttons, not a ⋯. */
+  .ms-user-self-actions { flex-shrink: 0; display: flex; gap: 8px; }
+  /* Role badges in the users list. Muted by default; admin gets amber. */
+  .ms-role-badge { display: inline-block; font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; padding: 1px 7px; border-radius: 10px; color: var(--text2); background: var(--surface2); border: 1px solid var(--border); vertical-align: middle; }
+  .ms-role-badge.ms-role-admin { color: #000; background: linear-gradient(135deg, var(--amber), var(--amber2)); border-color: transparent; }
+  /* Role picker reuses .pill; keep it wrapping rather than scrolling in the narrow users pane. */
+  #new-user-role, #edit-user-role { flex-wrap: wrap; overflow: visible; margin-bottom: 4px; }
+
+  /* ── Reader View settings palette ── */
+  /* Popover from the book button (desktop) / ⋯ Reader View row (mobile). Anchored
+     top-right under the topbar, same visual family as .topbar-menu. Chrome (app UI)
+     always uses Zimi's dark palette — only the article inside the iframe changes
+     theme, so this popover intentionally does NOT recolor with the reader theme. */
+  .reader-palette {
+    display: none; position: absolute; inset-inline-end: 8px; top: 48px; z-index: 220;
+    background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
+    box-shadow: var(--shadow-popup); width: 264px; max-width: calc(100vw - 16px); padding: 6px;
+  }
+  .reader-palette.visible { display: block; animation: fadeIn 0.12s ease; }
+  .rv-pal-head {
+    display: flex; align-items: center; gap: 8px; padding: 6px 8px 8px;
+    color: var(--text); font-size: 13px; font-weight: 600;
+  }
+  .rv-pal-head svg { color: var(--amber); }
+  .rv-row { padding: 7px 8px; }
+  .rv-row-label { font-size: 11px; color: var(--text2); margin-bottom: 6px; text-transform: uppercase; letter-spacing: 0.4px; }
+  /* Theme swatches */
+  .rv-swatches { display: flex; gap: 6px; }
+  .rv-swatch {
+    flex: 1; display: flex; flex-direction: column; align-items: center; gap: 5px;
+    padding: 8px 4px 6px; border: 1px solid var(--border); border-radius: 9px;
+    background: var(--surface2); color: var(--text2); font-size: 11px; cursor: pointer;
+    transition: border-color 0.15s, color 0.15s;
+  }
+  .rv-swatch:hover { border-color: var(--amber-border); color: var(--text); }
+  .rv-swatch.active { border-color: var(--amber); color: var(--text); }
+  .rv-sw-dot { width: 22px; height: 22px; border-radius: 50%; border: 1px solid rgba(255,255,255,0.14); }
+  .rv-sw-dark .rv-sw-dot { background: #0a0a0b; }
+  .rv-sw-light .rv-sw-dot { background: #fbfbf9; border-color: rgba(0,0,0,0.18); }
+  .rv-sw-sepia .rv-sw-dot { background: #f4ecd8; border-color: rgba(0,0,0,0.14); }
+  .rv-swatch.active .rv-sw-dot { box-shadow: 0 0 0 2px var(--surface2), 0 0 0 3px var(--amber); }
+  /* Family pills */
+  .rv-pills { display: flex; gap: 6px; }
+  .rv-pill {
+    flex: 1; padding: 8px 6px; border: 1px solid var(--border); border-radius: 8px;
+    background: var(--surface2); color: var(--text2); font-size: 14px; cursor: pointer;
+    transition: border-color 0.15s, color 0.15s, background 0.15s;
+  }
+  .rv-pill:hover { border-color: var(--amber-border); color: var(--text); }
+  .rv-pill.active { border-color: var(--amber); color: var(--amber); background: var(--amber-glow); }
+  /* Text-size stepper */
+  .rv-size { display: flex; align-items: center; gap: 8px; }
+  .rv-size-btn {
+    display: flex; align-items: center; justify-content: center; gap: 1px; line-height: 1;
+    width: 44px; height: 34px; border: 1px solid var(--border); border-radius: 8px;
+    background: var(--surface2); color: var(--text); font-size: 15px; font-weight: 700; cursor: pointer;
+    transition: border-color 0.15s, color 0.15s;
+  }
+  /* The ± sits smaller than the A but shares its vertical center — align-items:center
+     on the button centers both flex items, so the glyph group reads as centered. */
+  .rv-size-btn .rv-minus, .rv-size-btn .rv-plus { font-size: 10px; font-weight: 700; }
+  .rv-size-btn:hover:not([disabled]) { border-color: var(--amber-border); }
+  .rv-size-btn[disabled] { opacity: 0.35; cursor: default; }
+  .rv-size-val { flex: 1; text-align: center; font-size: 13px; color: var(--text2); }
+  /* ── Compact reader controls (⋯ menu, Reader View on) ── */
+  /* Label-less: theme swatches shrink to ~24px colour chips (the text label is
+     hidden, aria-label carries the name), and font family + size share one row.
+     Sized to fit a 390px viewport without horizontal scroll. */
+  .rv-compact { display: flex; flex-direction: column; gap: 8px; padding: 2px 2px 4px; }
+  .rv-compact .rv-swatches { gap: 8px; }
+  .rv-compact .rv-swatch { flex-direction: row; justify-content: center; padding: 5px; gap: 0; }
+  .rv-compact .rv-sw-label { display: none; }
+  .rv-compact .rv-sw-dot { width: 24px; height: 24px; }
+  .rv-compact-fontrow { display: flex; align-items: stretch; gap: 8px; flex-wrap: wrap; }
+  .rv-compact-fontrow .rv-pills { flex: 1 1 108px; }
+  .rv-compact-fontrow .rv-size { flex: 1 1 132px; }
+  /* Full-palette swatch keeps its stacked label. */
+  .rv-swatch .rv-sw-label { line-height: 1; }
+  /* Reader View row rendered as a switch inside the ⋯ menu. */
+  .topbar-menu-item.tbm-rv-toggle .rv-switch { margin-inline-start: auto; }
+  /* AUTO toggle row */
+  .rv-toggle-row {
+    display: flex; align-items: center; gap: 10px; width: 100%; text-align: start;
+    padding: 9px 8px; margin-top: 2px; background: none; border: none; cursor: pointer; border-radius: 8px;
+  }
+  .rv-toggle-row:hover { background: var(--surface2); }
+  .rv-toggle-text { flex: 1; display: flex; flex-direction: column; gap: 1px; }
+  .rv-toggle-title { font-size: 13px; color: var(--text); }
+  .rv-toggle-sub { font-size: 11px; color: var(--text2); }
+  .rv-switch {
+    flex-shrink: 0; width: 38px; height: 22px; border-radius: 11px; background: var(--surface2);
+    border: 1px solid var(--border); position: relative; transition: background 0.15s, border-color 0.15s;
+  }
+  .rv-switch.on { background: var(--amber); border-color: var(--amber); }
+  .rv-knob {
+    position: absolute; top: 2px; inset-inline-start: 2px; width: 16px; height: 16px;
+    border-radius: 50%; background: #fff; transition: inset-inline-start 0.15s;
+  }
+  .rv-switch.on .rv-knob { inset-inline-start: 18px; }
+  .rv-pal-divider { height: 1px; margin: 6px 6px; background: var(--border); }
+  .rv-exit-row, .rv-action-row {
+    display: flex; align-items: center; gap: 10px; width: 100%; text-align: start;
+    padding: 9px 8px; background: none; border: none; cursor: pointer; border-radius: 8px;
+    color: var(--text); font-size: 13px;
+  }
+  .rv-exit-row:hover, .rv-action-row:hover { background: var(--surface2); color: var(--amber); }
+  .rv-action-row svg { flex-shrink: 0; color: var(--text2); }
+  .rv-action-row:hover svg { color: var(--amber); }
   /* Language welcome card on home */
   .lang-welcome-card {
     display: flex; align-items: center; gap: 12px; padding: 14px 16px; margin-bottom: 16px;
@@ -254,6 +479,9 @@
   .lang-welcome-text { flex: 1; }
   .lang-welcome-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
   .lang-welcome-subtle { padding: 8px 12px; font-size: 13px; color: var(--text2); }
+  /* Management LAN-only notice (passwordless + non-private client, issue #36) */
+  .manage-locked-card { max-width: 520px; margin: 32px auto; }
+  .manage-locked-card strong { font-size: 15px; }
 
   /* ── Tab bar ── */
   /* ── Language selector (globe icon) ── */
@@ -293,6 +521,7 @@
   [dir="rtl"] .topbar-search input { text-align: right; padding: 9px 14px 9px 36px; }
   [dir="rtl"] .search-icon { left: 12px; right: auto; }
   [dir="rtl"] .kbd { right: auto; left: 8px; }
+  [dir="rtl"] .topbar-search .search-clear { right: auto; left: 8px; }
   [dir="rtl"] .back-btn { transform: scaleX(-1); }
   /* Article/ZIM titles can be RTL (Arabic, Hebrew, Farsi) inside LTR
      chrome (and vice versa) — isolate so neighboring punctuation and
@@ -324,6 +553,14 @@
   .cat-heading:first-child { margin-top: 0; }
   .cat-heading.clickable { cursor: pointer; }
   .cat-heading.clickable:hover { opacity: 0.8; }
+  /* The global view toggle rides on the first section header's line, pinned to
+     its trailing edge. Absolute (not flex) so the gradient-clipped heading text
+     is untouched; text-fill-color reset so the toggle glyphs aren't transparent. */
+  .cat-heading.has-view-toggle { position: relative; padding-inline-end: 74px; }
+  .cat-heading .lib-view-toggle {
+    position: absolute; inset-inline-end: 0; top: 50%; transform: translateY(-50%);
+    -webkit-text-fill-color: initial;
+  }
 
   /* ── Source header ── */
   .source-header { display: flex; gap: 16px; align-items: flex-start; padding: 4px 0 24px; }
@@ -333,6 +570,8 @@
   .source-header h1 { font-size: 20px; font-weight: 600; color: var(--accent); margin: 0; }
   .sh-meta { font-size: 13px; color: var(--text2); margin-top: 4px; }
   .sh-desc { font-size: 13px; color: var(--text2); margin-top: 4px; line-height: 1.5; }
+  .sh-actions { margin-top: 10px; display: flex; gap: 8px; flex-wrap: wrap; }
+  .dl-pill { text-decoration: none; display: inline-block; }
 
   /* ── Source cards ── */
   .stats-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 8px; margin-top: 8px; }
@@ -348,6 +587,16 @@
     box-shadow: 0 4px 24px var(--amber-glow), 0 0 0 1px var(--amber-glow);
     transform: translateY(-2px); outline: none;
   }
+  /* Brief amber pulse on a just-added source (e.g. a fresh bookmarks export)
+     so the eye lands on it after the library refreshes. Self-clears in JS. */
+  .stat-card.zimi-just-added {
+    animation: zimiJustAdded 2.6s ease-out both;
+  }
+  @keyframes zimiJustAdded {
+    0%   { border-color: var(--amber); box-shadow: 0 0 0 1px var(--amber), 0 6px 28px var(--amber-glow); }
+    70%  { border-color: var(--amber); box-shadow: 0 0 0 1px var(--amber-border), 0 4px 20px var(--amber-glow); }
+    100% { border-color: var(--border); box-shadow: none; }
+  }
   .card-icon { width: 48px; height: 48px; flex-shrink: 0; border-radius: 10px; overflow: hidden; background: var(--surface2); display: flex; align-items: center; justify-content: center; align-self: center; }
   .card-icon img { width: 42px; height: 42px; object-fit: cover; background: #fff; border-radius: 8px; padding: 2px; }
   .icon-letter { font-size: 20px; font-weight: 700; background: linear-gradient(135deg, var(--amber), #f97316); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; }
@@ -358,6 +607,44 @@
      by 0.6 dropped contrast below WCAG AA. --text2 alone is the
      "secondary" cue. */
   .stat-card .detail { font-size: 11px; color: var(--text2); margin-top: auto; }
+
+  /* ── Library view toggle (compact tiles vs full list) ── */
+  .lib-view-toggle { display: inline-flex; border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; vertical-align: middle; }
+  .lib-view-btn {
+    display: flex; align-items: center; justify-content: center; width: 32px; height: 28px;
+    background: none; border: none; color: var(--text2); cursor: pointer; padding: 0;
+    transition: background 0.15s, color 0.15s;
+  }
+  .lib-view-btn + .lib-view-btn { border-left: 1px solid var(--border); }
+  .lib-view-btn:hover { color: var(--text); background: var(--surface2); }
+  .lib-view-btn.active { color: var(--amber); background: var(--amber-glow); }
+
+  /* Compact tiles: square-ish cells, icon on top, name under it, several per row.
+     Reuses .stat-card markup — only the layout changes. Wider min column than
+     before so titles have room to breathe (mobile stays ~3 across, desktop gets
+     roomier tiles via the min-width override below). */
+  .stats-grid.tiles { grid-template-columns: repeat(auto-fill, minmax(112px, 1fr)); gap: 10px; }
+  .stats-grid.tiles .stat-card { flex-direction: column; align-items: center; gap: 8px; padding: 14px 10px; text-align: center; }
+  .stats-grid.tiles .card-icon { align-self: center; }
+  .stats-grid.tiles .card-info { align-items: center; padding-right: 0; }
+  .stats-grid.tiles .desc, .stats-grid.tiles .detail, .stats-grid.tiles .card-cat, .stats-grid.tiles .qid-badge { display: none; }
+  .stats-grid.tiles .name { font-size: 12px; margin-bottom: 0; line-height: 1.35; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; word-break: break-word; }
+  /* Badges become corner chips on the tile (icon is centred, so corners are
+     clear): NEW top-left, language bottom-left. The inline margins from the list
+     layout are dropped since they're absolutely positioned here. */
+  .stats-grid.tiles .new-badge { position: absolute; top: 6px; left: 6px; margin: 0; }
+  .stats-grid.tiles .lang-badge { display: inline-block; position: absolute; bottom: 6px; left: 6px; margin: 0; }
+  /* Compact view hides the empty (unfavorited) star — only a filled star or a
+     hover (pointer devices) reveals it, so tiles aren't peppered with grey stars. */
+  .stats-grid.tiles .star-btn:not(.starred) { opacity: 0; pointer-events: none; }
+  @media (hover: hover) {
+    .stats-grid.tiles .stat-card:hover .star-btn:not(.starred) { opacity: 0.4; pointer-events: auto; }
+  }
+  /* Desktop has the width for roomier tiles — bump the min column so titles get
+     more room; mobile keeps the tighter ~3-across from the base rule. */
+  @media (min-width: 601px) {
+    .stats-grid.tiles { grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); }
+  }
 
   /* ── Search results ── */
   .meta { display: flex; gap: 12px; align-items: center; margin-bottom: 20px; font-size: 12px; color: var(--text2); }
@@ -423,6 +710,73 @@
   .zimi-ctx-item { padding: 8px 14px; cursor: pointer; display: flex; align-items: center; gap: 8px; }
   .zimi-ctx-item:hover { background: var(--hover); }
   .zimi-ctx-item .ctx-key { margin-inline-start: auto; font-size: 11px; color: var(--text2); }
+  /* ── Word lookup (Define) popover ── */
+  .define-popover {
+    position: fixed; z-index: 10001; display: none;
+    background: var(--card-bg, #1a1a1a); border: 1px solid var(--border);
+    border-radius: 10px; box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+    color: var(--text); font-size: 13px; max-width: 320px;
+  }
+  .define-popover.open { display: block; }
+  /* Stage 1: the compact "Define" trigger button */
+  .define-trigger {
+    display: flex; align-items: center; gap: 6px;
+    padding: 7px 12px; cursor: pointer; white-space: nowrap; font-weight: 500;
+  }
+  .define-trigger:hover { color: var(--amber); }
+  .define-trigger svg { width: 14px; height: 14px; }
+  /* Stage 2: the definition card */
+  .define-card { padding: 10px 14px 12px; max-height: 40vh; overflow-y: auto; }
+  .define-card .define-word {
+    font-weight: 600; font-size: 15px; margin-bottom: 4px;
+    display: flex; align-items: baseline; gap: 8px;
+  }
+  .define-card .define-word .define-lang { font-size: 11px; color: var(--text2); font-weight: 400; }
+  .define-card .define-body { color: var(--text); line-height: 1.5; }
+  .define-card .define-body ol { margin: 4px 0 0; padding-inline-start: 20px; }
+  .define-card .define-body li { margin: 2px 0; }
+  .define-card .define-status { color: var(--text2); font-style: italic; }
+  .define-card .define-open {
+    display: inline-block; margin-top: 8px; font-size: 12px;
+    color: var(--amber); cursor: pointer; text-decoration: none;
+  }
+  .define-card .define-open:hover { text-decoration: underline; }
+  /* ── Library health report ── */
+  .library-health:empty { display: none; }
+  .library-health { margin-top: 12px; }
+  .health-summary { font-weight: 600; margin: 8px 0; color: var(--text); }
+  .health-table { border-top: 1px solid var(--border); }
+  .health-row {
+    display: flex; align-items: baseline; gap: 8px;
+    padding: 6px 2px; border-bottom: 1px solid var(--border); font-size: 13px;
+  }
+  .health-row .health-mark { flex: 0 0 auto; width: 16px; text-align: center; }
+  .health-row .health-name { flex: 0 0 auto; font-weight: 500; color: var(--text); }
+  .health-row .health-detail { flex: 1 1 auto; color: var(--text2); text-align: end; }
+  /* Small labelled chips for the "has title index / Q-ID index" indicators. */
+  .health-idx-badge {
+    display: inline-block; margin-inline-start: 5px; padding: 1px 6px;
+    font-size: 10px; font-weight: 600; letter-spacing: 0.04em; border-radius: 4px;
+    background: var(--surface2); color: var(--text2); border: 1px solid var(--border);
+    vertical-align: middle;
+  }
+  .health-row.health-warn .health-detail { color: var(--amber); }
+  .health-row.health-info .health-detail { color: var(--text2); }
+  .health-row .health-redownload-btn {
+    flex: 0 0 auto; font-size: 11px; padding: 2px 8px; border-radius: 5px; cursor: pointer;
+    background: var(--surface2); color: var(--amber); border: 1px solid var(--border);
+  }
+  .health-row .health-redownload-btn:hover { border-color: var(--amber); }
+  .health-row .health-redownload-btn.confirming { background: var(--amber-glow, rgba(245,158,11,.15)); font-weight: 600; }
+  /* ── Bookmarks panel: Save to ZIM ── */
+  .hp-actions { display: flex; align-items: center; gap: 10px; padding: 8px 12px; flex-wrap: wrap; }
+  .hp-action-btn {
+    font-size: 12px; padding: 5px 12px; border-radius: 6px; cursor: pointer;
+    background: var(--surface2); color: var(--text); border: 1px solid var(--border);
+  }
+  .hp-action-btn:hover:not(:disabled) { color: var(--amber); border-color: var(--amber-border, var(--amber)); }
+  .hp-action-btn:disabled { opacity: 0.5; cursor: default; }
+  .hp-action-status { font-size: 12px; color: var(--text2); }
   .reader-loading {
     position: absolute; inset: 0; display: flex; align-items: center;
     justify-content: center; flex-direction: column; gap: 12px;
@@ -453,6 +807,10 @@
   .empty { text-align: center; padding: 48px 20px; color: var(--text2); }
   .empty p { font-size: 14px; margin-bottom: 8px; }
   .empty .hint { font-size: 12px; opacity: 0.5; }
+  .did-you-mean { font-size: 14px; color: var(--text2); margin-bottom: 16px; }
+  .empty .did-you-mean { margin-bottom: 12px; }
+  .did-you-mean a { color: var(--amber); font-style: italic; text-decoration: none; border-bottom: 1px solid var(--amber-border); }
+  .did-you-mean a:hover { border-bottom-color: var(--amber); }
   .search-deeper {
     text-align: center; padding: 14px 20px; margin-top: 16px;
     color: var(--amber); font-size: 13px; cursor: pointer;
@@ -469,6 +827,17 @@
   .manage-card .mc-row, .ms-pane .mc-row { display: flex; justify-content: space-between; align-items: center; font-size: 13px; color: var(--text2); padding: 4px 0; }
   .manage-card .mc-row .mc-label, .ms-pane .mc-label { color: var(--text2); }
   .manage-card .mc-row .mc-value, .ms-pane .mc-value { color: var(--text); font-weight: 500; }
+  /* Caches: data-dir storage breakdown */
+  .mc-section-title { font-size: 12px; font-weight: 600; color: var(--text); margin: 2px 0 8px; }
+  .cache-bar { display: flex; width: 100%; height: 14px; border-radius: 6px; overflow: hidden; background: var(--surface2); border: 1px solid var(--border); }
+  .cache-seg { height: 100%; min-width: 2px; }
+  .cache-seg + .cache-seg { box-shadow: inset 1px 0 0 rgba(0,0,0,0.28); }
+  .cache-legend { display: flex; flex-wrap: wrap; gap: 6px 14px; margin: 8px 0 2px; font-size: 11px; color: var(--text2); }
+  .cache-legend-item { display: inline-flex; align-items: center; gap: 5px; }
+  .cache-legend-swatch { width: 9px; height: 9px; border-radius: 2px; flex: none; }
+  .cache-legend-item b { color: var(--text); font-weight: 600; }
+  .cache-top-zims { font-size: 11px; color: var(--text2); margin-top: 8px; line-height: 1.5; }
+  .cache-top-label { color: var(--text); font-weight: 600; }
   .manage-btn-action,
   .desktop-card .btn-primary,
   .coll-form button { background: linear-gradient(135deg, var(--amber), var(--amber2)); color: #000; border: none; border-radius: var(--radius); cursor: pointer; }
@@ -532,16 +901,46 @@
   }
   .catalog-grid .catalog-item .ci-hier,
   .catalog-grid .catalog-item .ci-peer { margin-top: 2px; }
-  /* Batch checkbox pins to the card's top-right corner (out of the title
-     flow). Modest 15px control, but padded to a ~35px touch target. */
+  /* Batch checkbox: a custom appearance:none box drawn entirely in CSS so it
+     renders identically across engines. A native checkbox scales with its
+     width/height/padding on iOS Safari into a huge dark rounded square — the
+     bug this replaces. 40px transparent hit area (tap target) centring a 22px
+     visual box (::before), pinned to the card's top-right corner. The checked
+     black-on-amber check matches the .pill.active convention. */
   .catalog-grid .catalog-item .ci-select {
-    position: absolute; top: 4px; right: 4px; margin: 0;
-    width: 15px; height: 15px; padding: 10px; box-sizing: content-box;
-    cursor: pointer;
+    appearance: none; -webkit-appearance: none;
+    position: absolute; top: 0; right: 0; margin: 0; padding: 0;
+    width: 40px; height: 40px; box-sizing: border-box;
+    background: none; border: none; cursor: pointer;
+    display: grid; place-content: center;
   }
-  [dir="rtl"] .catalog-grid .catalog-item .ci-select { right: auto; left: 4px; }
+  .catalog-grid .catalog-item .ci-select::before {
+    content: ""; width: 22px; height: 22px; box-sizing: border-box;
+    /* Unchecked contrast: a --border (#27272b) box on a --surface (#141416) card
+       nearly vanished on-device. --text2 (#8a8a94) border + --surface2 (#1c1c20)
+       fill (one step lighter than the card) reads clearly as an empty checkbox. */
+    border: 2px solid var(--text2); border-radius: 6px; background: var(--surface2);
+    transition: background 0.15s, border-color 0.15s;
+  }
+  .catalog-grid .catalog-item .ci-select:checked::before {
+    border-color: var(--amber);
+    background: var(--amber) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='3.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='20 6 9 17 4 12'/%3E%3C/svg%3E") center/14px no-repeat;
+  }
+  .catalog-grid .catalog-item .ci-select:focus-visible { outline: none; }
+  .catalog-grid .catalog-item .ci-select:focus-visible::before {
+    border-color: var(--amber); box-shadow: 0 0 0 3px var(--amber-glow);
+  }
+  [dir="rtl"] .catalog-grid .catalog-item .ci-select { right: auto; left: 0; }
   [dir="rtl"] .catalog-grid .catalog-item .ci-title { padding-right: 0; padding-left: 22px; }
   .mc-row-clickable:hover, .mc-row-clickable:focus-visible { color: var(--amber); }
+  /* Caret hints the Updates line expands; nudges right on hover. */
+  .mc-caret { vertical-align: -2px; margin-left: 4px; opacity: 0.7; transition: transform 0.12s; }
+  .mc-row-clickable:hover .mc-caret { transform: translateX(2px); }
+  .mc-value .spinner-inline {
+    display: inline-block; width: 12px; height: 12px; vertical-align: -1px; margin-right: 6px;
+    border: 2px solid var(--border); border-top-color: var(--amber);
+    border-radius: 50%; animation: spin 0.7s linear infinite;
+  }
   .catalog-item {
     display: flex; gap: 14px; align-items: center; padding: 14px 16px;
     background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
@@ -578,6 +977,10 @@
   }
   .ci-update-btn:hover { background: var(--amber); }
   .ci-has-update { border-color: var(--amber-border); }
+  /* Collection picker: selected member card + its checkmark badge */
+  .catalog-item.ci-selected { border-color: var(--amber); background: var(--amber-glow); }
+  .ci-coll-check { display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; color: var(--amber); font-weight: 700; font-size: 15px; }
+  .coll-picker { margin-top: 10px; }
   .ci-add-btn {
     padding: 6px 14px; font-size: 12px; font-weight: 600; cursor: pointer;
     background: var(--surface2); color: var(--text); border: 1px solid var(--border);
@@ -657,7 +1060,7 @@
   /* background:none beats .pill.active's amber gradient (same specificity,
      later in source) — amber label on amber fill was unreadable. */
   .dl-filter-pill.active { color: var(--amber); border-color: var(--amber); background: none; font-weight: 600; }
-  .dl-filter-pill.active .pill-count { opacity: 1; background: var(--amber); color: #000; padding: 0 5px; border-radius: 8px; }
+  .dl-filter-pill.active .pill-count { opacity: 1; background: var(--amber); color: #000; padding: 1px 6px; border-radius: 8px; }
   /* One shape for the whole download-row button family */
   .dl-pause-btn, .dl-cancel-btn, .dl-retry-btn { background: none; border: 1px solid var(--border); color: var(--text2);
     padding: 4px 12px; border-radius: 12px; font-size: 11px; cursor: pointer; transition: all 0.15s;
@@ -701,6 +1104,10 @@
   .seeding-bar-snag { background: var(--error); opacity: 0.5; }
   .share-nearby-warn { color: var(--error); margin-top: 4px; }
   .share-rows-skeleton { min-height: 300px; }
+  .share-row-skeleton { display: flex; flex-direction: column; gap: 8px; padding: 16px 0; border-bottom: 1px solid var(--border); }
+  .share-row-skeleton .sk-line { height: 12px; border-radius: 4px; background: linear-gradient(90deg, var(--surface2) 25%, var(--border) 50%, var(--surface2) 75%); background-size: 200% 100%; animation: dc-shimmer 1.5s ease-in-out infinite; }
+  .share-row-skeleton .sk-line-wide { width: 45%; }
+  .share-row-skeleton .sk-line-narrow { width: 70%; height: 10px; opacity: 0.6; }
   .share-bt-state { font-size: 12px; color: var(--text2); }
   .share-mirror-progress { margin-top: 6px; color: var(--amber); }
   /* Toggles pin to the top-right of tall cards; status tucks under */
@@ -714,7 +1121,12 @@
   .share-field { display: flex; align-items: center; gap: 10px; margin-top: 7px; font-size: 12px; color: var(--text2); }
   .share-field > label { min-width: 78px; color: var(--text2); }
   .share-field-note { color: var(--text3); font-size: 11px; }
-  .share-num-input { width: 72px; background: var(--surface2); border: 1px solid var(--border); border-radius: 6px; color: var(--text); font-family: monospace; font-size: 12px; padding: 3px 6px; text-align: left; }
+  /* Sized for the 1-4 digit values they hold (ratio 1.5, MB/s caps) rather than
+     the old label-width default; the port needs room for 5 digits + spinner. */
+  .share-num-input { width: 6ch; background: var(--surface2); border: 1px solid var(--border); border-radius: 6px; color: var(--text); font-family: monospace; font-size: 12px; padding: 3px 6px; text-align: left; }
+  /* 5 digits of monospace + left/right padding + the number spinner arrows;
+     8ch clipped the last digit once the spinner was accounted for. */
+  .share-port-input { width: 78px; }
   .share-num-input:disabled { opacity: 0.5; }
   .peer-name-input { width: 160px; background: var(--surface2); border: 1px solid var(--border); border-radius: 6px; color: var(--text); font-family: monospace; font-size: 12px; padding: 3px 8px; text-align: left; }
   .share-port-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
@@ -728,6 +1140,8 @@
   .dl-seed-icon .rs-letter { font-size: 12px; font-weight: 600; color: var(--text2); }
   .dl-seed-item .dl-name { flex: 1 1 auto; min-width: 0; }
   .dl-seed-item .dl-size { flex: 1 1 100%; min-width: 0; color: var(--text2); }
+  /* Uploaded-vs-goal line under the seed row: quiet, tabular, its own row. */
+  .dl-seed-goal { margin-top: 6px; font-size: 12px; color: var(--text2); font-variant-numeric: tabular-nums; }
   /* Stop-all spans the grid instead of squatting an empty card cell */
   .dl-seed-actions { grid-column: 1 / -1; margin-top: 8px; text-align: right; }
   /* Sharing cards on phones: text keeps its width, fields wrap cleanly */
@@ -742,11 +1156,13 @@
     .peer-name-input { width: 130px; }
     .share-port-group { gap: 8px; }
     .share-port-row { gap: 8px; }
-    .share-port-input { width: 58px; }
+    .share-port-input { width: 70px; }
   }
   .dl-source { font-size: 10px; padding: 1px 6px; border-radius: 3px; border: 1px solid var(--border);
     color: var(--text2); white-space: nowrap; }
   .dl-source-bt { color: var(--amber); border-color: var(--amber-border); background: var(--amber-glow); }
+  /* Delta-update salvage badge: a "savings" cue, distinct from the amber BT pill. */
+  .dl-source-reuse { color: #4fd1a5; border-color: rgba(79,209,165,.35); background: rgba(79,209,165,.10); }
   .dl-clear-btn { float: right; background: none; border: 1px solid var(--border); color: var(--text2); font-size: 11px; padding: 2px 10px; border-radius: 4px; cursor: pointer; margin-top: -28px; }
   .dl-clear-btn:hover { border-color: var(--amber); color: var(--amber); }
 
@@ -903,11 +1319,8 @@
     margin-top: 2px; opacity: 0.65; word-break: break-all;
   }
 
-  /* Multi-select checkbox + floating action bar */
-  .ci-select {
-    accent-color: var(--amber); flex-shrink: 0;
-    margin-right: 6px; align-self: center;
-  }
+  /* Floating multi-select action bar (the checkbox itself is fully styled in
+     the .catalog-grid rule above — appearance:none, so no accent-color here). */
   .ci-selection-bar {
     position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%);
     background: var(--surface); border: 1px solid var(--border); border-radius: 999px;
@@ -1073,12 +1486,32 @@
     body { overflow-x: hidden; }
     /* Mobile: hide secondary actions, show overflow menu */
     .random-btn, .lang-selector-btn, .manage-btn { display: none !important; }
+    /* Reader controls (font size, read-aloud, pop-out) migrate into the ...
+       menu on mobile — the topbar is too tight to hold them inline. */
+    #font-btn, #tts-btn, #readerview-btn, #newtab-btn { display: none !important; }
     .topbar-more { display: flex !important; }
     .topbar.search-focused .topbar-more,
     .topbar.search-focused .library-btn { display: none !important; }
     .topbar.search-focused .lang-dropdown { display: none !important; }
     /* v1.6: Language dropdown — full width on mobile */
     .lang-dropdown { min-width: 160px; }
+    /* Catalog checkbox is engine-independent now (custom CSS box, sized in the
+       base .catalog-grid rule) — no mobile size override needed. Just keep the
+       title clear of the corner box. */
+    .catalog-grid .catalog-item .ci-title { padding-right: 30px; }
+    [dir="rtl"] .catalog-grid .catalog-item .ci-title { padding-right: 0; padding-left: 30px; }
+    /* Selection bar — a single-row pill centred above the tab bar, never
+       wrapping into a blob that overlaps cards. */
+    .ci-selection-bar {
+      left: 12px; right: 12px; transform: none; margin: 0 auto;
+      max-width: 420px; flex-wrap: nowrap; gap: 8px; padding: 8px 12px;
+      justify-content: center;
+      bottom: calc(16px + env(safe-area-inset-bottom, 0px));
+    }
+    .ci-selection-bar .ci-sel-count {
+      min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .ci-selection-bar button { flex-shrink: 0; }
   }
 
   /* ── Password modal ── */
@@ -1088,8 +1521,9 @@
   .pw-box h3 { margin:0 0 12px; font-size:15px; color:var(--text); }
   /* 16px minimum — iOS Safari auto-zooms (and stays zoomed) on focus of any
      input smaller than 16px. */
-  .pw-box input[type="password"] { width:100%; padding:8px 10px; border-radius:var(--radius); border:1px solid var(--border); background:var(--bg); color:var(--text); font-size:16px; box-sizing:border-box; }
-  .pw-box input[type="password"]:focus { outline:none; border-color:var(--amber); }
+  .pw-box input[type="password"], .pw-box input[type="text"] { width:100%; padding:8px 10px; border-radius:var(--radius); border:1px solid var(--border); background:var(--bg); color:var(--text); font-size:16px; box-sizing:border-box; }
+  .pw-box input[type="password"]:focus, .pw-box input[type="text"]:focus { outline:none; border-color:var(--amber); }
+  .pw-box input#pw-username { margin-bottom:8px; }
   .pw-box .pw-actions { display:flex; gap:8px; margin-top:12px; justify-content:flex-end; }
   .pw-box button { padding:6px 14px; border-radius:var(--radius); border:1px solid var(--border); background:var(--surface2); color:var(--text); cursor:pointer; font-size:13px; }
   .pw-box button.pw-primary { background:linear-gradient(135deg, var(--amber), var(--amber2)); color:#000; border-color:transparent; font-weight:600; }
@@ -1145,6 +1579,8 @@
   .card-cat { font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; }
   .lang-badge { display: inline-block; font-size: 10px; font-weight: 600; padding: 1px 5px; margin-left: 6px; border-radius: 4px; background: var(--surface2); color: var(--text2); vertical-align: middle; letter-spacing: 0.06em; }
   .lang-badge.multi { background: var(--amber-glow); color: var(--amber); border: 1px solid var(--amber-border); }
+  /* Downloads/seeds row chip: distinguishes identically-titled transfers. */
+  .dl-lang-badge { flex-shrink: 0; }
   .qid-badge { display: inline-block; margin-left: 5px; vertical-align: middle; color: var(--text3); opacity: 0.5; }
 
   /* ── Star (favorite) toggle ── */
@@ -1159,15 +1595,17 @@
   .star-btn:hover { opacity: 1; color: var(--amber); transform: scale(1.2); }
   .star-btn.starred { opacity: 1; color: var(--amber); }
   .stat-card { position: relative; }
-  /* "New" ribbon for recently-installed ZIMs (#34) — top-left so it clears the
-     top-right star. */
+  /* "New"/"Updated" flag for recently-installed or changed ZIMs (#34). In the
+     full list it sits inline at the head of the title — it can never cover the
+     left icon. A subtle outlined amber pill in small caps, matching the app's
+     accent tokens. */
   .new-badge {
-    position: absolute; top: 6px; left: 6px; z-index: 2;
+    display: inline-block; vertical-align: middle;
+    margin-inline-end: 6px; z-index: 2;
     background: var(--amber); color: #1a1205; font-size: 9px; font-weight: 700;
     letter-spacing: 0.06em; text-transform: uppercase;
     padding: 2px 6px; border-radius: 5px; line-height: 1.2; pointer-events: none;
   }
-  [dir="rtl"] .new-badge { left: auto; right: 6px; }
   /* "Updated" is the quieter sibling — an outlined amber pill, so a brand-new
      ZIM (solid amber) still reads louder than one that merely changed. */
   .new-badge.updated-badge {
@@ -1193,7 +1631,51 @@
     padding: 4px 0; z-index: 10000;
   }
   .ctx-sub.flip-left { left: auto; right: 100%; }
-  .ctx-item:hover > .ctx-sub { display: block; }
+  .ctx-item:hover > .ctx-sub, .ctx-item.kb-open > .ctx-sub { display: block; }
+  /* Keyboard focus reads like hover (roving tabindex, ARIA menu pattern). */
+  .ctx-item:focus, .ctx-item:focus-visible { background: var(--amber-glow); color: var(--amber); outline: none; }
+  .ctx-item.danger:focus, .ctx-item.danger:focus-visible { background: rgba(239,68,68,0.08); color: var(--error); }
+  /* Move-to can list many categories — cap height and scroll rather than
+     overflow the viewport. */
+  .ctx-sub { max-height: 60vh; overflow-y: auto; }
+
+  /* ── Manage-row gear (opens the same Move to… menu) ── */
+  .ci-gear {
+    flex-shrink: 0; width: 26px; height: 26px; padding: 0;
+    display: inline-flex; align-items: center; justify-content: center;
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius); color: var(--text2); cursor: pointer;
+    font-size: 14px; line-height: 1; transition: color 0.1s, border-color 0.1s, background 0.1s;
+  }
+  .ci-gear:hover { color: var(--amber); border-color: var(--amber-border); background: var(--amber-glow); }
+
+  /* ── Section reorder panel (#37) ── */
+  /* Collections and categories share one draggable list; a per-type icon (layers
+     vs tag) tells them apart, and collection rows carry a dashed border too. */
+  .reorder-list { display: flex; flex-direction: column; gap: 4px; margin-top: 8px; }
+  .reorder-row {
+    display: flex; align-items: center; gap: 8px;
+    padding: 8px 12px; background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius); font-size: 13px; cursor: grab;
+  }
+  .reorder-row-col { border-style: dashed; }
+  .reorder-row.dragging { opacity: 0.5; cursor: grabbing; border-color: var(--amber); }
+  /* Grip is the drag affordance; the ▲▼ buttons remain the keyboard fallback. */
+  .reorder-grip { flex-shrink: 0; color: var(--text3); display: inline-flex; align-items: center; }
+  /* Type icon: collections read amber (their signature), categories muted. */
+  .reorder-type { flex-shrink: 0; display: inline-flex; align-items: center; color: var(--text2); }
+  .reorder-row-col .reorder-type { color: var(--amber); }
+  .reorder-label { flex: 1; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .reorder-btns { display: flex; gap: 4px; flex-shrink: 0; }
+  .reorder-btn {
+    width: 26px; height: 26px; padding: 0; display: inline-flex;
+    align-items: center; justify-content: center; font-size: 11px;
+    background: var(--surface2); border: 1px solid var(--border);
+    border-radius: var(--radius); color: var(--text); cursor: pointer;
+    transition: color 0.1s, border-color 0.1s, background 0.1s;
+  }
+  .reorder-btn:hover:not(:disabled) { color: var(--amber); border-color: var(--amber-border); background: var(--amber-glow); }
+  .reorder-btn:disabled { opacity: 0.3; cursor: default; }
 
   /* ── Collections manage ── */
   .coll-form { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
@@ -1237,6 +1719,9 @@
   .hp-clear:hover { color: var(--error); border-color: var(--error); }
   .hp-group { padding: 0 16px; }
   .hp-group-label { padding: 12px 0 6px; }
+  /* First day heading and the Clear action share one row. */
+  .hp-group-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  .hp-group-head .hp-group-label { flex: 1; }
   .hp-item { display: flex; align-items: center; gap: 10px; padding: 8px 0; cursor: pointer; transition: opacity 0.15s; border-bottom: 1px solid var(--border); }
   .hp-item:last-child { border-bottom: none; }
   .hp-item:hover { opacity: 0.8; }
@@ -1338,37 +1823,33 @@
     }
   }
 
-/* ── Background Activity Bar ──────────────────────────────────────────
-   Thin status strip below the topbar. Surfaces what the server is
-   doing in the background (indexing, downloading, seeding) on one line.
-   Hidden when nothing is happening so it never adds visual noise.
-
-   Design: precision-density / Linear-style. No shadows, no icons, just
-   typography. Single amber accent on the actively-building ZIM name.
-   Slides down on appear so it doesn't shift content abruptly. */
-  .activity-bar {
-    position: fixed; top: 56px; left: 0; right: 0; z-index: 199;
-    background: rgba(10, 10, 11, 0.85);
-    -webkit-backdrop-filter: blur(20px) saturate(180%);
-    backdrop-filter: blur(20px) saturate(180%);
-    border-bottom: 1px solid var(--border);
-    color: var(--text2); font-size: 12px; line-height: 1.4;
-    padding: 4px 16px;
-    font-variant-numeric: tabular-nums;
-    transform: translateY(-100%);
-    transition: transform 220ms cubic-bezier(0.25, 1, 0.5, 1);
-    pointer-events: none; /* never blocks topbar clicks */
-    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+/* ── Background-activity badge ────────────────────────────────────────
+   Background work (downloads, indexing, seeding) surfaces as a compact
+   amber badge on the topbar's Manage entry point — the gear on desktop,
+   the ⋯ button on mobile (the gear is hidden there). Replaces the old
+   full-width status bar: no layout shift, no ambient strip, and it's
+   clickable — tapping it jumps straight to the downloads view. The count
+   (in-flight + queued downloads) rides the gear; a hover/long-press title
+   carries the full detail string. Zero downloads but other work → a bare
+   dot. Matches the .dl-tab-badge amber-on-black convention. */
+  .topbar-badge {
+    position: absolute; top: -5px; right: -5px;
+    min-width: 17px; height: 17px; padding: 0 4px; box-sizing: border-box;
+    display: none; align-items: center; justify-content: center;
+    background: var(--amber); color: #000;
+    border: 1.5px solid var(--bg); border-radius: 9px;
+    font-size: 10px; font-weight: 700; line-height: 1;
+    font-variant-numeric: tabular-nums; cursor: pointer;
   }
-  .activity-bar.visible { transform: translateY(0); }
-  .activity-bar .ab-sep { opacity: 0.4; padding: 0 8px; }
-  .activity-bar .ab-current { color: var(--amber); font-weight: 500; }
-  body.has-activity { padding-top: 80px; } /* 56 topbar + 24 bar */
-  /* Manage view already surfaces downloads/indexing in its own tabs — the
-     ambient bar is redundant noise there. */
-  body.in-manage .activity-bar { display: none; }
-  body.in-manage.has-activity { padding-top: 56px; }
-
-  @media (prefers-reduced-motion: reduce) {
-    .activity-bar { transition: none; }
+  /* Ambient-only work (no downloads): shrink to a plain dot, no number. */
+  .topbar-badge.dot { min-width: 9px; width: 9px; height: 9px; padding: 0; top: -2px; right: -2px; }
+  [dir="rtl"] .topbar-badge { right: auto; left: -5px; }
+  [dir="rtl"] .topbar-badge.dot { right: auto; left: -2px; }
+  .topbar-more { position: relative; }
+  /* Download count shown on the ⋯-menu's Manage row (mobile). */
+  .topbar-menu-item .tbm-count {
+    margin-left: auto; padding: 1px 7px;
+    background: var(--amber); color: #000; border-radius: 10px;
+    font-size: 11px; font-weight: 600; line-height: 1.4;
+    font-variant-numeric: tabular-nums;
   }

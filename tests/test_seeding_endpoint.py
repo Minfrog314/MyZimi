@@ -1,8 +1,7 @@
 """Handler-level tests for /manage/seeding honesty (v1.7.2).
 
 Errored or file-missing seeds must be SHOWN (snag field), not hidden,
-and must not pollute the traffic totals. purge_stopped keeps errored
-results visible while clearing finished ones.
+and must not pollute the traffic totals.
 """
 
 import os
@@ -143,22 +142,89 @@ def test_inflight_download_not_listed_as_seed(tmp_path, monkeypatch):
     assert ids == {"g-seed"}, "in-flight download must not appear as a seed"
 
 
-def test_purge_stopped_keeps_errors_visible(monkeypatch):
-    calls = []
+def test_seed_reports_uploaded_and_cap_goal(tmp_path, monkeypatch):
+    """Per-seed payload carries lifetime uploaded + the cap goal (cap x size)
+    so the panel can render 'X of Y'. Personal (non-mirror) seed."""
+    monkeypatch.setattr(p2p, "is_mirror_enabled", lambda: False)
+    monkeypatch.setattr(p2p, "get_seed_ratio_cap", lambda: 2.0)
+    seeding = tmp_path / "wikipedia_en_2026-06.zim"
+    seeding.write_bytes(b"x" * 10)
+    managed = [
+        {
+            "gid": "g-seed",
+            "status": "active",
+            "files": [{"path": str(seeding)}],
+            "completedLength": "1000",
+            "totalLength": "1000",
+            "uploadLength": "600",
+            "connections": "3",
+            "seeder": "true",
+            "infoHash": "ee",
+        }
+    ]
+    body = _call_seeding(monkeypatch, managed, tmp_path)
+    assert body["mirror"] is False
+    t = body["torrents"][0]
+    assert t["file_size_bytes"] == 1000
+    assert t["cumulative_uploaded_bytes"] == 600  # no ledger → session upload
+    assert t["cap_bytes"] == 2000  # 2.0 x 1000
+    assert t["mirror"] is False
 
-    backend = p2p.Aria2Backend.__new__(p2p.Aria2Backend)
 
-    def fake_rpc(method, params, timeout=5.0):
-        calls.append((method, params))
-        if method == "aria2.tellStopped":
-            return [
-                {"gid": "g-done", "status": "complete"},
-                {"gid": "g-err", "status": "error"},
-                {"gid": "g-removed", "status": "removed"},
-            ]
-        return None
+def test_mirror_seed_has_no_cap(tmp_path, monkeypatch):
+    """Mirror mode lifts the cap: cap_bytes is 0 and mirror flag is set."""
+    monkeypatch.setattr(p2p, "is_mirror_enabled", lambda: True)
+    monkeypatch.setattr(p2p, "get_seed_ratio_cap", lambda: 2.0)
+    seeding = tmp_path / "wikipedia_en_2026-06.zim"
+    seeding.write_bytes(b"x" * 10)
+    managed = [
+        {
+            "gid": "g-mirror",
+            "status": "active",
+            "files": [{"path": str(seeding)}],
+            "completedLength": "1000",
+            "totalLength": "1000",
+            "uploadLength": "5000",
+            "connections": "9",
+            "seeder": "true",
+            "infoHash": "ff",
+        }
+    ]
+    body = _call_seeding(monkeypatch, managed, tmp_path)
+    assert body["mirror"] is True
+    t = body["torrents"][0]
+    assert t["cap_bytes"] == 0
+    assert t["mirror"] is True
+    assert t["cumulative_uploaded_bytes"] == 5000
 
-    backend._rpc = fake_rpc
-    backend.purge_stopped()
-    removed = [p[0] for m, p in calls if m == "aria2.removeDownloadResult"]
-    assert removed == ["g-done", "g-removed"], "errored result must stay visible"
+
+def test_seed_cumulative_prefers_ledger(tmp_path, monkeypatch):
+    """Cumulative upload comes from the ledger (survives restarts) when it
+    exceeds the current session's uploadLength."""
+    monkeypatch.setattr(p2p, "is_mirror_enabled", lambda: False)
+    monkeypatch.setattr(p2p, "get_seed_ratio_cap", lambda: 2.0)
+    from zimi import library as _lib
+
+    monkeypatch.setattr(
+        _lib,
+        "seed_ledger_snapshot",
+        lambda: {"wikipedia_en_2026-06.zim": {"uploaded": 9000, "origin": "download"}},
+    )
+    seeding = tmp_path / "wikipedia_en_2026-06.zim"
+    seeding.write_bytes(b"x" * 10)
+    managed = [
+        {
+            "gid": "g-seed",
+            "status": "active",
+            "files": [{"path": str(seeding)}],
+            "completedLength": "1000",
+            "totalLength": "1000",
+            "uploadLength": "600",  # this session only
+            "connections": "1",
+            "seeder": "true",
+            "infoHash": "gg",
+        }
+    ]
+    body = _call_seeding(monkeypatch, managed, tmp_path)
+    t = body["torrents"][0]
+    assert t["cumulative_uploaded_bytes"] == 9000  # ledger wins over session

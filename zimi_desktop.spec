@@ -15,7 +15,12 @@ import os
 import platform
 import sysconfig
 
-from PyInstaller.utils.hooks import collect_submodules
+from PyInstaller.utils.hooks import (
+    collect_all,
+    collect_data_files,
+    collect_dynamic_libs,
+    collect_submodules,
+)
 
 block_cipher = None
 
@@ -60,33 +65,62 @@ def collect_libzim_binaries():
 
 libzim_bins = collect_libzim_binaries()
 
-# Bundled aria2 sidecar (BT downloads/seeding work out of the box).
-# CI prepares a self-contained directory (binary + relocated dylibs on
-# macOS, one static binary on Linux) and points ZIMI_ARIA2_DIR at it.
-# Local builds without the env var simply skip it — Zimi falls back to
-# any system aria2c, then to plain HTTP.
-_aria2_dir = os.environ.get('ZIMI_ARIA2_DIR')
-if _aria2_dir and os.path.isdir(_aria2_dir):
-    for _root, _dirs, _files in os.walk(_aria2_dir):
-        _rel = os.path.relpath(_root, _aria2_dir)
-        _dest = '.' if _rel == '.' else _rel
-        for _f in sorted(_files):
-            # Subdirectories must survive: ossl-modules/ is located at
-            # runtime relative to the aria2c binary (OPENSSL_MODULES) —
-            # flattening it silently reverts to the Homebrew path baked
-            # into libcrypto, which only exists on the build runner.
-            libzim_bins.append((os.path.join(_root, _f), _dest))
-    print(f"Bundling aria2 sidecar from {_aria2_dir}")
+# libtorrent (in-process BT engine): PyInstaller misses compiled-extension
+# dylibs without an explicit collect. Soft dependency — if the build venv
+# has no libtorrent wheel this collects nothing and the app runs HTTP-only.
+lt_bins = collect_dynamic_libs('libtorrent')
+lt_hidden = collect_submodules('libtorrent')
+
+# WinSparkle (Windows auto-updater): the CI workflow downloads the release DLL
+# (pinned + sha256-verified) to the repo root as WinSparkle.dll before building.
+# Bundle it at the bundle root so zimi_winsparkle._find_dll() resolves it via
+# sys._MEIPASS. Absent (e.g. local mac build) → collects nothing, app runs
+# without auto-update, exactly like the Sparkle.framework soft path.
+winsparkle_bins = []
+if platform.system() == 'Windows':
+    _ws_dll = os.path.join(SPECPATH, 'WinSparkle.dll')
+    if os.path.isfile(_ws_dll):
+        winsparkle_bins.append((_ws_dll, '.'))
+
+# ---------------------------------------------------------------------------
+# Windows: pythonnet + clr_loader (drives pywebview's WebView2 backend).
+# ---------------------------------------------------------------------------
+# pywebview's edgechromium/winforms backend reaches .NET through pythonnet,
+# which loads Python.Runtime.dll (shipped inside the pythonnet package) via
+# clr_loader's native netfx hosting shim (clr_loader/ffi/dlls/**/*.dll). None
+# of that is a plain Python import, so PyInstaller's static analysis misses it
+# unless we collect the whole packages. Missing pieces = a frozen app that
+# crashes at launch trying to bring up the window. Windows-only; on mac/linux
+# these packages aren't installed and this collects nothing.
+pythonnet_datas = []
+pythonnet_bins = []
+windows_hiddenimports = []
+if platform.system() == 'Windows':
+    for _pkg in ('pythonnet', 'clr_loader'):
+        _d, _b, _h = collect_all(_pkg)
+        pythonnet_datas += _d
+        pythonnet_bins += _b
+        windows_hiddenimports += _h
+    # WebView2 interop DLLs live in webview/lib/ as data, not importable code.
+    pythonnet_datas += collect_data_files('webview')
+    windows_hiddenimports += [
+        'clr',
+        'clr_loader',
+        'clr_loader.netfx',
+        'pythonnet',
+        'webview.platforms.edgechromium',
+        'webview.platforms.winforms',
+    ]
 
 a = Analysis(
     ['zimi_desktop.py'],
     pathex=[],
-    binaries=libzim_bins,
+    binaries=libzim_bins + lt_bins + winsparkle_bins + pythonnet_bins,
     datas=[
         ('zimi/templates', 'zimi/templates'),
         ('zimi/assets', 'zimi/assets'),
         ('zimi/static', 'zimi/static'),
-    ],
+    ] + pythonnet_datas,
     hiddenimports=[
         'zimi',
         'zimi.server',
@@ -99,11 +133,17 @@ a = Analysis(
         'zimi.p2p',
         'zimi.p2p_discovery',
         'libzim',
+        # Soft BT dependency: guarantees the extension is bundled when a
+        # wheel is present. Absent → PyInstaller warns, does not fail.
+        'libtorrent',
         'certifi',
         'fitz',
         'PIL',
         'webview',
-    ] + zeroconf_hiddenimports + (['gi'] if platform.system() == 'Linux' else []),
+        # Windows auto-updater bridge (imported lazily in zimi_desktop).
+        'zimi_winsparkle',
+        *lt_hidden,
+    ] + zeroconf_hiddenimports + windows_hiddenimports + (['gi'] if platform.system() == 'Linux' else []),
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

@@ -1,7 +1,7 @@
 # Zimi
 
 [![CI](https://github.com/epheterson/Zimi/actions/workflows/ci.yml/badge.svg)](https://github.com/epheterson/Zimi/actions/workflows/ci.yml)
-[![Tests](https://img.shields.io/badge/tests-543%20passing-brightgreen)](#)
+[![Tests](https://img.shields.io/badge/tests-1042%20passing-brightgreen)](#)
 [![Lighthouse Accessibility](https://img.shields.io/badge/Lighthouse%20a11y-100%2F100-success?logo=lighthouse&logoColor=white)](docs/plans/2026-04-26-accessibility.md)
 [![WCAG 2.1 AA](https://img.shields.io/badge/WCAG%202.1-AA-blue)](docs/plans/2026-04-26-accessibility.md)
 [![i18n](https://img.shields.io/badge/i18n-10%20languages-blueviolet)](#languages)
@@ -16,14 +16,15 @@ A modern experience for your ZIM files.
 ## What is Zimi?
 
 - **The offline internet.** Entire websites, cross-ZIM linking, search engine and native browser experience.
-- **Search that hits everything.** One query, every source, 140M+ articles, the right answer on top. Fast.
+- **Search that hits everything.** One query, every source, 100M+ articles, the right answer on top. Fast.
 - **Multilingual.** Switch any article into any language it has. Ten UI languages built in.
 - **A real library.** 1,000+ archives one click away, auto-updates, collections, batch downloads, bookmarks and history.
-- **A mesh.** Your machines find each other and pass ZIMs around at LAN speed, no internet needed.
+- **Your own network.** Your machines find each other and pass ZIMs around at LAN speed, no internet needed.
 - **A good citizen.** Downloads arrive over BitTorrent and seed back to the Kiwix network. One switch makes you a full mirror.
 - **Fresh daily.** Picture of the Day, On This Day, a word, a quote, a comic, a live almanac sky. All computed locally, forever.
 - **Accessible.** If you browse by keyboard, listen by screen reader, or need high contrast, accessibility is built-in.
 - **Anywhere.** Docker, pip, a native macOS app, or your phone as a PWA.
+- **Improving.** Regular updates with ideas from the community, GitHub and creator keep Zimi fresh. Just ask!
 - **For humans and machines.** Web UI, JSON API, MCP server for AI agents.
 
 ## Screenshots
@@ -45,13 +46,13 @@ A modern experience for your ZIM files.
 Not an afterthought. Language is deeply integrated into every aspect of Zimi so you can focus on your content and feel at home. Enjoy filtered lists, labeled sources, RTL support and no rock left unturned.
 - **10 languages.** English, French, German, Spanish, Portuguese, Russian, Chinese, Arabic, Hindi, Hebrew.
 
-Something not right? [Open an issue.](https://github.com/epheterson/Zimi/issues)
+Something not right? [Open an issue.](https://github.com/epheterson/Zimi/issues) Found a security problem? See [SECURITY.md](SECURITY.md) — report it privately.
 
 ## Sharing
 
 Three switches in Server Settings control all of it:
 
-- **BitTorrent** (on by default). Downloads arrive via the Kiwix swarm and seed back, capped at a ratio you choose. `0` means never seed. The Mac and Linux desktop apps ship their own BitTorrent engine; pip and Docker installs use aria2 if present — and everything quietly falls back to plain HTTP without it. UPnP asks your router to open the port, and the settings panel shows whether it worked.
+- **BitTorrent** (on by default). Downloads arrive via the Kiwix swarm and seed back, capped at a ratio you choose. `0` means never seed. The Mac and Linux desktop apps and the Docker image ship their own BitTorrent engine (in-process libtorrent); a bare `pip install` uses it if the wheel is present — and everything quietly falls back to plain HTTP without it. UPnP asks your router to open the port, and the settings panel shows whether it worked.
 - **Nearby** (off by default). Flip it on and Zimi devices on your network find each other; a green pill on a catalog card means a neighbor already has that ZIM. Transfers stay on your LAN, never the internet.
 - **Mirror** (off). Lifts the seeding cap, for people who want to run a long-term Kiwix mirror.
 
@@ -119,7 +120,7 @@ services:
       - ./zimi-config:/config
 ```
 
-LAN peer discovery (`_zimi._tcp`) won't reach the LAN in bridge mode — multicast doesn't cross the docker bridge, and Zimi warns in the Nearby settings when it detects this. Use host networking, or set `ip=<your host's LAN address>` in `ZIMI_NEARBY`. BT seeding still works because aria2 binds the mapped port. See [docs/deployment-networking.md](docs/deployment-networking.md) for the full discussion.
+LAN peer discovery (`_zimi._tcp`) won't reach the LAN in bridge mode — multicast doesn't cross the docker bridge, and Zimi warns in the Nearby settings when it detects this. Use host networking, or set `ip=<your host's LAN address>` in `ZIMI_NEARBY`. BT seeding still works because libtorrent binds the mapped port. See [docs/deployment-networking.md](docs/deployment-networking.md) for the full discussion.
 </details>
 
 ### Python
@@ -162,6 +163,7 @@ Most people set nothing: every setting below has a sensible default or lives in 
 |----------|-------------|
 | `GET /search?q=...&limit=5&zim=...&fast=1&lang=...` | Full-text search. `fast=1` for title matches only. `lang` filters by language. |
 | `GET /read?zim=...&path=...&max_length=8000` | Read article as plain text |
+| `GET /chunks?zim=...&path=...&size=1200&overlap=120` | Deterministic, embedding-free article chunking for RAG clients |
 | `GET /suggest?q=...&limit=10&zim=...` | Title autocomplete |
 | `GET /list` | List all sources with metadata |
 | `GET /article-languages?zim=...&path=...` | All languages an article is available in |
@@ -175,6 +177,7 @@ Most people set nothing: every setting below has a sensible default or lives in 
 | `POST /resolve` | Batch resolve: `{"urls": [...]}` |
 | `GET /health` | Health check with version |
 | `GET /w/<zim>/<path>` | Serve raw ZIM content |
+| `GET /openapi.json` | OpenAPI 3.1 description of the stable read API |
 
 ### Examples
 
@@ -221,12 +224,30 @@ For Docker on a remote host:
 }
 ```
 
-Tools: `search` (with `lang` filter), `read`, `suggest`, `list_sources`, `random`, `article_languages`, `read_with_links`, `deep_search`, `list_collections`, `manage_collection`, `manage_favorites`
+Tools: `search` (with `lang` filter), `read`, `get_chunks`, `suggest`, `list_sources`, `random`, `article_languages`, `read_with_links`, `deep_search`, `list_collections`, `manage_collection`, `manage_favorites`
 
 ## Integrations
 
 - **[SearXNG](docs/integrations/searxng.md)** — route queries through Zimi from a self-hosted SearXNG metasearch instance.
 - **[OpenWebUI / generic AI](docs/integrations/openwebui.md)** — wire the MCP server into any AI client for offline research.
+
+## Long-requested, shipped here
+
+Every issue filed against Zimi has been answered — #33 country holiday colors,
+#34 new-ZIM badges and recency filters, #36 Tailscale-friendly management,
+#37 library organization, #38 fragment links and stray-torrent confusion.
+And features the wider ZIM ecosystem has been asking for, available today:
+
+- **Spelling suggestions** — "did you mean?" on weak searches, fully offline ([libzim #731](https://github.com/openzim/libzim/issues/731))
+- **Read-aloud** — text-to-speech in the reader via the offline Web Speech API ([kiwix-js #166](https://github.com/kiwix/kiwix-js/issues/166))
+- **Reader View** — a clean, adjustable reading mode (themes, fonts, text size) for any article
+- **Word lookup** — tap a word in any article, get the dictionary entry from your own library
+- **Resumable downloads** — an interrupted ZIM download picks up where it left off, and updates reuse the unchanged pieces of the old file instead of re-downloading everything
+- **User accounts** — named logins with per-ZIM access lists, so one server can serve the whole house (or classroom)
+- **A native Windows app** — with the same auto-update channel as macOS
+- **Give back** — seed your downloads to the Kiwix swarm at a ratio you choose, or flip one switch and be a full mirror
+- **Grab the file** — a download button for any ZIM you're sharing on your network
+- **Real article counts** — articles, not raw entry counts, on library cards
 
 ## Contributing
 
@@ -234,7 +255,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
-[MIT](LICENSE). Desktop builds bundle [aria2](https://aria2.github.io/) (GPLv2) as a separate sidecar — see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+[MIT](LICENSE). Desktop and Docker builds bundle [libtorrent-rasterbar](https://libtorrent.org/) (BSD-3-Clause) for BitTorrent transfers — see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ---
 
