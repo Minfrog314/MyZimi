@@ -87,7 +87,7 @@ except ImportError:
 # SSL context using certifi CA bundle (PyInstaller bundles lack system certs)
 SSL_CTX = ssl.create_default_context(cafile=certifi.where())
 
-ZIMI_VERSION = "1.8.0"
+ZIMI_VERSION = "1.8.1"
 
 # Standing maintenance cadence: catalog TTL is 24h and UPnP leases are
 # 24h — run every 12h so both stay fresh at half-life.
@@ -172,6 +172,9 @@ def start_background_services(http_port):
             from zimi import library as _lib
 
             _lib.resume_pending_downloads()
+            # Watcher that releases night-window-scheduled downloads when the
+            # window opens (no-op unless the user enabled download scheduling).
+            _lib.start_download_scheduler()
             # Mirror mode seeds the whole installed library; either way,
             # drop seeds whose file an update has replaced, and bring
             # session-resumed seeds under the CURRENT settings (a seed
@@ -453,6 +456,11 @@ MAX_SERVE_BYTES = (
     50 * 1024 * 1024
 )  # 50 MB — refuse to serve entries larger than this (prevents OOM)
 MAX_POST_BODY = 65536  # max bytes accepted in POST requests (64KB — handles ~500 URLs for batch resolve)
+# Backup bundles and per-user data blobs (bookmarks/history/preferences) are the
+# one class of POST that legitimately runs large — a full-server backup carries
+# users, history and every per-user blob. They get their own ceiling so the tight
+# 64 KB cap keeps guarding every other endpoint.
+MAX_BACKUP_BODY = 8 * 1024 * 1024  # 8 MB — backup import + /userdata save
 _BYTES_PER_GB = 1024**3
 
 
@@ -653,6 +661,14 @@ def _load_history():
     return []
 
 
+def _save_history(entries):
+    """Replace the persistent event history with ``entries`` (capped, newest
+    first). Used by the full-server backup restore. Thread-safe."""
+    with _history_lock:
+        clean = [e for e in entries if isinstance(e, dict)][:_HISTORY_MAX]
+    _atomic_write_json(_history_file_path(), clean)
+
+
 def _append_history(event):
     """Append an event dict to persistent history. Thread-safe."""
     with _history_lock:
@@ -698,18 +714,25 @@ def _save_collections(data):
 # ── Library layout: per-ZIM category overrides + home section order (#37) ──
 #
 # Storage: ZIMI_DATA_DIR/library_layout.json —
-#   {"overrides": {"<zim name>": "<category>"}, "section_order": ["cat:<key>"|"col:<name>", ...]}
+#   {"overrides": {"<zim name>": "<category>"},
+#    "section_order": ["cat:<key>"|"col:<name>"|"other", ...],
+#    "sections": ["<category name>", ...]}
 # Overrides win over the _categorize_zim heuristic; section_order drives the
-# home page ordering (unlisted sections append in default order). Reads are
-# public (ride /list); writes are auth-gated /manage endpoints.
+# home page ordering (unlisted sections append in default order); `sections`
+# holds user-declared empty categories that should be offered as Move-to targets
+# and reorder rows before any ZIM lives in them. Reads are public (ride /list);
+# writes are auth-gated /manage endpoints.
 _library_layout_lock = threading.Lock()
 
 #: Section-order keys are namespaced so categories and collections can share one
 #: ordered list without colliding (a collection named "Books" != category Books).
-_SECTION_KEY_RE = re.compile(r"^(cat:|col:).+")
+#: The bare `other` key is the reserved slot for the uncategorized catch-all, so
+#: it can be ordered like any real section instead of being pinned last.
+_SECTION_KEY_RE = re.compile(r"^(?:(?:cat:|col:).+|other)$")
 #: Defensive caps so a hostile/buggy client can't write an unbounded file.
 _LAYOUT_MAX_OVERRIDES = 5000
 _LAYOUT_MAX_ORDER = 500
+_LAYOUT_MAX_SECTIONS = 200
 _LAYOUT_STR_MAX = 128
 
 
@@ -721,11 +744,12 @@ def _library_layout_file_path():
 def _load_library_layout():
     """Load library layout from disk. Fail-soft to the empty default.
 
-    A missing or corrupt file must degrade to ``{"overrides": {}, "section_order": []}``
-    rather than 500 /list — the whole home page renders from this, so a bad read
-    can never be allowed to blank the library.
+    A missing or corrupt file must degrade to the empty default
+    (``{"overrides": {}, "section_order": [], "sections": []}``) rather than 500
+    /list — the whole home page renders from this, so a bad read can never be
+    allowed to blank the library.
     """
-    empty = {"overrides": {}, "section_order": []}
+    empty = {"overrides": {}, "section_order": [], "sections": []}
     try:
         with open(_library_layout_file_path(), encoding="utf-8") as f:
             data = json.load(f)
@@ -733,9 +757,11 @@ def _load_library_layout():
             return empty
         overrides = data.get("overrides")
         order = data.get("section_order")
+        sections = data.get("sections")
         return {
             "overrides": overrides if isinstance(overrides, dict) else {},
             "section_order": order if isinstance(order, list) else [],
+            "sections": sections if isinstance(sections, list) else [],
         }
     except FileNotFoundError:
         pass  # fresh install — no layout yet
@@ -1006,7 +1032,12 @@ def open_archive(path):
     return Archive(path)
 
 
-from zimi.previews import strip_html, _extract_preview, _resolve_img_path  # noqa: E402
+from zimi.previews import (  # noqa: E402
+    strip_html,
+    _extract_preview,
+    _resolve_img_path,
+    extract_snippet,
+)
 
 # ============================================================================
 # ZIM Listing & Metadata Cache
@@ -1628,6 +1659,13 @@ def main():
 
     elif args.command == "desktop" or (args.command == "serve" and args.ui):
         try:
+            # The desktop entry-point lives in the repo's desktop/ dir (a sibling
+            # of this package), not on the default import path — add it first.
+            _desktop_dir = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "desktop"
+            )
+            if _desktop_dir not in sys.path:
+                sys.path.insert(0, _desktop_dir)
             from zimi_desktop import main as desktop_main
         except ImportError:
             print(

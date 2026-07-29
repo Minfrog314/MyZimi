@@ -129,6 +129,16 @@ def _set_manage_password(pw, username=None):
     with open(tmp, "w", encoding="utf-8") as f:
         f.write(content)
     os.replace(tmp, pf)
+    # A password rotation must revoke old admin session cookies immediately (the
+    # pre-cookie model, where the Bearer WAS the password, did so implicitly). The
+    # rotating admin's own Bearer still authenticates and /whoami re-mints a fresh
+    # cookie, so this never locks out the person making the change.
+    try:
+        from zimi import users as _users
+
+        _users.drop_admin_sessions()
+    except Exception:
+        pass
     log.info("Manage password %s", "set" if pw else "cleared")
 
 
@@ -222,6 +232,23 @@ def _primary_admin_authorized(handler):
     if not stored_pw:
         # Passwordless: LAN/loopback clients are the (only) primary admin.
         return handler._is_private_client()
+
+    # A primary-admin SESSION token (users.create_admin_session): minted when the
+    # admin password verified, delivered as the HttpOnly zimi_session cookie so
+    # header-less transports carry admin identity — the /w/ reader iframe (a
+    # browser navigation that can't send Authorization) and the plain-fetch data
+    # endpoints (/list, /search, …). Without this, a private/limited-mode admin
+    # loads an EMPTY library and blank article iframes. Checked FIRST (before the
+    # Bearer-format gate below) so a cookie-only request with no Authorization
+    # header still resolves as admin. Accepted from either the cookie (browsers)
+    # or the Bearer header (an API client may present it). As unforgeable as the
+    # password Bearer: a random token, hashed at rest.
+    from zimi import users as _users
+
+    if _users.is_admin_session(_users._cookie_token(handler)):
+        return True
+    if _users.is_admin_session(_users._bearer_token(handler)):
+        return True
 
     auth = handler.headers.get("Authorization", "")
     if not auth.startswith("Bearer "):
@@ -425,6 +452,518 @@ def _cache_info_payload():
 
 
 # ============================================================================
+# Library layout — shared validate/apply (used by /manage/library-layout POST
+# and the backup importer so the two never drift).
+# ============================================================================
+
+
+def _validate_library_layout(overrides, order, sections=None):
+    """Return an error string if `overrides`/`section_order`/`sections` are
+    malformed, else None. Any may be None (that half is simply skipped)."""
+    if overrides is not None:
+        if (
+            not isinstance(overrides, dict)
+            or len(overrides) > _srv._LAYOUT_MAX_OVERRIDES
+        ):
+            return "invalid overrides"
+        for k, v in overrides.items():
+            if (
+                not isinstance(k, str)
+                or not isinstance(v, str)
+                or len(k) > _srv._LAYOUT_STR_MAX
+                or len(v) > _srv._LAYOUT_STR_MAX
+            ):
+                return "invalid overrides"
+    if order is not None:
+        if not isinstance(order, list) or len(order) > _srv._LAYOUT_MAX_ORDER:
+            return "invalid section_order"
+        for s in order:
+            if (
+                not isinstance(s, str)
+                or len(s) > _srv._LAYOUT_STR_MAX
+                or not _srv._SECTION_KEY_RE.match(s)
+            ):
+                return "invalid section_order"
+    if sections is not None:
+        if not isinstance(sections, list) or len(sections) > _srv._LAYOUT_MAX_SECTIONS:
+            return "invalid sections"
+        for s in sections:
+            if not isinstance(s, str) or not s or len(s) > _srv._LAYOUT_STR_MAX:
+                return "invalid sections"
+    return None
+
+
+def _apply_library_layout(overrides, order, sections=None):
+    """Merge-patch the persisted layout. `overrides` merges key-by-key (empty
+    value clears an entry); `section_order` and `sections` fully replace when
+    present. Returns the saved layout. Caller must have validated first."""
+    with _srv._library_layout_lock:
+        layout = _srv._load_library_layout()
+        if overrides is not None:
+            merged = dict(layout.get("overrides", {}))
+            for k, v in overrides.items():
+                if v == "":
+                    merged.pop(k, None)  # empty value = revert to heuristic
+                else:
+                    merged[k] = v
+            layout["overrides"] = merged
+        if order is not None:
+            layout["section_order"] = list(order)
+        if sections is not None:
+            # De-dupe case-insensitively, first spelling wins, so a declared
+            # empty section can't accumulate near-duplicate rows.
+            seen, deduped = set(), []
+            for name in sections:
+                key = name.strip().lower()
+                if key and key not in seen:
+                    seen.add(key)
+                    deduped.append(name)
+            layout["sections"] = deduped
+        _srv._save_library_layout(layout)
+    return layout
+
+
+# ============================================================================
+# Backup bundle — export/import a Zimi setup.
+#
+# SCHEMA (zimi-backup, version 3). Two scopes:
+#   • "device" — everyone's backup: the installed library list, collections/
+#     favorites, and the home layout. The client folds its own per-browser
+#     state (bookmarks/history/preferences) in on top; that never touches the
+#     server. This is the v1 shape plus a `scope` field. (The redesigned SPA
+#     splits this: the "My data" card round-trips the per-browser half through
+#     /userdata for a signed-in user; the "Server backup" card owns everything
+#     below. The device bundle stays for API clients and back-compat.)
+#   • "server" — ADMIN-ONLY. Everything the server owns: the device fields
+#     PLUS users.json (WITH password hashes — it's the admin's own backup),
+#     the anonymous-access policy, the download schedule, the BitTorrent/
+#     sharing prefs, the seed-intent ledger, and (v3) the hot-cache list, the
+#     auto-update config, the server-side event history, and every named
+#     user's server-stored My-data blob (user_data).
+#
+# Import MERGES by default (union by identity, incoming wins on conflict) and
+# is a two-step: a "preview" pass returns a diff summary and applies nothing;
+# only an explicit "apply" writes. An `overwrite` flag replaces wholesale where
+# the caller wants that. Keep `_BACKUP_SCHEMA_VERSION` in lockstep with the
+# client's `_BACKUP_SCHEMA_VERSION`.
+# ============================================================================
+
+_BACKUP_SCHEMA = "zimi-backup"
+_BACKUP_SCHEMA_VERSION = 3
+
+
+def _bundle_scope(data):
+    """The scope a bundle declares. Missing (v1 bundles) → 'device'. Anything
+    other than 'server' is treated as 'device' so server-only keys can never be
+    processed off a device bundle."""
+    return (
+        "server"
+        if (isinstance(data, dict) and data.get("scope") == "server")
+        else "device"
+    )
+
+
+def _build_backup_bundle(scope="device"):
+    """Assemble a backup bundle. ``scope='server'`` adds the admin-only server
+    state on top of the device fields (caller enforces the admin gate)."""
+    library = [
+        {
+            "name": z["name"],
+            "file": z.get("file"),
+            "date": z.get("date", ""),
+            "language": z.get("language", ""),
+            "article_count": z.get("article_count"),
+            "size_bytes": z.get("size_bytes"),
+            "title": z.get("title", z["name"]),
+        }
+        for z in _srv.list_zims()
+    ]
+    bundle = {
+        "schema": _BACKUP_SCHEMA,
+        "schema_version": _BACKUP_SCHEMA_VERSION,
+        "scope": "device",
+        "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "zimi_version": _srv.ZIMI_VERSION,
+        "library": library,
+        "collections": _srv._load_collections(),
+        "library_layout": _srv._load_library_layout(),
+    }
+    if scope == "server":
+        from zimi import library as _lib
+        from zimi import p2p
+        from zimi import users as _users
+
+        sched = _lib._load_download_schedule()
+        mode, allow, _ = _users._load_access()
+        au_enabled, au_freq = _lib._load_auto_update_config()
+        bundle["scope"] = "server"
+        bundle["users"] = _users._load_users()  # WITH hashes — admin's own backup
+        bundle["public_access"] = {"mode": mode, "allowlist": allow}
+        bundle["schedule"] = {
+            "enabled": sched["enabled"],
+            "start": sched["start"],
+            "end": sched["end"],
+            "upload_restrict": sched["upload_restrict"],
+            "upload_trickle_kb": sched["upload_trickle_kb"],
+        }
+        bundle["bt_prefs"] = p2p.all_prefs()
+        bundle["seed_intents"] = _lib.seed_ledger_snapshot()
+        # v3 additions — the rest of what a full restore needs to resurrect an
+        # instance: the hot-cache list, the auto-update config, the server-side
+        # event history, and every named user's server-stored My-data blob.
+        bundle["hot_zims"] = _srv.get_hot_zims()
+        bundle["auto_update"] = {"enabled": au_enabled, "frequency": au_freq}
+        bundle["history"] = _srv._load_history()
+        bundle["user_data"] = _users.all_user_data()
+    return bundle
+
+
+# ── Merge primitives (pure — compute the merged value + counts, persist later) ──
+
+
+def _collection_newer(incoming, current):
+    """Conflict winner for a same-named collection. Honors an optional
+    ``updated`` epoch when both carry one; otherwise incoming wins (it's the
+    backup the admin chose to restore)."""
+    try:
+        inc_t = float(incoming.get("updated"))
+        cur_t = float(current.get("updated"))
+    except (TypeError, ValueError):
+        return True
+    return inc_t >= cur_t
+
+
+def _merge_collections(cur, incoming, overwrite):
+    """Union favorites (dedupe) and named collections (by name, newest-wins).
+    Returns (merged, counts)."""
+    inc_fav = [f for f in incoming.get("favorites", []) if isinstance(f, str)]
+    inc_cols = incoming.get("collections", {})
+    if overwrite:
+        fav = list(dict.fromkeys(inc_fav))[:100]
+        merged = {"version": 1, "favorites": fav, "collections": dict(inc_cols)}
+        counts = {
+            "fav_added": len(fav),
+            "fav_dupes": 0,
+            "col_added": len(inc_cols),
+            "col_replaced": 0,
+        }
+        return merged, counts
+    fav = list(cur.get("favorites", []))
+    dupes = 0
+    for f in inc_fav:
+        if f in fav:
+            dupes += 1
+        else:
+            fav.append(f)
+    cols = dict(cur.get("collections", {}))
+    added = replaced = 0
+    for name, obj in inc_cols.items():
+        if name in cols:
+            if _collection_newer(obj, cols[name]):
+                cols[name] = obj
+            replaced += 1
+        else:
+            cols[name] = obj
+            added += 1
+    merged = {"version": 1, "favorites": fav[:100], "collections": cols}
+    counts = {
+        "fav_added": max(0, len(fav[:100]) - len(cur.get("favorites", []))),
+        "fav_dupes": dupes,
+        "col_added": added,
+        "col_replaced": replaced,
+    }
+    return merged, counts
+
+
+def _merge_layout(cur, incoming, overwrite):
+    """Merge the home layout: overrides union (incoming wins per ZIM), sections
+    union, section_order replaced when present (an ordering — merging is
+    meaningless). Returns (overrides, order, sections, counts)."""
+    inc_over = incoming.get("overrides") or {}
+    inc_order = incoming.get("section_order")
+    inc_sections = incoming.get("sections") or []
+    cur_over = cur.get("overrides") or {}
+    cur_sections = cur.get("sections") or []
+    if overwrite:
+        over = dict(inc_over)
+        order = inc_order if isinstance(inc_order, list) else cur.get("section_order")
+        sections = list(inc_sections)
+        counts = {
+            "over_added": len(inc_over),
+            "over_changed": 0,
+            "order_changed": inc_order is not None,
+            "sections_added": len(inc_sections),
+        }
+        return over, order, sections, counts
+    over = dict(cur_over)
+    added = changed = 0
+    for k, v in inc_over.items():
+        if k in over:
+            if over[k] != v:
+                changed += 1
+                over[k] = v
+        else:
+            over[k] = v
+            added += 1
+    sections = list(cur_sections)
+    sec_added = 0
+    seen = {s.strip().lower() for s in cur_sections if isinstance(s, str)}
+    for s in inc_sections:
+        if isinstance(s, str) and s.strip().lower() not in seen:
+            seen.add(s.strip().lower())
+            sections.append(s)
+            sec_added += 1
+    order = inc_order if isinstance(inc_order, list) else cur.get("section_order")
+    counts = {
+        "over_added": added,
+        "over_changed": changed,
+        "order_changed": isinstance(inc_order, list)
+        and inc_order != cur.get("section_order"),
+        "sections_added": sec_added,
+    }
+    return over, order, sections, counts
+
+
+def _merge_users(cur, incoming, overwrite):
+    """Union users by casefold key; incoming wins on conflict (or replace all
+    when overwrite). Returns (merged, counts)."""
+    from zimi import users as _users
+
+    inc = {
+        _users._key(v.get("name", k)): v
+        for k, v in incoming.items()
+        if isinstance(v, dict)
+    }
+    if overwrite:
+        return inc, {"added": len(inc), "replaced": 0}
+    merged = dict(cur)
+    added = replaced = 0
+    for k, v in inc.items():
+        if k in merged:
+            if merged[k] != v:
+                replaced += 1
+            merged[k] = v
+        else:
+            merged[k] = v
+            added += 1
+    return merged, {"added": added, "replaced": replaced}
+
+
+def _compute_backup(data, overwrite):
+    """Diff an incoming bundle against current server state WITHOUT persisting.
+
+    Returns (plan, preview, error). ``plan`` is a list of (label, thunk) pairs
+    the apply pass runs in order; ``preview`` is the diff summary the client
+    shows before the admin confirms. Server-only keys are considered only for a
+    ``server``-scope bundle, so a device bundle can never carry server changes.
+    """
+    if not isinstance(data, dict):
+        return None, None, "invalid backup"
+    schema = data.get("schema")
+    if schema is not None and schema != _BACKUP_SCHEMA:
+        return None, None, "not a Zimi backup"
+    scope = _bundle_scope(data)
+    plan = []
+    preview = {"scope": scope}
+
+    coll = data.get("collections")
+    if coll is not None:
+        if not isinstance(coll, dict):
+            return None, None, "invalid collections"
+        fav = coll.get("favorites", [])
+        cols = coll.get("collections", {})
+        if not isinstance(fav, list) or not isinstance(cols, dict):
+            return None, None, "invalid collections"
+        merged, counts = _merge_collections(_srv._load_collections(), coll, overwrite)
+        preview["collections"] = counts
+        plan.append(("collections", lambda m=merged: _persist_collections(m)))
+
+    layout = data.get("library_layout")
+    if layout is not None:
+        if not isinstance(layout, dict):
+            return None, None, "invalid library_layout"
+        over, order, sections, counts = _merge_layout(
+            _srv._load_library_layout(), layout, overwrite
+        )
+        err = _validate_library_layout(over, order, sections)
+        if err:
+            return None, None, err
+        preview["layout"] = counts
+        plan.append(
+            (
+                "library_layout",
+                lambda o=over, r=order, s=sections: _apply_library_layout(o, r, s),
+            )
+        )
+
+    lib = data.get("library")
+    if isinstance(lib, list):
+        installed = set(_srv.get_zim_files().keys())
+        preview["missing_zims"] = sum(
+            1 for z in lib if isinstance(z, dict) and z.get("name") not in installed
+        )
+
+    if scope == "server":
+        err = _plan_server_scope(data, overwrite, plan, preview)
+        if err:
+            return None, None, err
+
+    return plan, preview, None
+
+
+def _persist_collections(merged):
+    with _srv._collections_lock:
+        _srv._save_collections(merged)
+
+
+def _plan_server_scope(data, overwrite, plan, preview):
+    """Extend the plan/preview with the admin-only server state. Returns an
+    error string or None."""
+    from zimi import library as _lib
+    from zimi import p2p
+    from zimi import users as _users
+
+    users = data.get("users")
+    if users is not None:
+        if not isinstance(users, dict):
+            return "invalid users"
+        merged, counts = _merge_users(_users._load_users(), users, overwrite)
+        preview["users"] = counts
+        plan.append(("users", lambda m=merged: _users._save_users(m)))
+
+    settings_changed = []
+
+    pa = data.get("public_access")
+    if isinstance(pa, dict):
+        mode = pa.get("mode")
+        allow = pa.get("allowlist", [])
+        cur_mode, cur_allow, _ = _users._load_access()
+        if mode != cur_mode or allow != cur_allow:
+            settings_changed.append("public_access")
+        plan.append(
+            ("public_access", lambda m=mode, a=allow: _users.set_public_access(m, a))
+        )
+
+    sched = data.get("schedule")
+    if isinstance(sched, dict):
+        cur = _lib._load_download_schedule()
+        keys = ("enabled", "start", "end", "upload_restrict", "upload_trickle_kb")
+        if any(sched.get(k) != cur.get(k) for k in keys if k in sched):
+            settings_changed.append("download_schedule")
+        plan.append(("schedule", lambda s=sched: _restore_schedule(s)))
+
+    bt = data.get("bt_prefs")
+    if isinstance(bt, dict):
+        if bt != p2p.all_prefs():
+            settings_changed.append("sharing_prefs")
+        plan.append(("bt_prefs", lambda b=bt: _restore_bt_prefs(b, overwrite)))
+
+    intents = data.get("seed_intents")
+    if isinstance(intents, dict):
+        cur = _lib.seed_ledger_snapshot()
+        preview["seed_intents"] = {
+            "added": sum(1 for k, v in intents.items() if cur.get(k) != v)
+        }
+        plan.append(
+            ("seed_intents", lambda i=intents: _lib.restore_seed_intents(i, overwrite))
+        )
+
+    # v3 server state — hot list, auto-update, history, per-user data.
+    hot = data.get("hot_zims")
+    if isinstance(hot, list):
+        # Env-locked hot list (ZIMI_HOT_ZIMS) is authoritative — never clobber it.
+        if "ZIMI_HOT_ZIMS" not in os.environ:
+            if hot != _srv.get_hot_zims():
+                settings_changed.append("hot_zims")
+            plan.append(
+                (
+                    "hot_zims",
+                    lambda h=[s for s in hot if isinstance(s, str)]: _srv.set_hot_zims(
+                        h
+                    ),
+                )
+            )
+
+    au = data.get("auto_update")
+    if isinstance(au, dict) and "enabled" in au and "frequency" in au:
+        # Env-locked auto-update (ZIMI_AUTO_UPDATE) wins — skip the restore.
+        if not getattr(_srv, "_auto_update_env_locked", False):
+            cur_en, cur_fr = _lib._load_auto_update_config()
+            if bool(au["enabled"]) != cur_en or au["frequency"] != cur_fr:
+                settings_changed.append("auto_update")
+            plan.append(("auto_update", lambda a=au: _restore_auto_update(a)))
+
+    history = data.get("history")
+    if isinstance(history, list):
+        preview["history"] = {"events": len(history)}
+        plan.append(("history", lambda h=history: _restore_history(h, overwrite)))
+
+    ud = data.get("user_data")
+    if isinstance(ud, dict):
+        preview["user_data"] = {"users": len(ud)}
+        plan.append(("user_data", lambda u=ud: _users.restore_user_data(u, overwrite)))
+
+    if settings_changed:
+        preview["settings"] = settings_changed
+    return None
+
+
+def _restore_auto_update(au):
+    from zimi import library as _lib
+
+    enabled, freq = bool(au.get("enabled")), au.get("frequency", "weekly")
+    _lib._save_auto_update_config(enabled, freq)
+    # Reflect into the live server namespace so /manage/status reads true without
+    # a restart (the loop reads these via _srv — see library._auto_update_loop).
+    _srv._auto_update_enabled = enabled
+    _srv._auto_update_freq = freq
+
+
+def _restore_history(entries, overwrite):
+    """Restore server-side event history. Replace when overwrite; otherwise fill
+    only when the current log is empty (a resurrected instance) so a normal merge
+    into a running server never duplicates or reorders its real event stream."""
+    if overwrite or not _srv._load_history():
+        _srv._save_history(entries)
+
+
+def _restore_schedule(sched):
+    from zimi import library as _lib
+
+    cur = _lib._load_download_schedule()
+    _lib._save_download_schedule(
+        sched.get("enabled", cur["enabled"]),
+        sched.get("start", cur["start"]),
+        sched.get("end", cur["end"]),
+        sched.get("upload_restrict", cur["upload_restrict"]),
+        sched.get("upload_trickle_kb", cur["upload_trickle_kb"]),
+    )
+
+
+def _restore_bt_prefs(bt, overwrite):
+    from zimi import p2p
+
+    p2p.replace_prefs(bt, overwrite=overwrite)
+    p2p.apply_rate_limits()
+
+
+def _apply_backup_bundle(data, overwrite=False):
+    """Apply a backup bundle (MERGE by default). Returns (result, error).
+
+    Prefer the two-step route contract (preview then apply); this runs the whole
+    plan in one shot for direct callers/tests. ``result`` carries the applied
+    keys plus the preview summary."""
+    plan, preview, err = _compute_backup(data, overwrite)
+    if err:
+        return None, err
+    applied = []
+    for label, thunk in plan:
+        thunk()
+        applied.append(label)
+    return {"status": "ok", "applied": applied, "preview": preview}, None
+
+
+# ============================================================================
 # Manage GET Routes
 # ============================================================================
 
@@ -529,10 +1068,27 @@ def handle_manage_get(handler, parsed, params):
     elif parsed.path == "/manage/usage":
         return handler._json(200, _srv._get_usage_stats())
 
+    elif parsed.path == "/manage/download-schedule":
+        from zimi import library as _lib
+
+        return handler._json(200, _lib._download_schedule_status())
+
+    elif parsed.path == "/manage/backup":
+        # scope=device (default, everyone) or scope=server (admin-only: the full
+        # server state incl. users.json with hashes). The manage gate above is
+        # already admin-only, but the explicit check keeps the server-scope
+        # contract self-evident and independently testable.
+        scope = param("scope", "device")
+        if scope == "server" and admin_kind(handler) is None:
+            return handler._json(403, {"error": "full-server backup requires an admin"})
+        return handler._json(200, _build_backup_bundle(scope=scope))
+
     elif parsed.path == "/manage/users":
         # Named user accounts (multi-user v1) — admin-only (gated above). Returns
-        # the roster (no password hashes) plus the installed ZIM names so the
-        # admin UI can build the per-user allowlist multi-select.
+        # the roster (no password hashes), the installed ZIM names (legacy field),
+        # the richer picker options (title + language + count) the redesigned
+        # allowlist picker needs, and the public-access policy so the whole Users
+        # panel renders from a single fetch.
         from zimi import users as _users
 
         return handler._json(
@@ -540,6 +1096,11 @@ def handle_manage_get(handler, parsed, params):
             {
                 "users": _users.list_users(),
                 "zims": sorted(_srv.get_zim_files().keys()),
+                # Rich per-ZIM options for the allowlist picker (used by both the
+                # per-user Limited picker and the public-access Limited picker).
+                "zim_options": _zim_picker_options(),
+                # Anonymous-access policy (Open / Limited / Sign-in required).
+                "public_access": _users.public_access_status(),
                 # The PRIMARY admin (password-file account) is not stored in
                 # users.json — surface it as a synthetic, non-deletable row so
                 # the UI can show "the admin" alongside the named users.
@@ -551,6 +1112,19 @@ def handle_manage_get(handler, parsed, params):
                 # Which kind of admin is viewing — the client hides admin-only
                 # controls (creating/managing other admins) for secondaries.
                 "self_kind": admin_kind(handler),
+            },
+        )
+
+    elif parsed.path == "/manage/public-access":
+        # Anonymous-access policy on its own, with the picker options — a
+        # lightweight refetch target after the admin changes it.
+        from zimi import users as _users
+
+        return handler._json(
+            200,
+            {
+                "public_access": _users.public_access_status(),
+                "zim_options": _zim_picker_options(),
             },
         )
 
@@ -908,10 +1482,24 @@ def handle_manage_get(handler, parsed, params):
         if not enabled:
             hint = "BT downloads disabled (ZIMI_BT=off). HTTP is used instead."
         elif status == "unavailable":
+            import sys as _sys
+
+            # Give the exact next step. Wheels exist for CPython 3.9–3.13; on
+            # 3.14+ there's no wheel yet, so name that specifically instead of
+            # sending the user to a pip command that will fail.
+            if _sys.version_info >= (3, 14):
+                fix = (
+                    f"no libtorrent wheel exists for Python "
+                    f"{_sys.version_info.major}.{_sys.version_info.minor} yet — "
+                    "run Zimi on Python 3.13 or older (or use the Docker image) "
+                    "to torrent."
+                )
+            else:
+                fix = "run `pip install libtorrent` (or `pip install zimi[bt]`) to torrent."
             hint = (
-                "libtorrent isn't importable on this install — downloads "
-                "fall back to HTTP. Install libtorrent to torrent and share "
-                "load with the Kiwix mirrors."
+                "libtorrent isn't importable on this install — downloads fall "
+                "back to HTTP, which works fine. To share load with the Kiwix "
+                "mirrors, " + fix
             )
 
         from zimi import p2p_nat
@@ -939,6 +1527,51 @@ def handle_manage_get(handler, parsed, params):
 
     else:
         return handler._json(404, {"error": "not found"})
+
+
+def _zim_picker_options():
+    """``[{name, title, language, article_count}]`` for the allowlist pickers,
+    sorted by title. Admin view = all installed ZIMs. Titles/languages come from
+    the startup metadata cache; a ZIM not yet in that cache still appears (by
+    name) so it is always selectable."""
+    opts = []
+    seen = set()
+    for z in _srv._zim_list_cache or []:
+        name = z.get("name")
+        if not name:
+            continue
+        seen.add(name)
+        opts.append(
+            {
+                "name": name,
+                "title": z.get("title") or name,
+                "language": z.get("language", ""),
+                "article_count": z.get("article_count"),
+            }
+        )
+    for name in sorted(_srv.get_zim_files().keys()):
+        if name not in seen:
+            opts.append(
+                {"name": name, "title": name, "language": "", "article_count": None}
+            )
+    opts.sort(key=lambda o: (o["title"] or "").casefold())
+    return opts
+
+
+def _handle_public_access_post(handler, data):
+    """Admin-only: set the anonymous-access policy. ``mode`` ∈ {open, limited,
+    private}; ``allowlist`` applies only to ``limited``. Echoes the fresh status
+    so the UI re-renders in one round trip. Auth already passed (gated in
+    ``handle_manage_post``)."""
+    from zimi import users as _users
+
+    mode = data.get("mode", "")
+    ok, err = _users.set_public_access(mode, data.get("allowlist"))
+    if not ok:
+        return handler._json(400, {"error": err or "operation failed"})
+    return handler._json(
+        200, {"status": "ok", "public_access": _users.public_access_status()}
+    )
 
 
 def _handle_users_post(handler, data):
@@ -1066,6 +1699,9 @@ def handle_manage_post(handler, parsed, data):
     if parsed.path == "/manage/users":
         return _handle_users_post(handler, data)
 
+    if parsed.path == "/manage/public-access":
+        return _handle_public_access_post(handler, data)
+
     if parsed.path == "/manage/download":
         url = data.get("url", "")
         size_bytes = data.get("size_bytes")
@@ -1134,6 +1770,17 @@ def handle_manage_post(handler, parsed, data):
             return handler._json(404, {"error": "Download not found"})
         if status == "already_done":
             return handler._json(400, {"error": "Download already finished"})
+        return handler._json(code, {"status": status, "id": dl_id})
+
+    elif parsed.path == "/manage/download-start-now":
+        # Override the nightly window for one scheduled item — start it now
+        # (or promote it to a normal queued item if every slot is busy).
+        dl_id = data.get("id", "")
+        from zimi.library import _start_scheduled_now
+
+        status, code = _start_scheduled_now(dl_id)
+        if status == "not_found":
+            return handler._json(404, {"error": "Download not found"})
         return handler._json(code, {"status": status, "id": dl_id})
 
     elif parsed.path == "/manage/switch-direct":
@@ -1386,6 +2033,82 @@ def handle_manage_post(handler, parsed, data):
             200,
             {"enabled": _srv._auto_update_enabled, "frequency": _srv._auto_update_freq},
         )
+
+    elif parsed.path == "/manage/download-schedule":
+        # Night-window queueing + the global download-speed cap. Same env-lock
+        # contract as the other settings endpoints: ZIMI_DL_WINDOW locks the
+        # window, ZIMI_BT_DOWN_KB (via bt_down_kb) locks the speed cap.
+        from zimi import library as _lib
+        from zimi import p2p
+
+        sched = _lib._load_download_schedule()
+        # Window fields + the upload restrictor (restrict seeding to the window
+        # + its trickle cap). All ride the same config file, so one save covers
+        # any subset the client sent; absent fields are preserved.
+        window_keys = (
+            "enabled",
+            "start",
+            "end",
+            "upload_restrict",
+            "upload_trickle_kb",
+        )
+        if any(k in data for k in window_keys):
+            if sched.get("locked"):
+                return handler._json(
+                    403,
+                    {
+                        "error": "Download window is controlled by the ZIMI_DL_WINDOW env var"
+                    },
+                )
+            enabled = bool(data.get("enabled", sched["enabled"]))
+            start = data.get("start", sched["start"])
+            end = data.get("end", sched["end"])
+            if _lib._parse_hhmm(start) is None or _lib._parse_hhmm(end) is None:
+                return handler._json(
+                    400, {"error": "start/end must be 'HH:MM' (24-hour)"}
+                )
+            upload_restrict = (
+                bool(data["upload_restrict"])
+                if "upload_restrict" in data
+                else sched["upload_restrict"]
+            )
+            upload_trickle_kb = sched["upload_trickle_kb"]
+            if "upload_trickle_kb" in data:
+                try:
+                    upload_trickle_kb = max(1, int(data["upload_trickle_kb"]))
+                except (ValueError, TypeError):
+                    return handler._json(
+                        400, {"error": "upload_trickle_kb must be a number"}
+                    )
+            if not _lib._save_download_schedule(
+                enabled, start, end, upload_restrict, upload_trickle_kb
+            ):
+                return handler._json(
+                    500, {"error": "could not save setting (config dir not writable)"}
+                )
+            # Whether the window just opened or scheduling was turned off,
+            # release anything already waiting now — don't wait for a tick.
+            threading.Thread(target=_lib._download_schedule_tick, daemon=True).start()
+        # Global download-speed cap (KB/s, 0 = unlimited) — shared with the BT
+        # download limit so one number governs every transport.
+        if "download_kb" in data:
+            if p2p.is_bt_down_env_locked():
+                return handler._json(
+                    403,
+                    {
+                        "error": "Download speed limit is controlled by the ZIMI_BT env var"
+                    },
+                )
+            try:
+                kb = max(0, int(data["download_kb"]))
+            except (ValueError, TypeError):
+                return handler._json(400, {"error": "download_kb must be a number"})
+            if not p2p.set_pref("bt_down_kb", kb):
+                return handler._json(
+                    500, {"error": "could not save setting (config dir not writable)"}
+                )
+            p2p.apply_rate_limits()
+        return handler._json(200, _lib._download_schedule_status())
 
     elif parsed.path == "/manage/seeding-action":
         # Pause / resume / stop one seed, or stop everything — the
@@ -1652,6 +2375,48 @@ def handle_manage_post(handler, parsed, data):
                 changed[_field] = kb
         if any(k in changed for k in ("bt_up_kb", "bt_down_kb")):
             p2p.apply_rate_limits()
+        # Max concurrent downloads (governs HTTP + BT via library.py's queue).
+        if "max_active_downloads" in data:
+            if p2p.is_max_active_downloads_env_locked():
+                return handler._json(
+                    403,
+                    {"error": "Max concurrent downloads is controlled by an env var"},
+                )
+            try:
+                n = max(1, min(20, int(data["max_active_downloads"])))
+            except (ValueError, TypeError):
+                return handler._json(
+                    400, {"error": "max_active_downloads must be a number"}
+                )
+            if not p2p.set_pref("max_active_downloads", n):
+                return handler._json(
+                    500, {"error": "could not save setting (config dir not writable)"}
+                )
+            changed["max_active_downloads"] = n
+            # Raising the cap frees slots that nothing else would drain until a
+            # download finishes — promote queued items now.
+            from zimi import library as _lib_cc
+
+            threading.Thread(target=_lib_cc.drain_download_queue, daemon=True).start()
+        # Max connections — a real libtorrent session setting, applied live.
+        if "bt_max_connections" in data:
+            if p2p.is_bt_max_connections_env_locked():
+                return handler._json(
+                    403,
+                    {"error": "Max connections is controlled by the ZIMI_BT env var"},
+                )
+            try:
+                n = max(10, min(2000, int(data["bt_max_connections"])))
+            except (ValueError, TypeError):
+                return handler._json(
+                    400, {"error": "bt_max_connections must be a number"}
+                )
+            if not p2p.set_pref("bt_max_connections", n):
+                return handler._json(
+                    500, {"error": "could not save setting (config dir not writable)"}
+                )
+            changed["bt_max_connections"] = n
+            p2p.apply_session_limits()
         if not changed:
             return handler._json(
                 400,
@@ -1692,53 +2457,43 @@ def handle_manage_post(handler, parsed, data):
         # may be omitted so "Move to…" and "Reorder" send minimal payloads.
         overrides = data.get("overrides")
         order = data.get("section_order")
-        if overrides is None and order is None:
+        sections = data.get("sections")
+        if overrides is None and order is None and sections is None:
             return handler._json(400, {"error": "nothing to update"})
-        if overrides is not None:
-            if (
-                not isinstance(overrides, dict)
-                or len(overrides) > _srv._LAYOUT_MAX_OVERRIDES
-            ):
-                return handler._json(400, {"error": "invalid overrides"})
-            for k, v in overrides.items():
-                if (
-                    not isinstance(k, str)
-                    or not isinstance(v, str)
-                    or len(k) > _srv._LAYOUT_STR_MAX
-                    or len(v) > _srv._LAYOUT_STR_MAX
-                ):
-                    return handler._json(400, {"error": "invalid overrides"})
-        if order is not None:
-            if not isinstance(order, list) or len(order) > _srv._LAYOUT_MAX_ORDER:
-                return handler._json(400, {"error": "invalid section_order"})
-            for s in order:
-                if (
-                    not isinstance(s, str)
-                    or len(s) > _srv._LAYOUT_STR_MAX
-                    or not _srv._SECTION_KEY_RE.match(s)
-                ):
-                    return handler._json(400, {"error": "invalid section_order"})
-        with _srv._library_layout_lock:
-            layout = _srv._load_library_layout()
-            if overrides is not None:
-                merged = dict(layout.get("overrides", {}))
-                for k, v in overrides.items():
-                    if v == "":
-                        merged.pop(k, None)  # empty value = revert to heuristic
-                    else:
-                        merged[k] = v
-                layout["overrides"] = merged
-            if order is not None:
-                layout["section_order"] = list(order)
-            _srv._save_library_layout(layout)
+        err = _validate_library_layout(overrides, order, sections)
+        if err:
+            return handler._json(400, {"error": err})
+        layout = _apply_library_layout(overrides, order, sections)
         return handler._json(
             200,
             {
                 "status": "ok",
                 "overrides": layout.get("overrides", {}),
                 "section_order": layout.get("section_order", []),
+                "sections": layout.get("sections", []),
             },
         )
+
+    elif parsed.path == "/manage/backup":
+        # Restore a backup bundle. Two-step so nothing lands before the admin
+        # confirms: action="preview" (default) returns a diff summary and
+        # applies NOTHING; action="apply" writes. MERGE by default; overwrite
+        # replaces wholesale. A server-scope bundle is admin-only in BOTH
+        # directions — a non-admin session can't preview OR apply one.
+        if _bundle_scope(data) == "server" and admin_kind(handler) is None:
+            return handler._json(403, {"error": "full-server backup requires an admin"})
+        action = data.get("action", "preview")
+        overwrite = bool(data.get("overwrite"))
+        if action == "apply":
+            result, err = _apply_backup_bundle(data, overwrite=overwrite)
+            if err:
+                return handler._json(400, {"error": err})
+            return handler._json(200, result)
+        # Preview (default): compute the diff, persist nothing.
+        _plan, preview, err = _compute_backup(data, overwrite)
+        if err:
+            return handler._json(400, {"error": err})
+        return handler._json(200, {"status": "preview", "preview": preview})
 
     else:
         return handler._json(404, {"error": "not found"})

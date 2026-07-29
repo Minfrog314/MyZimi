@@ -63,7 +63,20 @@
    keeps the cursor on it and hover repaints the amber border grey. */
 .alm-tz-city-card.alm-tz-city-active,
 .alm-tz-city-card.alm-tz-city-active:hover { border: 2px solid var(--amber); background: var(--amber-glow); box-shadow: 0 0 10px var(--amber-glow); padding: 5px 3px; }
-.alm-cal-region { text-align: center; font-size: 11px; color: var(--text3); margin-top: 8px; }
+/* Holiday scope pill — centered directly under the calendar grid it filters.
+   A recessed segmented pill (Regional/Worldwide) sets the scope explicitly,
+   amber-filled when active — same control language as the app-theme picker
+   (app.css .app-theme-seg) so the two families read as one system. The
+   location affordance lives on the sun-map, so there is no caption. */
+.alm-hol-row { display: flex; justify-content: center; align-items: center; margin-top: 14px; }
+.alm-scope-seg { display: flex; gap: 3px; padding: 3px; border-radius: 999px; background: var(--surface2); border: 1px solid var(--border); }
+.alm-scope-btn {
+  border: none; border-radius: 999px; padding: 3px 12px; font: inherit; font-size: 11px;
+  background: none; color: var(--text3); cursor: pointer; line-height: 1.4;
+  transition: color 0.15s, background 0.15s;
+}
+.alm-scope-btn:hover { color: var(--amber); }
+.alm-scope-btn.active { background: var(--amber); color: #000; font-weight: 600; }
 .alm-tz-city-active .alm-tz-city-name { color: var(--amber); font-weight: 600; }
 .alm-tz-city-active .alm-tz-city-time { color: var(--amber); }
 .almanac-hero { display: flex; flex-direction: column; align-items: center; margin-bottom: 32px; position: relative; }

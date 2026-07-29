@@ -254,25 +254,374 @@ _active_downloads = (
 _download_counter = 0
 _download_lock = threading.Lock()
 
-# Concurrent-download cap. Default 3; overridable via ZIMI_MAX_CONCURRENT_DOWNLOADS.
-# Items beyond the cap are queued in _download_queue, smallest-first.
-_MAX_CONCURRENT_DEFAULT = 3
+# Concurrent-download cap authority lives in p2p (get_max_active_downloads);
+# _max_concurrent() below delegates. Items beyond the cap queue in
+# _download_queue, smallest-first.
 _download_queue = []  # [dl, ...] sorted: known sizes ascending, unknown sizes last
 
 
-def _max_concurrent():
-    """Concurrent-download cap, read from env each call so tests can flip it.
+# ----------------------------------------------------------------------------
+# Global download-speed throttle
+# ----------------------------------------------------------------------------
+# The BT session enforces its own download_rate_limit; HTTP downloads share
+# the same global cap (p2p.get_download_limit_kb) via a token bucket held
+# across every download thread — so N concurrent HTTP pulls sum to the cap,
+# not N × the cap. 0 = unlimited.
+class _DownloadThrottle:
+    """Shared byte-rate limiter across all HTTP download threads.
 
-    Invalid values (non-integer, negative, zero) clamp to safe defaults.
+    ``consume`` accounts ``nbytes`` against a token bucket refilled at
+    ``rate_bps`` bytes/sec and returns how long the caller should sleep to
+    stay under the rate. Pure arithmetic (clock injectable) so the pacing
+    math is unit-testable without real sleeps. ``rate_bps <= 0`` disables it.
     """
-    raw = os.environ.get("ZIMI_MAX_CONCURRENT_DOWNLOADS")
-    if raw is None:
-        return _MAX_CONCURRENT_DEFAULT
+
+    def __init__(self, clock=time.monotonic):
+        self._lock = threading.Lock()
+        self._clock = clock
+        self._tokens = 0.0
+        self._last = None
+
+    def reset(self):
+        with self._lock:
+            self._tokens = 0.0
+            self._last = None
+
+    def consume(self, nbytes, rate_bps):
+        if rate_bps <= 0:
+            return 0.0
+        with self._lock:
+            now = self._clock()
+            if self._last is None:
+                # Start with a full one-second burst so a fresh (or reset)
+                # bucket doesn't stall the very first chunk.
+                self._last = now
+                self._tokens = rate_bps
+            # Refill, capping the burst allowance at one second's worth so a
+            # long idle can't bank unlimited credit.
+            self._tokens += (now - self._last) * rate_bps
+            self._last = now
+            if self._tokens > rate_bps:
+                self._tokens = rate_bps
+            self._tokens -= nbytes
+            if self._tokens >= 0:
+                return 0.0
+            return -self._tokens / rate_bps
+
+
+_download_throttle = _DownloadThrottle()
+
+# The download cap lives in a prefs file; re-reading it per 64 KB chunk is
+# needless I/O. Cache it briefly so a live change still lands within ~2s.
+_rate_cache = {"ts": 0.0, "bps": 0}
+_RATE_CACHE_TTL = 2.0
+
+
+def _download_rate_bps():
+    """Current global download cap in bytes/sec (0 = unlimited), cached ~2s."""
+    now = time.monotonic()
+    if now - _rate_cache["ts"] > _RATE_CACHE_TTL:
+        try:
+            from zimi import p2p as _p2p
+
+            _rate_cache["bps"] = max(0, _p2p.get_download_limit_kb()) * 1024
+        except Exception:
+            _rate_cache["bps"] = 0
+        _rate_cache["ts"] = now
+    return _rate_cache["bps"]
+
+
+# ----------------------------------------------------------------------------
+# Scheduled downloads — optional night-window queueing
+# ----------------------------------------------------------------------------
+# When enabled, downloads started OUTSIDE the configured local-time window are
+# held in the queue with a "scheduled" marker instead of starting immediately;
+# a background watcher promotes them once the window opens. Disabled by default
+# (new downloads start right away — the pre-existing behavior). Times are
+# minutes-since-local-midnight; a window may span midnight (start > end).
+_DOWNLOAD_SCHEDULE_CONFIG = os.path.join(_srv.ZIMI_DATA_DIR, "download_schedule.json")
+_DEFAULT_WINDOW_START = "01:00"
+_DEFAULT_WINDOW_END = "07:00"
+# Trickle cap (KB/s) applied to seeding when uploads are restricted to the
+# window and we're outside it. A low positive floor, not 0 — 0 means
+# "unlimited" everywhere else in the rate plumbing, which would be the opposite
+# of a trickle.
+_DEFAULT_UPLOAD_TRICKLE_KB = 50
+_schedule_watcher_thread = None
+# Last (restrict, in_window) tuple pushed to the BT session by the upload
+# restrictor, so a 60s tick only touches libtorrent on an actual transition.
+_upload_window_applied = None
+
+
+def _parse_hhmm(s):
+    """'HH:MM' -> minutes since midnight, or None if malformed."""
+    m = re.match(r"^([01]?\d|2[0-3]):([0-5]\d)$", str(s or "").strip())
+    if not m:
+        return None
+    return int(m.group(1)) * 60 + int(m.group(2))
+
+
+def _fmt_hhmm(minutes):
+    """Minutes since midnight -> 'HH:MM'."""
+    minutes = int(minutes) % 1440
+    return f"{minutes // 60:02d}:{minutes % 60:02d}"
+
+
+def _in_window(now_min, start_min, end_min):
+    """True if now_min falls inside [start, end). Equal bounds = always open
+    (a degenerate 24h window). Spans midnight when start > end."""
+    if start_min == end_min:
+        return True
+    if start_min < end_min:
+        return start_min <= now_min < end_min
+    return now_min >= start_min or now_min < end_min
+
+
+def _load_download_schedule():
+    """Return {'enabled', 'start', 'end'} for the download window.
+
+    ZIMI_DL_WINDOW='HH:MM-HH:MM' locks the window and forces scheduling on;
+    otherwise the persisted config (default: disabled, 01:00-07:00)."""
+    env_win = os.environ.get("ZIMI_DL_WINDOW", "").strip()
+    if env_win and "-" in env_win:
+        a, b = env_win.split("-", 1)
+        if _parse_hhmm(a) is not None and _parse_hhmm(b) is not None:
+            return {
+                "enabled": True,
+                "start": a.strip(),
+                "end": b.strip(),
+                "locked": True,
+                "upload_restrict": False,
+                "upload_trickle_kb": _DEFAULT_UPLOAD_TRICKLE_KB,
+            }
+    cfg_path = getattr(_srv, "_DOWNLOAD_SCHEDULE_CONFIG", _DOWNLOAD_SCHEDULE_CONFIG)
     try:
-        n = int(raw)
+        with open(cfg_path, encoding="utf-8") as f:
+            cfg = json.loads(f.read())
+        start = cfg.get("start", _DEFAULT_WINDOW_START)
+        end = cfg.get("end", _DEFAULT_WINDOW_END)
+        if _parse_hhmm(start) is None:
+            start = _DEFAULT_WINDOW_START
+        if _parse_hhmm(end) is None:
+            end = _DEFAULT_WINDOW_END
+        try:
+            trickle = max(
+                1, int(cfg.get("upload_trickle_kb", _DEFAULT_UPLOAD_TRICKLE_KB))
+            )
+        except (ValueError, TypeError):
+            trickle = _DEFAULT_UPLOAD_TRICKLE_KB
+        return {
+            "enabled": bool(cfg.get("enabled", False)),
+            "start": start,
+            "end": end,
+            "locked": False,
+            "upload_restrict": bool(cfg.get("upload_restrict", False)),
+            "upload_trickle_kb": trickle,
+        }
+    except (OSError, json.JSONDecodeError, ValueError):
+        return {
+            "enabled": False,
+            "start": _DEFAULT_WINDOW_START,
+            "end": _DEFAULT_WINDOW_END,
+            "locked": False,
+            "upload_restrict": False,
+            "upload_trickle_kb": _DEFAULT_UPLOAD_TRICKLE_KB,
+        }
+
+
+def _save_download_schedule(
+    enabled, start, end, upload_restrict=None, upload_trickle_kb=None
+):
+    """Persist the download window. Returns False if the config is env-locked
+    or the write fails.
+
+    The upload-window fields (restrict seeding to the window + the trickle cap)
+    are UI-only — no env lock — and preserved when the caller passes None, so a
+    window edit doesn't clobber the seeding policy and vice versa.
+    """
+    cur = _load_download_schedule()
+    if cur.get("locked"):
+        return False
+    if upload_restrict is None:
+        upload_restrict = cur["upload_restrict"]
+    if upload_trickle_kb is None:
+        upload_trickle_kb = cur["upload_trickle_kb"]
+    try:
+        trickle = max(1, int(upload_trickle_kb))
     except (ValueError, TypeError):
-        return _MAX_CONCURRENT_DEFAULT
-    return max(1, n)
+        trickle = _DEFAULT_UPLOAD_TRICKLE_KB
+    cfg_path = getattr(_srv, "_DOWNLOAD_SCHEDULE_CONFIG", _DOWNLOAD_SCHEDULE_CONFIG)
+    try:
+        _srv._atomic_write_json(
+            cfg_path,
+            {
+                "enabled": bool(enabled),
+                "start": start,
+                "end": end,
+                "upload_restrict": bool(upload_restrict),
+                "upload_trickle_kb": trickle,
+            },
+        )
+        # A policy change is a transition — push the right cap now instead of
+        # waiting up to a full tick for the watcher to notice.
+        _apply_upload_window(force=True)
+        return True
+    except OSError as e:
+        log.warning("could not persist download schedule: %s", e)
+        return False
+
+
+def _now_local_minutes():
+    lt = time.localtime()
+    return lt.tm_hour * 60 + lt.tm_min
+
+
+def _within_download_window(now_min=None):
+    """True when downloads may start NOW. Always True when scheduling is off,
+    or when the window is malformed (never trap downloads on bad config)."""
+    sched = _load_download_schedule()
+    if not sched["enabled"]:
+        return True
+    start = _parse_hhmm(sched["start"])
+    end = _parse_hhmm(sched["end"])
+    if start is None or end is None:
+        return True
+    if now_min is None:
+        now_min = _now_local_minutes()
+    return _in_window(now_min, start, end)
+
+
+def _schedule_defers_now():
+    """True when a newly-started download should be held for the window
+    instead of starting immediately."""
+    return _load_download_schedule()["enabled"] and not _within_download_window()
+
+
+def _in_window_now(sched=None, now_min=None):
+    """Raw window membership, IGNORING the ``enabled`` flag.
+
+    The upload restrictor has its own toggle (``upload_restrict``) over the same
+    window bounds, so it can't reuse ``_within_download_window`` (which
+    short-circuits to True when download-queueing is off). Malformed bounds → in
+    window (never throttle on bad config)."""
+    sched = sched or _load_download_schedule()
+    start = _parse_hhmm(sched["start"])
+    end = _parse_hhmm(sched["end"])
+    if start is None or end is None:
+        return True
+    if now_min is None:
+        now_min = _now_local_minutes()
+    return _in_window(now_min, start, end)
+
+
+def _apply_upload_window(force=False):
+    """Push the correct upload cap to the BT session for the current window.
+
+    When ``upload_restrict`` is on and we're OUTSIDE the window, seeding is
+    trickled to ``upload_trickle_kb``; inside the window (or when the option is
+    off) the normal up limit is restored. Idempotent — only touches libtorrent
+    on a state change, so a 60s tick is free when nothing moved."""
+    global _upload_window_applied
+    from zimi import p2p as _p2p
+
+    sched = _load_download_schedule()
+    restrict = sched["upload_restrict"]
+    inside = _in_window_now(sched)
+    state = (restrict, inside)
+    if not force and state == _upload_window_applied:
+        return
+    _upload_window_applied = state
+    if restrict and not inside:
+        _p2p.set_upload_window_cap(sched["upload_trickle_kb"])
+    else:
+        _p2p.set_upload_window_cap(None)
+
+
+def _download_schedule_status():
+    """Serialize the schedule config for the /manage/download-schedule endpoint."""
+    from zimi import p2p as _p2p
+
+    sched = _load_download_schedule()
+    return {
+        "enabled": sched["enabled"],
+        "start": sched["start"],
+        "end": sched["end"],
+        "locked": sched["locked"],
+        "in_window": _within_download_window(),
+        # The global download-speed cap lives with the BT down limit — one
+        # number governs every transport (see p2p.get_download_limit_kb).
+        "download_kb": _p2p.get_download_limit_kb(),
+        "download_kb_locked": _p2p.is_bt_down_env_locked(),
+        # Upload-window restrictor: throttle seeding to a trickle outside the
+        # window. Shares the window bounds above but is independently toggled.
+        "upload_restrict": sched["upload_restrict"],
+        "upload_trickle_kb": sched["upload_trickle_kb"],
+        "upload_kb": _p2p.get_bt_up_limit_kb(),
+        "upload_kb_locked": _p2p.is_bt_up_env_locked(),
+        # True right now: uploads are actively trickled (restrict on + outside).
+        "upload_throttled": sched["upload_restrict"] and not _in_window_now(sched),
+    }
+
+
+def _download_schedule_tick():
+    """One watcher pass: release scheduled downloads once the window is open and
+    keep the upload cap in step with the window. Cheap no-op otherwise.
+    Extracted so tests can drive it without the loop."""
+    if _within_download_window():
+        with _download_lock:
+            if _download_queue:
+                _drain_queue()
+    _apply_upload_window()
+
+
+def _download_schedule_loop(interval=60):
+    """Background watcher that opens the gate when the window arrives.
+
+    Ticks every ``interval`` seconds. Laptop-sleep resilient: a missed window
+    start just means scheduled downloads begin at the next tick inside the
+    window, not that they're lost. Runs for the process lifetime (daemon)."""
+    while True:
+        try:
+            _download_schedule_tick()
+        except Exception as e:
+            log.debug("download schedule tick failed: %s", e)
+        time.sleep(interval)
+
+
+def start_download_scheduler():
+    """Start the singleton schedule watcher thread (idempotent)."""
+    global _schedule_watcher_thread
+    if _schedule_watcher_thread and _schedule_watcher_thread.is_alive():
+        return
+    _schedule_watcher_thread = threading.Thread(
+        target=_download_schedule_loop, daemon=True, name="download-scheduler"
+    )
+    _schedule_watcher_thread.start()
+    # Set the upload cap to match wherever the window sits right now, so a
+    # process that boots outside its window starts throttled without waiting a
+    # full tick.
+    try:
+        _apply_upload_window(force=True)
+    except Exception as e:
+        log.debug("initial upload-window apply failed: %s", e)
+
+
+def _max_concurrent():
+    """Concurrent-download cap. Authority lives in p2p (legacy
+    ZIMI_MAX_CONCURRENT_DOWNLOADS > ZIMI_BT active= > persisted UI pref >
+    default) so the BitTorrent settings card and this download queue read one
+    number. Invalid/zero values clamp to a safe minimum there."""
+    from zimi import p2p as _p2p
+
+    return _p2p.get_max_active_downloads()
+
+
+def drain_download_queue():
+    """Promote queued downloads into freshly-available slots — e.g. right
+    after the concurrency cap is raised in the UI, when nothing else would
+    trigger a drain until a download finishes. Safe to call any time."""
+    with _download_lock:
+        _drain_queue()
 
 
 def _active_count():
@@ -280,17 +629,16 @@ def _active_count():
     return sum(1 for d in _active_downloads.values() if not d.get("done"))
 
 
-def _enqueue_or_start(dl):
-    """Either start the download immediately or place it in the queue.
+def _launch_download(dl):
+    """Move dl into an active slot and spawn its thread. Hold _download_lock."""
+    dl.pop("scheduled", None)
+    _active_downloads[dl["id"]] = dl
+    threading.Thread(target=_download_thread, args=(dl,), daemon=True).start()
 
-    Returns True if queued, False if started. Caller must hold _download_lock.
-    """
-    if _active_count() < _max_concurrent():
-        _active_downloads[dl["id"]] = dl
-        threading.Thread(target=_download_thread, args=(dl,), daemon=True).start()
-        _persist_pending_downloads()
-        return False
-    # Queue: known sizes ascending; unknown (None) sizes go to the end.
+
+def _insert_into_queue(dl):
+    """Insert dl into the queue, known sizes ascending, unknown sizes last.
+    Hold _download_lock."""
     sz = dl.get("size_bytes")
     pos = len(_download_queue)
     if sz is not None:
@@ -300,19 +648,45 @@ def _enqueue_or_start(dl):
                 pos = i
                 break
     _download_queue.insert(pos, dl)
+
+
+def _enqueue_or_start(dl):
+    """Either start the download immediately or place it in the queue.
+
+    Returns True if queued, False if started. Caller must hold _download_lock.
+    When download scheduling is on and we're outside the window, the download
+    is queued as ``scheduled`` regardless of free slots — the watcher (or the
+    window opening) releases it later.
+    """
+    if _schedule_defers_now():
+        dl["scheduled"] = True
+        _insert_into_queue(dl)
+        _persist_pending_downloads()
+        return True
+    if _active_count() < _max_concurrent():
+        _launch_download(dl)
+        _persist_pending_downloads()
+        return False
+    _insert_into_queue(dl)
     _persist_pending_downloads()
     return True
 
 
 def _drain_queue():
-    """Promote queued downloads into active slots while there's room.
+    """Promote eligible queued downloads into active slots while there's room.
 
-    Caller must hold _download_lock.
+    Caller must hold _download_lock. Items marked ``scheduled`` stay put while
+    we're outside the download window; everything else promotes as before.
     """
-    while _download_queue and _active_count() < _max_concurrent():
-        dl = _download_queue.pop(0)
-        _active_downloads[dl["id"]] = dl
-        threading.Thread(target=_download_thread, args=(dl,), daemon=True).start()
+    in_window = _within_download_window()
+    i = 0
+    while _active_count() < _max_concurrent() and i < len(_download_queue):
+        dl = _download_queue[i]
+        if dl.get("scheduled") and not in_window:
+            i += 1
+            continue
+        _download_queue.pop(i)
+        _launch_download(dl)
 
 
 # Refuse downloads that would obviously fill the disk: the expected size
@@ -616,6 +990,32 @@ def seed_ledger_snapshot():
         return {k: dict(v) for k, v in _seed_ledger().items()}
 
 
+def restore_seed_intents(intents, overwrite=False):
+    """Restore seed-intent entries from a full-server backup.
+
+    ``overwrite`` replaces the whole ledger; otherwise incoming entries are
+    merged in (union by filename, incoming wins on conflict) so a restore never
+    drops a seed this machine already intends. Entries whose ZIM is absent are
+    harmless — reseed_from_ledger drops them at startup. Returns how many
+    entries were added/updated."""
+    if not isinstance(intents, dict):
+        return 0
+    clean = {
+        k: v for k, v in intents.items() if isinstance(k, str) and isinstance(v, dict)
+    }
+    try:
+        with _seed_ledger_lock:
+            ledger = {} if overwrite else _seed_ledger()
+            before = dict(ledger)
+            ledger.update(clean)
+            os.makedirs(os.path.dirname(_seed_ledger_path()), exist_ok=True)
+            _srv._atomic_write_json(_seed_ledger_path(), ledger)
+            return sum(1 for k, v in clean.items() if before.get(k) != v)
+    except Exception as e:
+        log.debug("seed ledger restore failed: %s", e)
+        return 0
+
+
 def unrecord_seed(filename):
     """A deliberate stop: this file should NOT come back at startup."""
     try:
@@ -880,6 +1280,30 @@ def _cancel_download(dl_id):
         dl["cancelled"] = True
         _persist_pending_downloads()
     return "cancelling", 200
+
+
+def _start_scheduled_now(dl_id):
+    """Override the schedule for one queued item: start it now if a slot is
+    free, else clear its ``scheduled`` marker so it drains like any normal
+    queued download. Returns (status, code).
+
+    status: "started" | "queued" | "already_active" | "not_found"
+    """
+    with _download_lock:
+        for i, q in enumerate(_download_queue):
+            if q["id"] == dl_id:
+                q.pop("scheduled", None)
+                if _active_count() < _max_concurrent():
+                    _download_queue.pop(i)
+                    _launch_download(q)
+                    _persist_pending_downloads()
+                    return "started", 200
+                _persist_pending_downloads()
+                return "queued", 200
+        dl = _active_downloads.get(dl_id)
+        if dl and not dl.get("done"):
+            return "already_active", 200
+    return "not_found", 404
 
 
 def _switch_to_direct(dl_id):
@@ -2428,6 +2852,10 @@ def _download_from_url(dl, url, tmp_dest):
                     break
                 f.write(chunk)
                 dl["downloaded_bytes"] = dl.get("downloaded_bytes", 0) + len(chunk)
+                # Global download-speed cap (shared across all HTTP pulls).
+                delay = _download_throttle.consume(len(chunk), _download_rate_bps())
+                if delay > 0:
+                    time.sleep(delay)
     except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
         resp.close()
         return False, f"Transfer error from {urlparse(url).hostname}: {e}"
@@ -2974,6 +3402,7 @@ def _get_downloads():
                     "elapsed": round(time.time() - dl["started"], 1),
                     "is_update": dl.get("is_update", False),
                     "queued": True,
+                    "scheduled": bool(dl.get("scheduled", False)),
                 }
             )
         for dl_id in to_remove:

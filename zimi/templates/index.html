@@ -3,6 +3,12 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- Declare both schemes so the UA knows the page is theme-aware; the boot
+     below pins the *resolved* scheme via documentElement.style.colorScheme,
+     which is what Safari paints the tab backdrop / scrollbars from. Without it,
+     a light-app user on a dark-mode OS gets a dark compositor flash when
+     switching back to the tab. -->
+<meta name="color-scheme" content="light dark">
 <title>Zimi</title>
 <link rel="icon" type="image/png" sizes="64x64" href="/favicon-64.png?v=6">
 <link rel="icon" type="image/png" sizes="32x32" href="/favicon.png?v=6">
@@ -13,6 +19,50 @@
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="Zimi">
 <link rel="manifest" href="/static/manifest.json">
+<!-- Theme bootstrap — stamp data-theme AND color-scheme on <html> BEFORE the
+     stylesheet applies so a light-app visitor never sees a dark flash. Mirrors
+     _resolveAppTheme() in app.js (kept trivially in sync); app.js re-applies and
+     installs the live prefers-color-scheme listener on load. Default = Auto
+     (follow the OS), dark fallback when the media query is unavailable.
+     colorScheme is set alongside data-theme because Safari paints the tab
+     backdrop from it — that's the fix for the dark flash on tab re-activation.
+     The pageshow(persisted) hook re-asserts after a bfcache restore, where no
+     other script re-runs. -->
+<script>
+(function(){
+  var el = document.documentElement;
+  // Drop the transition-suppression guard once the themed first paint has
+  // committed (double rAF), so normal interactions still animate. A load
+  // backstop covers browsers that throttle rAF on a backgrounded/restored tab.
+  function settle(){
+    var done = false;
+    function clear(){ if (done) return; done = true; el.classList.remove('theme-boot'); }
+    requestAnimationFrame(function(){ requestAnimationFrame(clear); });
+    window.addEventListener('load', clear, { once: true });
+  }
+  function apply(){
+    // Suppress theme-sensitive transitions while (re)stamping the theme so pills,
+    // cards, etc. never animate a dark->light flip — the residual Safari flash on
+    // tab return / bfcache restore, where the snapshot repaints before the token
+    // override settles. Removed again on the next committed paint.
+    el.classList.add('theme-boot');
+    try {
+      var m = localStorage.getItem('zimi_app_theme') || 'auto';
+      var dark = m === 'dark' || (m !== 'light' && !(window.matchMedia &&
+        window.matchMedia('(prefers-color-scheme: light)').matches));
+      var t = dark ? 'dark' : 'light';
+      el.setAttribute('data-theme', t);
+      el.style.colorScheme = t;
+    } catch(e) {
+      el.setAttribute('data-theme', 'dark');
+      el.style.colorScheme = 'dark';
+    }
+    settle();
+  }
+  apply();
+  window.addEventListener('pageshow', function(e){ if (e.persisted) apply(); });
+})();
+</script>
 <link rel="stylesheet" href="/static/app.css?v=1">
 <link rel="stylesheet" href="/static/almanac.css?v=2">
 </head>
@@ -86,7 +136,7 @@
     </label>
     <div class="pw-actions">
       <button type="button" id="pw-remove-btn" onclick="_confirmRemovePassword(this)" style="display:none;color:var(--text2);font-size:12px;margin-right:auto" data-i18n="remove">Remove</button>
-      <button type="button" onclick="closePwModal()" data-i18n="cancel">Cancel</button>
+      <button type="button" id="pw-cancel" onclick="closePwModal()" data-i18n="cancel">Cancel</button>
       <button type="submit" class="pw-primary" data-i18n="ok">OK</button>
     </div>
   </form>

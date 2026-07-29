@@ -171,6 +171,33 @@ _POLL_PATHS = frozenset(
     )
 )
 
+# The ONLY paths an anonymous visitor may reach when the public-access policy is
+# ``private``. Everything else 401s until they log in. The set is deliberately
+# minimal — enough to render the login screen and authenticate, nothing that
+# reveals library contents:
+#   /                     the SPA shell (static HTML, no data)
+#   /whoami               so the client learns it must show the login screen
+#   /health               aggregate status; already allow-filtered (→ 0 zims)
+#   /login /logout        the auth transitions themselves
+#   favicons / touch icon chrome the shell references
+# Prefixes: /static/ (app.js, app.css, i18n, sw.js, pdfjs, manifest) and
+# /manage/ (self-gated — its own admin challenge blocks non-admins, while the
+# pre-auth has-password/has-token the login modal needs stay reachable).
+_PRIVATE_LOGIN_SURFACE_EXACT = frozenset(
+    (
+        "/",
+        "/whoami",
+        "/health",
+        "/login",
+        "/logout",
+        "/favicon.ico",
+        "/favicon.png",
+        "/favicon-64.png",
+        "/apple-touch-icon.png",
+    )
+)
+_PRIVATE_LOGIN_SURFACE_PREFIX = ("/static/", "/manage/")
+
 
 def _rate_class(path):
     """(is_rate_limited, uses_content_bucket) for a GET path."""
@@ -586,6 +613,27 @@ class ZimHandler(BaseHTTPRequestHandler):
             return "proxy-unknown"
         return direct_ip
 
+    def _private_access_block(self, parsed):
+        """Enforce ``private`` public-access mode. Returns True (and sends a 401)
+        when an ANONYMOUS request targets anything outside the login surface;
+        False to proceed. Admins and logged-in users always proceed.
+
+        Checks the cheap static path allowlist BEFORE probing identity, so
+        serving the login shell + assets costs no session/admin file reads.
+        """
+        mode, _ = _users.get_public_access()
+        if mode != "private":
+            return False
+        path = parsed.path
+        if path in _PRIVATE_LOGIN_SURFACE_EXACT or path.startswith(
+            _PRIVATE_LOGIN_SURFACE_PREFIX
+        ):
+            return False
+        if _users.resolve_request_user(self) or _users._request_is_admin(self):
+            return False
+        self._json(401, {"error": "authentication required", "login_required": True})
+        return True
+
     def do_GET(self):
         parsed = urlparse(self.path)
         params = parse_qs(parsed.query)
@@ -597,6 +645,17 @@ class ZimHandler(BaseHTTPRequestHandler):
         # allowlist (None = admin/anonymous/all-access). Set FIRST so a kept-alive
         # connection re-sets it per request; cleared in the finally for hygiene.
         _srv.set_request_allow(_users.request_allow(self))
+
+        # Private mode: block anonymous reads before any handler runs. The
+        # finally below still clears the request-allow context.
+        try:
+            if self._private_access_block(parsed):
+                return
+        except Exception:
+            # Fail closed: if the policy can't be evaluated, deny rather than
+            # risk serving content an intended-private instance meant to hide.
+            self._json(401, {"error": "authentication required"})
+            return
 
         # Rate limit: API endpoints at RATE_LIMIT (10x for trusted clients),
         # /w/ content and /snippet at 20x.
@@ -849,12 +908,16 @@ class ZimHandler(BaseHTTPRequestHandler):
                         {
                             "zims": result,
                             "section_order": layout.get("section_order", []),
+                            "sections": layout.get("sections", []),
                         },
                     )
                 return self._json(200, result)
 
             elif parsed.path == "/whoami":
                 return self._handle_whoami()
+
+            elif parsed.path == "/userdata":
+                return self._handle_userdata_get()
 
             elif parsed.path == "/languages":
                 # Installed language summary with native names and ZIM counts
@@ -925,28 +988,10 @@ class ZimHandler(BaseHTTPRequestHandler):
                         # Read first 15KB — enough for <head> meta tags + initial content
                         raw = bytes(item.content)[:15360]
                         text = raw.decode("UTF-8", errors="replace")
-                        # Prefer meta description (skips nav/header boilerplate)
-                        for desc_pat in [
-                            r'<meta\s+(?:name|property)=["\'](?:og:)?description["\']\s+content=["\']([^"\']{20,})["\']',
-                            r'<meta\s+content=["\']([^"\']{20,})["\']\s+(?:name|property)=["\'](?:og:)?description["\']',
-                        ]:
-                            desc_m = re.search(desc_pat, text[:8000], re.IGNORECASE)
-                            if desc_m:
-                                snippet = _srv.strip_html(desc_m.group(1))[:300].strip()
-                                break
-                        # Fallback: extract from <main> or <article> body (skip nav boilerplate)
-                        if not snippet:
-                            for tag in ["main", "article"]:
-                                tag_m = re.search(
-                                    r"<" + tag + r"[\s>]", text, re.IGNORECASE
-                                )
-                                if tag_m:
-                                    plain = _srv.strip_html(text[tag_m.start() :])
-                                    snippet = plain[:300].strip()
-                                    break
-                        # Last resort: full page text
-                        if not snippet:
-                            snippet = _srv.strip_html(text)[:300].strip()
+                        # Prefer the page's own summary, then meta description,
+                        # then body prose — skipping boilerplate some ZIMs bake
+                        # into every page (iFixit device pages, #snippet QA).
+                        snippet = _srv.extract_snippet(text, zim)
                         # Lightweight thumbnail: og:image / twitter:image from <head>
                         for img_pat in [
                             r'<meta\s+property=["\']og:image["\']\s+content=["\']([^"\']+)["\']',
@@ -1322,13 +1367,25 @@ class ZimHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         _srv.set_request_allow(_users.request_allow(self))
         try:
+            if self._private_access_block(parsed):
+                return
+        except Exception:
+            self._json(401, {"error": "authentication required"})
+            return
+        try:
             content_len = int(self.headers.get("Content-Length", "0"))
-            if content_len > _srv.MAX_POST_BODY:
+            # Backup import + per-user data save legitimately run large (a full
+            # server bundle carries users/history/every per-user blob); every
+            # other endpoint stays under the tight default cap.
+            body_cap = (
+                _srv.MAX_BACKUP_BODY
+                if parsed.path in ("/manage/backup", "/userdata")
+                else _srv.MAX_POST_BODY
+            )
+            if content_len > body_cap:
                 return self._json(
                     413,
-                    {
-                        "error": f"Request body too large (max {_srv.MAX_POST_BODY} bytes)"
-                    },
+                    {"error": f"Request body too large (max {body_cap} bytes)"},
                 )
             body = self.rfile.read(content_len) if content_len > 0 else b"{}"
             try:
@@ -1351,6 +1408,9 @@ class ZimHandler(BaseHTTPRequestHandler):
 
             if parsed.path == "/logout":
                 return self._handle_logout()
+
+            if parsed.path == "/userdata":
+                return self._handle_userdata_post(data)
 
             if parsed.path == "/resolve":
                 retry_after = _check_rate_limit(
@@ -2200,17 +2260,29 @@ class ZimHandler(BaseHTTPRequestHandler):
                 },
                 self._session_cookie(token, remember),
             )
-        # Admin account (the existing password account).
+        # Admin account (the existing password account). Mint an HttpOnly admin
+        # session cookie IN ADDITION to the client's password Bearer, so the
+        # header-less transports (reader iframe, plain-fetch data endpoints) carry
+        # admin identity — otherwise a private/limited-mode admin sees an empty
+        # library and blank article iframes. The client still keeps using the
+        # password as its manage Bearer token (unchanged).
         from zimi import manage as _manage
 
         if _manage.verify_admin_credentials(username, password):
-            return self._json(200, {"role": "admin"})
+            token = _users.create_admin_session()
+            log.info("Admin login (password account)")
+            return self._json_cookie(
+                200, {"role": "admin"}, self._session_cookie(token, remember)
+            )
         return self._json(401, {"error": "invalid credentials"})
 
     def _handle_logout(self):
-        """POST /logout — drop the current session + expire the cookie."""
-        token = _users._bearer_token(self) or _users._cookie_token(self)
-        _users.drop_session(token)
+        """POST /logout — drop the current session(s) + expire the cookie. Drops
+        BOTH the Bearer and cookie tokens: an admin's Bearer is the password (a
+        no-op drop) while its session rides the cookie, so dropping only the
+        first-present token could leave the admin session alive server-side."""
+        _users.drop_session(_users._bearer_token(self))
+        _users.drop_session(_users._cookie_token(self))
         return self._json_cookie(200, {"status": "ok"}, self._expire_cookie())
 
     def _handle_whoami(self):
@@ -2243,17 +2315,57 @@ class ZimHandler(BaseHTTPRequestHandler):
             and _manage._get_manage_password_hash()
             and _manage._check_manage_auth(self) is None
         ):
-            return self._json(
-                200,
-                {"role": "admin", "name": _manage._get_manage_user() or "admin"},
-            )
+            resp = {"role": "admin", "name": _manage._get_manage_user() or "admin"}
+            # Ensure the header-less transports (reader iframe, plain-fetch data
+            # endpoints) carry admin identity. If this admin was recognised by the
+            # password Bearer but has no live admin session cookie yet — first boot
+            # after a remembered login, or the cookie expired — mint one now. Boot
+            # awaits /whoami before the first /list, so the cookie lands in time. A
+            # session-scoped cookie (no Max-Age) keeps the "remember" contract: a
+            # non-remembered admin loses it on tab close (its stored Bearer is gone
+            # too), while a remembered admin re-mints from the Bearer each boot.
+            if not _users.is_admin_session(_users._cookie_token(self)):
+                token = _users.create_admin_session()
+                return self._json_cookie(200, resp, self._session_cookie(token, False))
+            return self._json(200, resp)
         # Anonymous. Expose a first-login hint ONLY when the default username
         # applies — no custom username AND no named users configured. This is
         # not an info leak: "the default username is admin" is in the docs.
         resp = {"role": "anonymous"}
         if not _manage._get_manage_user() and not _users.list_users():
             resp["default_username"] = "admin"
+        # Tell the SPA how the public-access policy shapes its view: ``private``
+        # forces the login screen (login_required); ``limited`` just means the
+        # library it receives is already filtered server-side (no client action
+        # needed, but surfaced for messaging). ``open`` omits the field.
+        mode, _ = _users.get_public_access()
+        if mode != "open":
+            resp["public_access"] = mode
+            if mode == "private":
+                resp["login_required"] = True
         return self._json(200, resp)
+
+    def _handle_userdata_get(self):
+        """GET /userdata — the signed-in user's own server-stored My-data blob
+        (bookmarks/history/preferences). Only a NAMED user resolves here; an
+        admin-without-a-user or an anonymous visitor gets 401 and keeps their
+        data in the browser."""
+        name = _users.resolve_request_user(self)
+        if not name:
+            return self._json(401, {"error": "sign in required"})
+        return self._json(200, _users.load_user_data(name))
+
+    def _handle_userdata_post(self, data):
+        """POST /userdata — save the signed-in user's own My-data blob. A user
+        can only ever touch their OWN data: the target is the session identity,
+        never a name from the body, so there is no cross-user write path."""
+        name = _users.resolve_request_user(self)
+        if not name:
+            return self._json(401, {"error": "sign in required"})
+        ok, err = _users.save_user_data(name, data if isinstance(data, dict) else {})
+        if not ok:
+            return self._json(400, {"error": err})
+        return self._json(200, {"status": "ok"})
 
     def log_message(self, format, *args):
         # Light logging: errors + slow requests. Suppress 200/304 noise.

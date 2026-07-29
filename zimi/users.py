@@ -67,6 +67,17 @@ _NAME_RE = re.compile(r"^[\w .\-]{1,32}$", re.UNICODE)
 
 _SESSION_TOKEN_BYTES = 32  # secrets.token_urlsafe(32) → ~43 url-safe chars
 
+#: sessions.json stores USER sessions keyed by casefold username. The PRIMARY
+#: admin is the password account, not a users.json record, so its session rides
+#: under a sentinel key that no real username can produce (names are
+#: ``[\w .\-]{1,32}`` — a NUL byte is unrepresentable). This lets the admin reuse
+#: the exact session machinery named users use (random token, hashed at rest, TTL
+#: expiry, logout drop) so header-less transports — the /w/ reader iframe and the
+#: plain-fetch data endpoints — can carry admin identity via the zimi_session
+#: cookie. Recognised by ``manage._primary_admin_authorized``; never resolves as a
+#: named user (see ``resolve_session``).
+_ADMIN_SESSION_USER = "\x00admin"
+
 #: Server-side session lifetime. The cookie carries a matching Max-Age, but that
 #: is a hint the holder controls — this is the half that actually expires a
 #: stolen token, and it bounds sessions.json instead of letting it grow one
@@ -316,6 +327,7 @@ def delete_user(name):
         del users[_key(name)]
         _save_users(users)
         _drop_user_sessions_locked(_key(name))
+    delete_user_data(name)  # their server-side bookmarks/history go with them
     log.info("User deleted: %s", name)
     return True, None
 
@@ -385,6 +397,287 @@ def is_admin_user(name):
 
 
 # ============================================================================
+# Per-user data — bookmarks / history / preferences stored SERVER-SIDE per user
+# ============================================================================
+#
+# The tasteful bridge to the 1.9 full users-v2 migration: when a NAMED user is
+# signed in, their "My data" (the browser-half a device otherwise keeps only in
+# localStorage) round-trips through the server so it follows them across devices.
+# One opaque JSON doc per user under ZIMI_DATA_DIR/userdata/<casefold-key>.json,
+# atomic writes, deleted with the account. Anonymous / admin-without-a-named-user
+# never reach here — their bookmarks stay in the browser (see http.py's gate).
+
+_USERDATA_VERSION = 1
+#: Hard ceiling per blob so one account can't fill the disk (server-side twin of
+#: the client cap). Comfortably above a heavy bookmarks+history set.
+_USERDATA_MAX_BYTES = 4 * 1024 * 1024
+
+
+def _userdata_dir():
+    return os.path.join(_srv.ZIMI_DATA_DIR, "userdata")
+
+
+def _safe_userdata_key(name):
+    """Casefold key for a user's data file, or None if it can't be a safe
+    filename. Names are validated on creation, but this is the last gate before
+    a path join, so it stays strict: no separators, no dot-only names."""
+    key = _key(name)
+    if (
+        not key
+        or key in (".", "..")
+        or os.sep in key
+        or (os.altsep and os.altsep in key)
+    ):
+        return None
+    return key
+
+
+def _userdata_path(name):
+    return os.path.join(_userdata_dir(), _safe_userdata_key(name) + ".json")
+
+
+def _empty_user_data():
+    return {
+        "version": _USERDATA_VERSION,
+        "bookmarks": [],
+        "history": [],
+        "preferences": {},
+    }
+
+
+def load_user_data(name):
+    """Return a user's stored data blob, or a fresh-empty one when none exists.
+    Caller has already authorized the requester for ``name``."""
+    if _safe_userdata_key(name) is None:
+        return _empty_user_data()
+    try:
+        import json
+
+        with open(_userdata_path(name), encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+    except (FileNotFoundError, ValueError, OSError):
+        pass
+    return _empty_user_data()
+
+
+def save_user_data(name, blob):
+    """Persist a user's data blob (bookmarks/history/preferences). Returns
+    (ok, error). Caller has already authorized the requester for ``name``."""
+    import json
+
+    if _safe_userdata_key(name) is None:
+        return False, "invalid user"
+    if not isinstance(blob, dict):
+        return False, "invalid data"
+    bookmarks = blob.get("bookmarks")
+    history = blob.get("history")
+    prefs = blob.get("preferences")
+    doc = {
+        "version": _USERDATA_VERSION,
+        "bookmarks": bookmarks if isinstance(bookmarks, list) else [],
+        "history": history if isinstance(history, list) else [],
+        "preferences": prefs if isinstance(prefs, dict) else {},
+        "updated": int(time.time()),
+    }
+    if len(json.dumps(doc)) > _USERDATA_MAX_BYTES:
+        return False, "data too large"
+    with _lock:
+        os.makedirs(_userdata_dir(), exist_ok=True)
+        _srv._atomic_write_json(_userdata_path(name), doc, indent=2)
+    return True, None
+
+
+def delete_user_data(name):
+    """Remove a user's stored data file (best-effort; a missing file is fine)."""
+    if _safe_userdata_key(name) is None:
+        return
+    try:
+        os.remove(_userdata_path(name))
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        log.warning("Could not delete user data for %s: %s", name, e)
+
+
+def all_user_data():
+    """Every per-user blob, keyed by casefold name — for the full-server backup.
+    Keys are the on-disk filenames (already casefold), so restore round-trips."""
+    import json
+
+    out = {}
+    d = _userdata_dir()
+    if not os.path.isdir(d):
+        return out
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return out
+    for fn in names:
+        if not fn.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(d, fn), encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                out[fn[: -len(".json")]] = data
+        except (ValueError, OSError):
+            pass
+    return out
+
+
+def restore_user_data(blobs, overwrite=False):
+    """Restore per-user blobs from a full-server backup. ``blobs`` is keyed by
+    casefold name (as ``all_user_data`` emits). ``overwrite`` clears every
+    existing blob first; otherwise incoming wins per user, others untouched.
+    Returns the number of user blobs written."""
+    if not isinstance(blobs, dict):
+        return 0
+    if overwrite:
+        for key in list(all_user_data().keys()):
+            delete_user_data(key)
+    written = 0
+    for key, blob in blobs.items():
+        ok, _ = save_user_data(key, blob)  # key is already casefold; _key is idempotent
+        if ok:
+            written += 1
+    return written
+
+
+# ============================================================================
+# Public-access policy — what an ANONYMOUS (not logged-in) visitor may see
+# ============================================================================
+#
+# Three modes, stored in ``access.json`` under ZIMI_DATA_DIR (kept out of
+# users.json so the user schema stays stable and the policy can be swapped
+# atomically on its own):
+#
+#   {"version": 1, "mode": "open"|"limited"|"private", "allowlist": [...]}
+#
+# - ``open``    — default, legacy behaviour: anonymous sees the whole library
+#                 (``request_allow`` → None, the all-access sentinel).
+# - ``limited`` — anonymous is filtered to ``allowlist`` using the EXACT same
+#                 choke points as a limited USER (``current_allow`` thread-local
+#                 → get_zim_files/list_zims/zim_allowed/search-cache key). No new
+#                 filtering path, so no new leak surface.
+# - ``private`` — anonymous gets nothing but the login screen; every read
+#                 endpoint requires a session (enforced by the request gate in
+#                 http.py). ``request_allow`` returns an EMPTY set as defence in
+#                 depth so a gate bypass still yields an empty library.
+#
+# Env override ``ZIMI_PUBLIC_ACCESS`` (open|limited|private) wins over the file
+# for docker/compose deployments. When it selects ``limited`` the allowlist
+# still comes from access.json (env can't carry a list); an unconfigured
+# allowlist there → empty set → anonymous sees nothing, which is safe.
+#
+# FAIL CLOSED: a file that is PRESENT but corrupt/unreadable, with no env
+# override, resolves to ``private`` — never silently back to ``open`` (that
+# would dump the whole library to the internet on a hand-edited or truncated
+# config). A MISSING file is the legacy default → ``open`` (installs that never
+# configured a policy must not suddenly lock out).
+
+_ACCESS_VERSION = 1
+_ACCESS_MODES = ("open", "limited", "private")
+_DEFAULT_ACCESS_MODE = "open"
+
+
+def _access_path():
+    return os.path.join(_srv.ZIMI_DATA_DIR, "access.json")
+
+
+def _env_access_mode():
+    """The ZIMI_PUBLIC_ACCESS override, or None if unset/invalid."""
+    raw = (os.environ.get("ZIMI_PUBLIC_ACCESS") or "").strip().lower()
+    return raw if raw in _ACCESS_MODES else None
+
+
+def _load_access():
+    """Return ``(mode, allowlist, ok)``.
+
+    ``ok`` is False ONLY when the file exists but could not be read/parsed as a
+    valid policy — the fail-closed signal. A missing file is the legacy default
+    (``open``, ok=True), NOT an error.
+    """
+    path = _access_path()
+    if not os.path.exists(path):
+        return _DEFAULT_ACCESS_MODE, [], True
+    try:
+        import json
+
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return _DEFAULT_ACCESS_MODE, [], False
+        mode = data.get("mode")
+        if mode not in _ACCESS_MODES:
+            return _DEFAULT_ACCESS_MODE, [], False
+        raw = data.get("allowlist")
+        allow = [a for a in raw if isinstance(a, str)] if isinstance(raw, list) else []
+        return mode, allow, True
+    except (ValueError, OSError):
+        return _DEFAULT_ACCESS_MODE, [], False
+
+
+def get_public_access():
+    """The effective anonymous policy as ``(mode, allowlist)``.
+
+    Env override wins over the file. With no override, an unreadable-but-present
+    config fails closed to ``private``. See the section header for the full
+    contract.
+    """
+    mode, allow, ok = _load_access()
+    env = _env_access_mode()
+    if env is not None:
+        mode = env
+    elif not ok:
+        mode = "private"  # fail closed
+    return mode, allow
+
+
+def set_public_access(mode, allowlist=None):
+    """Persist the anonymous-access policy. Returns (ok, error).
+
+    ``limited`` stores the cleaned allowlist; ``open``/``private`` ignore it
+    (stored empty). The env override, if set, still wins at read time — callers
+    should surface that to the admin, but we still persist so a later env
+    removal restores intent.
+    """
+    if mode not in _ACCESS_MODES:
+        return False, "invalid mode"
+    allow, err = _clean_allowlist(allowlist if allowlist is not None else [])
+    if err:
+        return False, err
+    stored = allow if mode == "limited" else []
+    with _lock:
+        _srv._atomic_write_json(
+            _access_path(),
+            {"version": _ACCESS_VERSION, "mode": mode, "allowlist": stored},
+            indent=2,
+        )
+    log.info("Public access set: mode=%s (allowlist=%d)", mode, len(stored))
+    return True, None
+
+
+def public_access_status():
+    """Admin-facing view of the policy: the effective mode/allowlist plus
+    whether the env override is forcing it (so the UI can show a read-only
+    banner). The stored file mode is surfaced separately from the effective
+    mode so the admin sees what they saved even when env overrides it."""
+    file_mode, file_allow, _ = _load_access()
+    env = _env_access_mode()
+    eff_mode, eff_allow = get_public_access()
+    return {
+        "mode": eff_mode,
+        "allowlist": eff_allow,
+        "stored_mode": file_mode,
+        "stored_allowlist": file_allow,
+        "env_controlled": env is not None,
+        "env_mode": env,
+    }
+
+
+# ============================================================================
 # Authentication + sessions
 # ============================================================================
 
@@ -430,9 +723,9 @@ def _session_expired(ent, now=None):
     return (now if now is not None else int(time.time())) - created > SESSION_TTL_S
 
 
-def create_session(name):
-    """Mint a random session token for a user, persist it (hashed), return the
-    plaintext token (shown once, delivered via cookie + login response)."""
+def _mint_session(user_key):
+    """Mint a random session token for a stored user key, persist it (hashed),
+    return the plaintext token. Shared by named-user and admin sessions."""
     token = secrets.token_urlsafe(_SESSION_TOKEN_BYTES)
     now = int(time.time())
     with _lock:
@@ -441,9 +734,39 @@ def create_session(name):
         # only grow by one entry between two sweeps of the same account.
         for h in [h for h, e in sessions.items() if _session_expired(e, now)]:
             del sessions[h]
-        sessions[_token_hash(token)] = {"user": _key(name), "created": now}
+        sessions[_token_hash(token)] = {"user": user_key, "created": now}
         _save_sessions(sessions)
     return token
+
+
+def create_session(name):
+    """Mint a random session token for a user, persist it (hashed), return the
+    plaintext token (shown once, delivered via cookie + login response)."""
+    return _mint_session(_key(name))
+
+
+def create_admin_session():
+    """Mint a session token for the PRIMARY admin (the password account) so
+    header-less transports carry admin identity via the zimi_session cookie: the
+    /w/ reader iframe (a browser navigation that cannot send an Authorization
+    header) and the plain-fetch data endpoints (/list, /search, …). Stored and
+    expired exactly like a user session; recognised by
+    ``manage._primary_admin_authorized`` via ``is_admin_session``."""
+    return _mint_session(_ADMIN_SESSION_USER)
+
+
+def is_admin_session(token):
+    """True if the token is a live PRIMARY-admin session (see
+    ``create_admin_session``). Fails closed: empty / unknown / expired → False.
+    As unforgeable as the password Bearer — a random token, hashed at rest."""
+    if not token:
+        return False
+    ent = _load_sessions().get(_token_hash(token))
+    return (
+        bool(ent)
+        and not _session_expired(ent)
+        and ent.get("user") == _ADMIN_SESSION_USER
+    )
 
 
 def resolve_session(token):
@@ -455,6 +778,10 @@ def resolve_session(token):
     sessions = _load_sessions()
     ent = sessions.get(_token_hash(token))
     if not ent or _session_expired(ent):
+        return None
+    # An admin session is not a named user — never let it resolve as one (it
+    # would fail the users.json lookup anyway; this is defence in depth).
+    if ent.get("user") == _ADMIN_SESSION_USER:
         return None
     rec = _load_users().get(ent.get("user"))
     if not rec:
@@ -469,6 +796,16 @@ def drop_session(token):
         sessions = _load_sessions()
         if sessions.pop(_token_hash(token), None) is not None:
             _save_sessions(sessions)
+
+
+def drop_admin_sessions():
+    """Invalidate every primary-admin session (see ``create_admin_session``).
+    Called when the manage password changes or clears so an old admin cookie
+    can't outlive a password rotation — matching the pre-cookie model where the
+    admin's Bearer WAS the password and changing it locked out the old one
+    immediately."""
+    with _lock:
+        _drop_user_sessions_locked(_ADMIN_SESSION_USER)
 
 
 def _drop_user_sessions_locked(key):
@@ -522,19 +859,44 @@ def resolve_request_user(handler):
     return resolve_session(_cookie_token(handler))
 
 
+def _request_is_admin(handler):
+    """True if the request is an authorized admin (primary or secondary) — the
+    account that always sees the whole library regardless of the public-access
+    policy. Fails CLOSED: any error resolving admin status → False (treat as a
+    non-admin, i.e. restricted), never accidentally all-access."""
+    try:
+        from zimi import manage as _manage
+
+        return _manage._check_manage_auth(handler) is None
+    except Exception:
+        return False
+
+
 def request_allow(handler):
     """The request's ZIM allow set, or None for all-access.
 
-    None  → admin / anonymous / all-access user → sees everything.
-    set() → a logged-in user with an explicit allowlist → restricted.
+    Resolution order:
+    - A logged-in USER → their own allowlist (set) or None (all-access user).
+    - Otherwise (anonymous OR admin) the public-access policy applies:
+        * ``open``    → None (all-access) — the common default; no admin probe.
+        * ``limited`` → admin gets None, anonymous gets set(public allowlist).
+        * ``private`` → admin gets None, anonymous gets an EMPTY set (defence in
+                        depth; the http.py request gate 401s them before any
+                        read handler runs).
     """
     name = resolve_request_user(handler)
-    if not name:
+    if name:
+        rec = get_user(name)
+        if not rec:
+            return None
+        allowlist = rec.get("allowlist")
+        return set(allowlist) if isinstance(allowlist, list) else None
+
+    mode, allow = get_public_access()
+    if mode == "open":
+        return None  # fast path — no admin probe for the default deployment
+    if _request_is_admin(handler):
         return None
-    rec = get_user(name)
-    if not rec:
-        return None
-    allowlist = rec.get("allowlist")
-    if isinstance(allowlist, list):
-        return set(allowlist)
-    return None
+    if mode == "limited":
+        return set(allow)
+    return set()  # private → empty library; gate returns 401 first

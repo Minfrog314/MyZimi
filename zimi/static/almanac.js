@@ -65,6 +65,21 @@ function _saveLocation(lat, lon, name) {
   _almSelectedTz = _almTzForLocation(lat, lon);
 }
 
+// Holiday scope — 'region' (default: the one national pack for the chosen or
+// detected location) or 'worldwide' (all national packs layered at once, each
+// entry tagged with its country). Session-scoped like the location itself: the
+// almanac is ephemeral, so a refresh returns to the location-following default.
+var _ALM_HOLIDAY_SCOPE_KEY = 'zimi_almanac_holiday_scope';
+function _almHolidayScope() {
+  try { return sessionStorage.getItem(_ALM_HOLIDAY_SCOPE_KEY) === 'worldwide' ? 'worldwide' : 'region'; }
+  catch (e) { return 'region'; }
+}
+function _almSetHolidayScope(scope) {
+  if (scope === _almHolidayScope()) return;
+  try { sessionStorage.setItem(_ALM_HOLIDAY_SCOPE_KEY, scope); } catch (e) {}
+  if (typeof _drawAlmanacGrid === 'function') _drawAlmanacGrid();
+}
+
 function _signalDelay(au) {
   var sec = au * 499;
   return { h: Math.floor(sec / 3600), m: Math.floor((sec % 3600) / 60) };
@@ -2843,6 +2858,7 @@ var _MAP_CITIES = [
   { name: 'Melbourne, Victoria, Australia', lat: -37.81, lon: 144.96 },
   { name: 'Brisbane, Queensland, Australia', lat: -27.47, lon: 153.03 },
   { name: 'Perth, Western Australia, Australia', lat: -31.95, lon: 115.86 },
+  { name: 'Adelaide, South Australia, Australia', lat: -34.93, lon: 138.60 },
   { name: 'Auckland, New Zealand', lat: -36.85, lon: 174.76 },
   { name: 'Wellington, New Zealand', lat: -41.29, lon: 174.78 },
   { name: 'Suva, Fiji', lat: -17.77, lon: 177.97 }
@@ -3082,7 +3098,158 @@ var _SEARCH_CITIES = [
   { name: 'Wellington, New Zealand', lat: -41.29, lon: 174.78 },
   { name: 'Christchurch, New Zealand', lat: -43.53, lon: 172.64 },
   { name: 'Suva, Fiji', lat: -18.14, lon: 178.44 },
-  { name: 'Port Moresby, Papua New Guinea', lat: -9.44, lon: 147.18 }
+  { name: 'Port Moresby, Papua New Guinea', lat: -9.44, lon: 147.18 },
+  // ── Wider world coverage (1.8.1): major cities by population, coordinates
+  //    from the GeoNames cities15000 dataset; deduped against the lists above. ──
+  { name: 'Aden, Yemen', lat: 12.78, lon: 45.04 },
+  { name: 'Al Basrah al Qadimah, Iraq', lat: 30.50, lon: 47.82 },
+  { name: 'Al Mawsil al Jadidah, Iraq', lat: 36.33, lon: 43.11 },
+  { name: 'Aleppo, Syria', lat: 36.20, lon: 37.16 },
+  { name: 'Andijon, Uzbekistan', lat: 40.78, lon: 72.35 },
+  { name: 'Ankara, Turkey', lat: 39.92, lon: 32.85 },
+  { name: 'Antananarivo, Madagascar', lat: -18.91, lon: 47.54 },
+  { name: 'Antsirabe, Madagascar', lat: -19.87, lon: 47.03 },
+  { name: 'Arequipa, Peru', lat: -16.40, lon: -71.54 },
+  { name: 'Arhus, Denmark', lat: 56.16, lon: 10.21 },
+  { name: 'Ashgabat, Turkmenistan', lat: 37.95, lon: 58.38 },
+  { name: 'Asmara, Eritrea', lat: 15.34, lon: 38.93 },
+  { name: 'Bamako, Mali', lat: 12.61, lon: -7.98 },
+  { name: 'Bamenda, Cameroon', lat: 5.96, lon: 10.15 },
+  { name: 'Bangui, Central African Republic', lat: 4.36, lon: 18.55 },
+  { name: 'Banja Luka, Bosnia and Herzegovina', lat: 44.78, lon: 17.21 },
+  { name: 'Benghazi, Libya', lat: 32.11, lon: 20.07 },
+  { name: 'Bharatpur, Nepal', lat: 27.68, lon: 84.44 },
+  { name: 'Bissau, Guinea-Bissau', lat: 11.86, lon: -15.60 },
+  { name: 'Blantyre, Malawi', lat: -15.78, lon: 35.01 },
+  { name: 'Bo, Sierra Leone', lat: 7.96, lon: -11.74 },
+  { name: 'Bobo-Dioulasso, Burkina Faso', lat: 11.18, lon: -4.29 },
+  { name: 'Borama, Somalia', lat: 9.94, lon: 43.18 },
+  { name: 'Bouake, Ivory Coast', lat: 7.69, lon: -5.03 },
+  { name: 'Bujumbura, Burundi', lat: -3.38, lon: 29.36 },
+  { name: 'Bulawayo, Zimbabwe', lat: -20.15, lon: 28.58 },
+  { name: 'Bursa, Turkey', lat: 40.20, lon: 29.06 },
+  { name: 'Camagueey, Cuba', lat: 21.38, lon: -77.92 },
+  { name: 'Chisinau, Moldova', lat: 47.01, lon: 28.86 },
+  { name: 'Ciudad del Este, Paraguay', lat: -25.50, lon: -54.65 },
+  { name: 'Cochabamba, Bolivia', lat: -17.38, lon: -66.16 },
+  { name: 'Conakry, Guinea', lat: 9.54, lon: -13.68 },
+  { name: 'Constantine, Algeria', lat: 36.37, lon: 6.61 },
+  { name: 'Cork, Ireland', lat: 51.90, lon: -8.47 },
+  { name: 'Cotonou, Benin', lat: 6.37, lon: 2.42 },
+  { name: 'Cuenca, Ecuador', lat: -2.90, lon: -79.00 },
+  { name: 'Damascus, Syria', lat: 33.51, lon: 36.29 },
+  { name: 'Danli, Honduras', lat: 14.03, lon: -86.58 },
+  { name: 'Dasoguz, Turkmenistan', lat: 41.84, lon: 59.97 },
+  { name: 'Djibouti, Djibouti', lat: 11.59, lon: 43.15 },
+  { name: 'Dodoma, Tanzania', lat: -6.17, lon: 35.74 },
+  { name: 'Douala, Cameroon', lat: 4.05, lon: 9.70 },
+  { name: 'Dushanbe, Tajikistan', lat: 38.54, lon: 68.78 },
+  { name: 'Fes, Morocco', lat: 34.03, lon: -5.00 },
+  { name: 'Freetown, Sierra Leone', lat: 8.49, lon: -13.24 },
+  { name: 'Gaborone, Botswana', lat: -24.65, lon: 25.91 },
+  { name: 'Ganja, Azerbaijan', lat: 40.68, lon: 46.36 },
+  { name: 'Gaza, Palestinian Territory', lat: 31.50, lon: 34.47 },
+  { name: 'Georgetown, Guyana', lat: 6.80, lon: -58.16 },
+  { name: 'Gonder, Ethiopia', lat: 12.60, lon: 37.47 },
+  { name: 'Graz, Austria', lat: 47.07, lon: 15.44 },
+  { name: 'Haiphong, Vietnam', lat: 20.86, lon: 106.68 },
+  { name: 'Hamhung, North Korea', lat: 39.92, lon: 127.54 },
+  { name: 'Hargeysa, Somalia', lat: 9.56, lon: 44.06 },
+  { name: 'Herat, Afghanistan', lat: 34.35, lon: 62.20 },
+  { name: 'Homs, Syria', lat: 34.72, lon: 36.73 },
+  { name: 'Homyel\', Belarus', lat: 52.43, lon: 30.98 },
+  { name: 'Hrodna, Belarus', lat: 53.68, lon: 23.83 },
+  { name: 'Iasi, Romania', lat: 47.17, lon: 27.60 },
+  { name: 'Ibadan, Nigeria', lat: 7.38, lon: 3.91 },
+  { name: 'Irbid, Jordan', lat: 32.56, lon: 35.85 },
+  { name: 'Isfara, Tajikistan', lat: 40.13, lon: 70.63 },
+  { name: 'Istaravshan, Tajikistan', lat: 39.91, lon: 69.00 },
+  { name: 'Jijiga, Ethiopia', lat: 9.35, lon: 42.80 },
+  { name: 'Juba, South Sudan', lat: 4.85, lon: 31.58 },
+  { name: 'Kakamega, Kenya', lat: 0.28, lon: 34.75 },
+  { name: 'Kano, Nigeria', lat: 12.00, lon: 8.52 },
+  { name: 'Kaunas, Lithuania', lat: 54.90, lon: 23.91 },
+  { name: 'Kenema, Sierra Leone', lat: 7.88, lon: -11.19 },
+  { name: 'Kigali, Rwanda', lat: -1.95, lon: 30.06 },
+  { name: 'Kingston, Jamaica', lat: 18.00, lon: -76.79 },
+  { name: 'Kitwe, Zambia', lat: -12.80, lon: 28.21 },
+  { name: 'Kosice, Slovakia', lat: 48.71, lon: 21.26 },
+  { name: 'Koutiala, Mali', lat: 12.39, lon: -5.47 },
+  { name: 'Kumasi, Ghana', lat: 6.69, lon: -1.62 },
+  { name: 'Libreville, Gabon', lat: 0.39, lon: 9.45 },
+  { name: 'Lilongwe, Malawi', lat: -13.97, lon: 33.79 },
+  { name: 'Linz, Austria', lat: 48.31, lon: 14.29 },
+  { name: 'Lome, Togo', lat: 6.13, lon: 1.22 },
+  { name: 'Lubumbashi, Democratic Republic of the Congo', lat: -11.66, lon: 27.48 },
+  { name: 'Macau, Macao', lat: 22.20, lon: 113.55 },
+  { name: 'Managua, Nicaragua', lat: 12.13, lon: -86.25 },
+  { name: 'Mandalay, Myanmar', lat: 21.97, lon: 96.08 },
+  { name: 'Maracaibo, Venezuela', lat: 10.64, lon: -71.61 },
+  { name: 'Maradi, Niger', lat: 13.50, lon: 7.10 },
+  { name: 'Maseru, Lesotho', lat: -29.32, lon: 27.48 },
+  { name: 'Mazar-e Sharif, Afghanistan', lat: 36.71, lon: 67.11 },
+  { name: 'Mbuji-Mayi, Democratic Republic of the Congo', lat: -6.14, lon: 23.59 },
+  { name: 'Minsk, Belarus', lat: 53.90, lon: 27.57 },
+  { name: 'Misratah, Libya', lat: 32.38, lon: 15.09 },
+  { name: 'Mogadishu, Somalia', lat: 2.04, lon: 45.34 },
+  { name: 'Monrovia, Liberia', lat: 6.30, lon: -10.80 },
+  { name: 'Mwanza, Tanzania', lat: -2.52, lon: 32.90 },
+  { name: 'Mzuzu, Malawi', lat: -11.47, lon: 34.02 },
+  { name: 'N\'Djamena, Chad', lat: 12.11, lon: 15.04 },
+  { name: 'Namangan, Uzbekistan', lat: 41.00, lon: 71.67 },
+  { name: 'Nampula, Mozambique', lat: -15.12, lon: 39.27 },
+  { name: 'Nassau, Bahamas', lat: 25.06, lon: -77.34 },
+  { name: 'Nay Pyi Taw, Myanmar', lat: 19.75, lon: 96.13 },
+  { name: 'Ndola, Zambia', lat: -12.96, lon: 28.64 },
+  { name: 'Niamey, Niger', lat: 13.51, lon: 2.11 },
+  { name: 'Nicosia, Cyprus', lat: 35.17, lon: 33.35 },
+  { name: 'Nis, Serbia', lat: 43.32, lon: 21.90 },
+  { name: 'Nouakchott, Mauritania', lat: 18.09, lon: -15.98 },
+  { name: 'Novi Sad, Serbia', lat: 45.25, lon: 19.84 },
+  { name: 'Nzerekore, Guinea', lat: 7.76, lon: -8.82 },
+  { name: 'Oran, Algeria', lat: 35.70, lon: -0.64 },
+  { name: 'Osh, Kyrgyzstan', lat: 40.53, lon: 72.80 },
+  { name: 'Ostrava, Czechia', lat: 49.83, lon: 18.28 },
+  { name: 'Ouagadougou, Burkina Faso', lat: 12.37, lon: -1.53 },
+  { name: 'Paramaribo, Suriname', lat: 5.87, lon: -55.17 },
+  { name: 'Plovdiv, Bulgaria', lat: 42.15, lon: 24.75 },
+  { name: 'Podgorica, Montenegro', lat: 42.44, lon: 19.26 },
+  { name: 'Pointe-Noire, Republic of the Congo', lat: -4.78, lon: 11.86 },
+  { name: 'Pokhara, Nepal', lat: 28.27, lon: 83.97 },
+  { name: 'Port-au-Prince, Haiti', lat: 18.54, lon: -72.34 },
+  { name: 'Pristina, Kosovo', lat: 42.67, lon: 21.17 },
+  { name: 'Rabat, Morocco', lat: 34.01, lon: -6.83 },
+  { name: 'San Miguel, El Salvador', lat: 13.48, lon: -88.18 },
+  { name: 'San Pedro Sula, Honduras', lat: 15.51, lon: -88.03 },
+  { name: 'San Salvador, El Salvador', lat: 13.69, lon: -89.19 },
+  { name: 'Sanaa, Yemen', lat: 15.35, lon: 44.21 },
+  { name: 'Santa Cruz de la Sierra, Bolivia', lat: -17.79, lon: -63.18 },
+  { name: 'Santiago de Cuba, Cuba', lat: 20.02, lon: -75.82 },
+  { name: 'Santiago de los Caballeros, Dominican Republic', lat: 19.45, lon: -70.69 },
+  { name: 'Sarajevo, Bosnia and Herzegovina', lat: 43.85, lon: 18.36 },
+  { name: 'Serekunda, Gambia', lat: 13.44, lon: -16.68 },
+  { name: 'Sfax, Tunisia', lat: 34.74, lon: 10.76 },
+  { name: 'Shymkent, Kazakhstan', lat: 42.31, lon: 69.60 },
+  { name: 'Sikasso, Mali', lat: 11.32, lon: -5.67 },
+  { name: 'Skopje, North Macedonia', lat: 42.00, lon: 21.43 },
+  { name: 'Sousse, Tunisia', lat: 35.83, lon: 10.64 },
+  { name: 'Taichung, Taiwan', lat: 24.15, lon: 120.68 },
+  { name: 'Taiz, Yemen', lat: 13.58, lon: 44.02 },
+  { name: 'Takeo, Cambodia', lat: 10.99, lon: 104.78 },
+  { name: 'Tamale, Ghana', lat: 9.40, lon: -0.84 },
+  { name: 'Tampere, Finland', lat: 61.50, lon: 23.79 },
+  { name: 'Tegucigalpa, Honduras', lat: 14.08, lon: -87.21 },
+  { name: 'Tirana, Albania', lat: 41.33, lon: 19.82 },
+  { name: 'Toamasina, Madagascar', lat: -18.15, lon: 49.40 },
+  { name: 'Touba, Senegal', lat: 14.86, lon: -15.88 },
+  { name: 'Trondheim, Norway', lat: 63.43, lon: 10.40 },
+  { name: 'Tuerkmenabat, Turkmenistan', lat: 39.07, lon: 63.58 },
+  { name: 'Varna, Bulgaria', lat: 43.22, lon: 27.91 },
+  { name: 'Winejok, South Sudan', lat: 9.01, lon: 27.57 },
+  { name: 'Wroclaw, Poland', lat: 51.10, lon: 17.03 },
+  { name: 'Yaounde, Cameroon', lat: 3.87, lon: 11.52 },
+  { name: 'Yei, South Sudan', lat: 4.09, lon: 30.68 },
+  { name: 'Zinder, Niger', lat: 13.81, lon: 8.99 },
 ];
 
 // Coastline data removed — using Natural Earth SVG map (/static/world-map.svg)
@@ -4015,10 +4182,13 @@ function _almRegion() {
   return '';
 }
 
-function _applyRegionHolidays(region, year, month, add) {
+function _applyRegionHolidays(region, year, month, add, worldwide) {
   var pack = _REGION_HOLIDAYS[region];
   if (!pack) return;
-  var src = _almRegionName(region);
+  // Region-scoped: the caption already names the country, so each entry's tag is
+  // just its colour. Worldwide: 18 packs at once, so every entry carries a
+  // compact country code ("Bastille Day · FR") to say whose day it is.
+  var src = worldwide ? region : _almRegionName(region);
   var i;
   for (i = 0; i < (pack.fixed || []).length; i++) {
     var fx = pack.fixed[i];
@@ -4030,6 +4200,9 @@ function _applyRegionHolidays(region, year, month, add) {
     var day = nh[2] === -1 ? _lastWeekday(year, month, nh[1]) : _nthWeekday(year, month, nh[1], nh[2]);
     add(day, nh[3], 'holiday', '', src, region);
   }
+  // Clock changes are location-specific; layering 18 countries' worth would be
+  // pure noise, so only the single region-scoped pack contributes them.
+  if (worldwide) return;
   // Clock changes: labels hold both hemispheres (October IS spring in AU)
   var dst = pack.dst;
   if (dst === 'us') {
@@ -4041,6 +4214,16 @@ function _applyRegionHolidays(region, year, month, add) {
   } else if (dst === 'au') {
     if (month === 10) add(_nthWeekday(year, 10, 0, 1), 'Clocks Forward', 'seasonal');
     if (month === 4) add(_nthWeekday(year, 4, 0, 1), 'Clocks Back', 'seasonal');
+  }
+}
+
+// Worldwide scope: layer every national pack (skipping the EU pseudo-region,
+// which carries no national days of its own — only a DST rule). Each entry is
+// tagged with its ISO country code via the worldwide path of _applyRegionHolidays.
+function _applyAllRegionHolidays(year, month, add) {
+  for (var iso in _REGION_HOLIDAYS) {
+    if (iso === 'EU') continue;
+    _applyRegionHolidays(iso, year, month, add, true);
   }
 }
 
@@ -4167,8 +4350,10 @@ function _gregorianBaseEvents(year, month, add) {
     // (US, CA, AU, DE, IT, BR, IN, CN, JP and others)
     if (month === 5) { add(_nthWeekday(year, 5, 0, 2), t('hol_mothers_day'), 'holiday'); }
     if (month === 6) { add(_nthWeekday(year, 6, 0, 3), t('hol_fathers_day'), 'holiday'); }
-    // National days + clock changes for the detected region
-    _applyRegionHolidays(_almRegion(), year, month, add);
+    // National days: every pack when Worldwide is chosen, else the detected
+    // region's (which also contributes its clock changes).
+    if (_almHolidayScope() === 'worldwide') _applyAllRegionHolidays(year, month, add);
+    else _applyRegionHolidays(_almRegion(), year, month, add);
     // Easter and related
     var easter = _computeEaster(year);
     if (easter.month === month) { add(easter.day, 'Easter', 'holiday'); }
@@ -4385,7 +4570,10 @@ function _drawAlmanacGrid() {
     for (var ei = 0; ei < shown; ei++) {
       var ev = dayEvents[ei];
       var escapedLabel = _th(ev.label).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-      var srcTitle = ev.src ? ' title="' + _tLookup('alm_region_holiday', '{c} holiday').replace('{c}', ev.src).replace(/"/g, '&quot;') + '"' : '';
+      // Worldwide entries carry a 2-letter ISO code as src; expand it to the full
+      // country name for the tooltip ("France holiday", not "FR holiday").
+      var srcName = (ev.src && ev.src.length === 2) ? (_almRegionName(ev.src) || ev.src) : ev.src;
+      var srcTitle = ev.src ? ' title="' + _tLookup('alm_region_holiday', '{c} holiday').replace('{c}', srcName).replace(/"/g, '&quot;') + '"' : '';
       // Country-specific holidays (those with a region src) get their own
       // colour so they read apart from the worldwide observances (#33).
       var evCls = 'alm-ev alm-ev-' + ev.type + (ev.src ? ' alm-ev-country' : '');
@@ -4404,6 +4592,23 @@ function _drawAlmanacGrid() {
     html += '<div class="alm-cell alm-empty"></div>';
   }
   html += '</div>';
+
+  // Holiday scope pill — centered directly under the calendar grid it filters.
+  // A two-segment pill (Regional/Worldwide) sets the scope; the location
+  // affordance lives on the sun-map, so no caption here. Gregorian only — the
+  // national packs are keyed to Gregorian month/day, not other systems.
+  if (_almSystem === 'gregorian') {
+    var scope = _almHolidayScope();
+    html += '<div class="alm-hol-row">' +
+      '<div class="alm-scope-seg" role="tablist" aria-label="' +
+        _tLookup('alm_scope_toggle_hint', 'Switch between your region and every country').replace(/"/g, '&quot;') + '">' +
+        '<button type="button" class="alm-scope-btn' + (scope === 'region' ? ' active' : '') + '" role="tab" aria-selected="' + (scope === 'region') + '" onclick="_almSetHolidayScope(\'region\')">' +
+          _tLookup('alm_scope_regional', 'Regional') + '</button>' +
+        '<button type="button" class="alm-scope-btn' + (scope === 'worldwide' ? ' active' : '') + '" role="tab" aria-selected="' + (scope === 'worldwide') + '" onclick="_almSetHolidayScope(\'worldwide\')">' +
+          _tLookup('alm_scope_worldwide', 'Worldwide') + '</button>' +
+      '</div>' +
+      '</div>';
+  }
 
   // Selected day detail — full event list for the selected day
   var selCal = _jdnToCalendar(_almSystem, _almSelectedJDN);
@@ -4424,19 +4629,6 @@ function _drawAlmanacGrid() {
       }
       html += '</div>';
     }
-  }
-
-  // Quiet caption saying whose national days are shown. Always present on
-  // the Gregorian calendar — no pack means the worldwide set, and saying
-  // so beats an unexplained absence of holidays.
-  if (_almSystem === 'gregorian') {
-    var regionName = _almRegionName(_almRegion());
-    var capText = regionName
-      ? _tLookup('alm_showing_holidays', 'Showing {c} holidays').replace('{c}', regionName.replace(/</g, '&lt;'))
-      : _tLookup('alm_showing_worldwide', 'Showing worldwide holidays');
-    html += '<div class="alm-cal-region" title="' +
-      _tLookup('alm_holidays_follow_hint', 'Follows your location on the map').replace(/"/g, '&quot;') +
-      '">' + capText + '</div>';
   }
 
   // Cross-reference — selected date in all calendar systems (replaces pills)
