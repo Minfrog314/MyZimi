@@ -554,7 +554,22 @@ def get_mirror_status() -> dict:
             _disc.is_share_enabled() and _disc.advertised_ip_looks_unreachable()
         ),
         "progress": _mirror_progress_snapshot(),
+        # When the offline catalog copy was last written (file mtime of the
+        # persisted OPDS cache). It refreshes on any catalog revalidation and
+        # on every 12h maintenance pass — the same pass that keeps the mirror
+        # seeds and .torrent archive current, so it's the honest "backup
+        # updated" time the settings UI shows. 0 = no copy yet.
+        "catalog_backup_ts": _catalog_backup_ts(),
     }
+
+
+def _catalog_backup_ts() -> int:
+    try:
+        from zimi import library as _lib
+
+        return int(os.path.getmtime(_lib._catalog_cache_path()))
+    except Exception:
+        return 0
 
 
 def _mirror_progress_snapshot() -> dict:
@@ -658,6 +673,17 @@ _lt_import_failed = False
 # balloon memory. Real Kiwix .torrent files are tens of KB.
 TORRENT_FETCH_TIMEOUT_S = 30
 TORRENT_FETCH_MAX_BYTES = 10 * 1024 * 1024
+
+
+def _user_agent():
+    """Zimi's identifying User-Agent (lazy import avoids a module cycle)."""
+    try:
+        from zimi import library as _lib
+
+        return _lib.USER_AGENT
+    except Exception:
+        return "Zimi"
+
 
 # How long the alert pump blocks per iteration. Also the unit the fastresume
 # checkpoint cadence counts in, so the two must be read together.
@@ -1003,7 +1029,7 @@ class LibtorrentBackend(BTBackend):
         session. Holding the full metadata up front is what makes 'complete'
         unambiguously mean the *content* is complete — a two-phase add can
         report complete on metadata alone and hand back a truncated ZIM."""
-        req = urllib.request.Request(url, headers={"User-Agent": "zimi"})
+        req = urllib.request.Request(url, headers={"User-Agent": _user_agent()})
         with urllib.request.urlopen(req, timeout=TORRENT_FETCH_TIMEOUT_S) as resp:
             data = resp.read(TORRENT_FETCH_MAX_BYTES + 1)
         if len(data) > TORRENT_FETCH_MAX_BYTES:

@@ -21,6 +21,12 @@ var SK = {
   LIBRARY_VIEW: 'zimi_library_view',
   BROWSE_HISTORY: 'zimi_browse_history',
   BOOKMARKS: 'zimi_bookmarks',
+  // Bookmark folders (v2) — array of {id,name,parent,order}. Root is implicit
+  // (a bookmark/folder with parent null|"" is top-level). Rides in the same
+  // /userdata + My-data backup blob as BOOKMARKS.
+  BM_FOLDERS: 'zimi_bm_folders',
+  // Per-device UI state: ids of collapsed folders in the bookmarks tree.
+  BM_COLLAPSED: 'zimi_bm_collapsed',
   MANAGE_PW: 'zimi_manage_pw',
   // Optional management username (v1.8) — a plain identifier, stored next to
   // the token so a remembered session keeps sending its X-Zimi-User header.
@@ -194,10 +200,19 @@ var _ARTICLE_DARKEN_STYLE_ID = 'zimi-article-darken';
 var _ARTICLE_DARKEN_CSS = [
   'html{background:#ffffff !important;filter:invert(1) hue-rotate(180deg) !important;',
     '-webkit-filter:invert(1) hue-rotate(180deg) !important}',
+  // Counter-invert media + anything painting its own image so photos, diagrams,
+  // maps and icons keep true colour under the root flip.
   'img,video,picture,canvas,svg,image,embed,object,iframe,',
-  '[style*="background-image"],.mwe-math-element,.mwe-math-fallback-image-inline,',
-  '.mwe-math-fallback-image-display{filter:invert(1) hue-rotate(180deg) !important;',
-    '-webkit-filter:invert(1) hue-rotate(180deg) !important}'
+  '[style*="background-image"]{filter:invert(1) hue-rotate(180deg) !important;',
+    '-webkit-filter:invert(1) hue-rotate(180deg) !important}',
+  // MediaWiki math is black line-art on a TRANSPARENT ground — an <img> fallback
+  // (caught by the img rule above) or an inline <svg>. It must invert WITH the
+  // page like text, NOT be counter-inverted, or the glyphs stay black on the dark
+  // page and vanish. filter:none here leaves only the root flip → white glyphs.
+  // Outranks the generic img/svg counter-invert by class specificity.
+  '.mwe-math-element,.mwe-math-element img,.mwe-math-element svg,',
+  '.mwe-math-fallback-image-inline,.mwe-math-fallback-image-display{',
+    'filter:none !important;-webkit-filter:none !important}'
 ].join('');
 // A page "declares its own dark scheme" (so we must NOT invert it, or we'd flip it
 // back to blinding white) when it opts into dark via <meta name="color-scheme">
@@ -426,9 +441,7 @@ let _declaredSections = [];
 const OTHER_CAT = '__other__';
 // The reserved section-order key for the Other section (server mirrors it).
 const OTHER_KEY = 'other';
-// Deep-link state for the manage reorder panel: expand it on next render, and
-// which ms-nav section to jump to after the (async) manage view mounts.
-let _reorderAutoExpand = false;
+// Which ms-nav section to jump to after the (async) manage view mounts.
 let _pendingMsSection = null;
 
 // Single reader of /list — normalizes the additive ?layout=1 envelope
@@ -436,7 +449,7 @@ let _pendingMsSection = null;
 // stashes the section order as a side effect. Older/plain array responses still
 // work (section order simply stays empty).
 async function _fetchList() {
-  const r = await fetch('/list?layout=1');
+  const r = await serverFetch('/list?layout=1');
   const data = await r.json();
   if (Array.isArray(data)) { _sectionOrder = []; _declaredSections = []; return data; }
   _sectionOrder = Array.isArray(data.section_order) ? data.section_order : [];
@@ -504,6 +517,23 @@ function t(key, vars) {
 // HTML-escaped version of t() for use in innerHTML/attribute contexts
 function tH(key, vars) {
   return t(key, vars).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+// Localized pluralization: picks "<base>_<category>" via Intl.PluralRules for
+// the active UI language, falling back to "<base>_other" when that category
+// key does not exist. Locale files currently ship only _one/_other; languages
+// with richer plural categories (ru few/many, ar, he...) resolve to _other
+// until per-category keys are added. {n} is injected automatically.
+function tPlural(base, n, vars) {
+  var cat = 'other';
+  try { cat = new Intl.PluralRules(_currentLang).select(Number(n) || 0); } catch (e) {}
+  var key = base + '_' + cat;
+  if (_i18n[key] === undefined && _i18nFallback[key] === undefined) key = base + '_other';
+  var v = { n: n };
+  if (vars) for (var k in vars) v[k] = vars[k];
+  return t(key, v);
+}
+function tPluralH(base, n, vars) {
+  return tPlural(base, n, vars).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 function _loadingHtml(key) { return '<div class="loading"><span class="spinner-inline"></span>' + tH(key || 'loading') + '</div>'; }
 
@@ -664,6 +694,13 @@ function _zimCountHtml(z) {
   const n = (z && typeof z.article_count === 'number') ? z.article_count : (z ? z.entries : undefined);
   return typeof n === 'number' ? t('n_entries', {n: n.toLocaleString()}) : '';
 }
+// True for ZIMs Zimi itself exported (bookmark exports). Server flags them
+// from Creator metadata; the description sniff covers caches built before the
+// flag existed. Their cards show the full creation date — for an export,
+// "when did I make this" is the date that matters.
+function _isZimiExport(z) {
+  return !!(z && (z.zimi_export || /exported by Zimi/.test(z.description || '')));
+}
 // ── DOM refs ──
 const q = document.getElementById('q');
 const output = document.getElementById('output');
@@ -765,7 +802,13 @@ function userLogout() {
 
 // Reload the library after a login/logout so the filtered view is reflected.
 async function _refreshAfterAuthChange() {
-  try { zimsCache = await _fetchList(); _rebuildZimsMap(); } catch (e) { zimsCache = []; }
+  try { zimsCache = await _fetchList(); _rebuildZimsMap(); _libraryKnown = true; }
+  catch (e) {
+    zimsCache = [];
+    _libraryKnown = false;
+    _noteConn(_isOfflineError(e) ? CONN_OFFLINE : CONN_ERROR);
+    _renderConnBanner();
+  }
   if (typeof goHome === 'function') goHome();
   else route(false);
 }
@@ -786,13 +829,16 @@ async function _bootAuthGate() {
   if (!_manageToken) { var saved = _readManageToken(); if (saved) _manageToken = saved; }
   var j;
   try {
-    var r = await fetch('/whoami', {
+    var r = await serverFetch('/whoami', {
       credentials: 'same-origin',
       headers: _manageToken ? _authHeaders() : {},
     });
     j = await r.json();
   } catch (e) {
-    return false;  // network hiccup — fall through to the normal boot
+    // Unreachable server: we cannot know whether this instance is private, so
+    // we do NOT gate. Fall through to the normal boot, where /list will fail
+    // the same way and the offline state (not a fake empty library) paints.
+    return false;
   }
   // First-login hint: the server only sends this when the default username
   // ("admin") applies (no custom username, no named users). The login modal
@@ -1241,6 +1287,246 @@ function updateFooter() {
   }
 }
 
+// ── Connection state ──
+//
+// Absence of data is not data. The PWA shell is service-worker cached, so it
+// boots perfectly well with a dead backend; before this, every data fetch that
+// failed fell into the same `catch { zimsCache = [] }` as a server that
+// genuinely answered "you have zero ZIMs", and home rendered a confident "No
+// knowledge sources found". That reads as "my library was wiped".
+//
+// Every server exchange is classified into exactly one of three states:
+//   'online'  — the server answered. ANY HTTP status counts, including 401/403
+//               /404/500: an answer is an answer, and the auth gate owns 401.
+//   'offline' — the request never reached the server: fetch threw at the
+//               network layer, or the service worker returned its synthetic
+//               offline response (X-Zimi-Offline) in place of one.
+//   'error'   — the server answered but the payload was unusable (malformed
+//               JSON, unexpected shape). Rare, and still not "you own nothing".
+// Auth-gating is deliberately NOT a connection state: _bootAuthGate owns it.
+const CONN_OK = 'online', CONN_OFFLINE = 'offline', CONN_ERROR = 'error';
+// Reconnect probe backoff, ms. Capped so a long outage settles into a cheap
+// 30s heartbeat rather than hammering a server that may be mid-restart.
+const CONN_PROBE_STEPS = [3000, 5000, 10000, 20000, 30000];
+let _connState = CONN_OK;
+// False once an attempt to load /list failed for ANY reason. Gates every
+// "no ZIMs" claim in the UI: we only assert an empty library when the server
+// actually told us it was empty.
+let _libraryKnown = true;
+let _connProbeTimer = null;
+let _connProbeStep = 0;
+let _connProbeSeq = 0;
+let _connRecovering = false;
+
+// Tagged error meaning "never reached the server". Thrown by serverFetch so
+// callers can branch on cause without re-sniffing the failure.
+function _offlineError() {
+  const e = new Error('zimi-offline');
+  e.zimiOffline = true;
+  return e;
+}
+function _isOfflineError(e) { return !!(e && e.zimiOffline); }
+
+// The service worker's stand-in for an answer, not an answer from the server.
+function _isOfflineResponse(res) {
+  if (!res) return false;
+  try {
+    if (res.headers.get('X-Zimi-Offline') === '1') return true;
+    // Older cached SW without the header: its offline page is the only 503 that
+    // returns HTML from an endpoint the app only ever asks for JSON.
+    return res.status === 503 && (res.headers.get('Content-Type') || '').indexOf('text/html') === 0;
+  } catch (e) { return false; }
+}
+
+// Mirrors sw.js NETWORK_ONLY_PREFIXES. A 200 from any OTHER route may have come
+// out of the service worker's cache, which proves nothing about the server being
+// up — it is exactly how a dead backend came to look reachable. Only these
+// routes (and the cache-busted /health probe) can promote the state to online.
+const _LIVE_PROOF_PREFIXES = ['/whoami', '/login', '/logout', '/list', '/search', '/suggest', '/random'];
+function _isLiveProof(url) {
+  const p = String(url).split('?')[0];
+  for (let i = 0; i < _LIVE_PROOF_PREFIXES.length; i++) {
+    const pre = _LIVE_PROOF_PREFIXES[i];
+    if (p === pre || p.indexOf(pre + '/') === 0) return true;
+  }
+  return String(url).indexOf('/health?ping=') === 0;
+}
+
+// The single front door for anything that talks to the Zimi server. Classifies
+// the outcome (updating the banner as a side effect) and throws a tagged
+// offline error rather than letting an unreachable server masquerade as data.
+//
+// The classification is deliberately asymmetric: a failure ALWAYS proves the
+// server is unreachable (nothing else produces the SW's offline response), but a
+// success only proves it when the route could not have been served from cache.
+async function serverFetch(url, opts) {
+  let res;
+  try {
+    res = await fetch(url, opts);
+  } catch (e) {
+    _noteConn(CONN_OFFLINE);
+    throw _offlineError();
+  }
+  if (_isOfflineResponse(res)) {
+    _noteConn(CONN_OFFLINE);
+    throw _offlineError();
+  }
+  if (_isLiveProof(url)) _noteConn(CONN_OK);
+  return res;
+}
+
+// Record the outcome of a server exchange. Transitions drive the banner and,
+// on a fall to offline, start the reconnect probe.
+function _noteConn(state) {
+  if (state === _connState) {
+    // Still online and the library is stale-unknown from an earlier outage
+    // (e.g. only /list failed): keep probing until the library is back.
+    if (state === CONN_OK && !_libraryKnown && !_connProbeTimer) _scheduleConnProbe();
+    return;
+  }
+  _connState = state;
+  if (state === CONN_OK) {
+    _stopConnProbe();
+    _renderConnBanner();
+  } else {
+    _renderConnBanner();
+    _scheduleConnProbe();
+  }
+}
+
+// ── Connection banner ──
+// Calm, persistent, non-blocking. Sits between the topbar and the content (it
+// pushes rather than overlays, so cached articles and the almanac stay fully
+// readable) and offers an explicit Retry alongside the automatic probe.
+function _connBannerEl() {
+  let el = document.getElementById('conn-banner');
+  if (el) return el;
+  el = document.createElement('div');
+  el.id = 'conn-banner';
+  el.className = 'conn-banner';
+  el.setAttribute('role', 'status');
+  el.setAttribute('aria-live', 'polite');
+  document.body.appendChild(el);
+  return el;
+}
+
+function _renderConnBanner() {
+  const offline = _connState !== CONN_OK;
+  if (!offline && _libraryKnown) {
+    const existing = document.getElementById('conn-banner');
+    if (existing) existing.remove();
+    document.documentElement.style.setProperty('--conn-h', '0px');
+    return;
+  }
+  const el = _connBannerEl();
+  // Server answered but we still can't show the library: a different, honest
+  // sentence from "no network at all".
+  const msgKey = _connState === CONN_OFFLINE ? 'conn_offline_msg'
+    : (_connState === CONN_ERROR ? 'conn_error_msg' : 'conn_library_stale_msg');
+  el.innerHTML =
+    '<span class="conn-dot" aria-hidden="true"></span>' +
+    '<span class="conn-msg">' + tH(msgKey) + '</span>' +
+    '<button type="button" class="conn-retry" onclick="_connRetryClick(this)">' + tH('conn_retry') + '</button>';
+  _syncConnBannerHeight();
+}
+
+// The banner's height is content-dependent (it wraps on narrow screens), so the
+// layout offset every under-topbar surface uses is measured, not assumed.
+function _syncConnBannerHeight() {
+  const el = document.getElementById('conn-banner');
+  const h = el ? el.offsetHeight : 0;
+  document.documentElement.style.setProperty('--conn-h', h + 'px');
+}
+
+function _connRetryClick(btn) {
+  if (btn) { btn.disabled = true; btn.textContent = t('conn_retrying'); }
+  _connProbeStep = 0;
+  _connProbeNow();
+}
+
+function _stopConnProbe() {
+  if (_connProbeTimer) { clearTimeout(_connProbeTimer); _connProbeTimer = null; }
+  _connProbeStep = 0;
+}
+
+function _scheduleConnProbe() {
+  if (_connProbeTimer) return;
+  const delay = CONN_PROBE_STEPS[Math.min(_connProbeStep, CONN_PROBE_STEPS.length - 1)];
+  _connProbeTimer = setTimeout(function() {
+    _connProbeTimer = null;
+    _connProbeStep++;
+    _connProbeNow();
+  }, delay);
+}
+
+// One reachability check. The cache-busting query is deliberate: /health is a
+// network-first route, so a plain request could be answered from the SW cache
+// and report a dead server as alive.
+async function _connProbeNow() {
+  if (_connRecovering) return;
+  const seq = ++_connProbeSeq;
+  _connRecovering = true;
+  let reachable = false;
+  try {
+    await serverFetch('/health?ping=' + Date.now(), { cache: 'no-store' });
+    reachable = true;
+  } catch (e) {
+    reachable = false;
+  }
+  _connRecovering = false;
+  if (seq !== _connProbeSeq) return;  // superseded by a newer probe
+  if (!reachable) { _renderConnBanner(); _scheduleConnProbe(); return; }
+  await _connRecover();
+}
+
+// The server is back. Reload the library and repaint whatever the user is
+// looking at, so recovery needs no manual reload.
+async function _connRecover() {
+  const hadLibrary = _libraryKnown;
+  try {
+    zimsCache = await _fetchList();
+    _rebuildZimsMap();
+    _libraryKnown = true;
+  } catch (e) {
+    _noteConn(_isOfflineError(e) ? CONN_OFFLINE : CONN_ERROR);
+    _scheduleConnProbe();
+    return;
+  }
+  _stopConnProbe();
+  _renderConnBanner();
+  if (!hadLibrary) {
+    // Only announce when something actually changed on screen.
+    _showToast(t('conn_restored'));
+    if (mode === 'manage') renderInstalled();
+    else if (!readerOpen && !currentSource && !readerSource) renderHome();
+  }
+}
+
+// Browser-level connectivity events are a hint, not the truth (a laptop can be
+// on Wi-Fi with the Zimi server down, or offline-flagged yet reachable on LAN),
+// so a regain triggers a probe rather than clearing the banner outright.
+function _bindConnEvents() {
+  window.addEventListener('online', function() { _connProbeStep = 0; _connProbeNow(); });
+  window.addEventListener('offline', function() { _noteConn(CONN_OFFLINE); });
+  document.addEventListener('visibilitychange', function() {
+    if (!document.hidden && (_connState !== CONN_OK || !_libraryKnown)) {
+      _connProbeStep = 0;
+      _connProbeNow();
+    }
+  });
+  window.addEventListener('resize', _syncConnBannerHeight);
+}
+
+// Shared honest-empty markup for any surface that would otherwise assert "no
+// ZIMs" while _libraryKnown is false.
+function _libraryUnavailableHtml() {
+  return '<div class="empty conn-empty">' +
+    '<p>' + tH('library_unavailable') + '</p>' +
+    '<p class="hint">' + tH('library_unavailable_hint') + '</p>' +
+    '<button type="button" class="conn-retry conn-retry-inline" onclick="_connRetryClick(this)">' + tH('conn_retry') + '</button>' +
+    '</div>';
+}
+
 // ── Init ──
 async function init() {
   // Re-apply the app theme (the head bootstrap already stamped it pre-paint) and
@@ -1261,11 +1547,27 @@ async function init() {
   // shown gate reloads the page on successful sign-in, so we stop the boot here.
   if (await _bootAuthGate()) return;
 
+  // Learn manage-auth state in parallel with /list. /manage/has-password is a
+  // cheap, lock-free endpoint, so this resolves long before /list on a large
+  // library — the gear is then live the moment the library paints instead of
+  // dead until the whole boot finishes (#44). _initSecondary reuses this probe.
+  _manageProbe = _probeManageAuth();
+
+  _bindConnEvents();
   output.innerHTML = '<div class="loading"><span class="spinner-inline"></span>' + tH('loading_library') + '</div>';
-  // Only block on /list — everything else loads in background
+  // Only block on /list — everything else loads in background.
+  // A failure here must NOT collapse into "the library is empty": zimsCache
+  // stays a safe [] for the hundreds of call sites that iterate it, but
+  // _libraryKnown records that the emptiness is our ignorance, not a fact.
   try {
     zimsCache = await _fetchList();
-  } catch(e) { zimsCache = []; }
+    _libraryKnown = true;
+  } catch(e) {
+    zimsCache = [];
+    _libraryKnown = false;
+    _noteConn(_isOfflineError(e) ? CONN_OFFLINE : CONN_ERROR);
+    _renderConnBanner();
+  }
   _rebuildZimsMap();
   // Migrate bookmarks if ZIM names changed
   _migrateBookmarks();
@@ -1286,11 +1588,15 @@ async function init() {
 // pollers await this so they never fire an unauthenticated request (a 401
 // resource error in the console) during the bootstrap race.
 let _manageProbe = null;
+// True once _probeManageAuth has finished at least once — lets enterManage
+// tell "manage genuinely disabled" (bail) apart from "state not known yet"
+// (open on demand). See #44.
+let _manageProbed = false;
 
 async function _probeManageAuth() {
   try {
     // Public pre-auth endpoint — learns password state without a 401 probe.
-    const hres = await fetch('/manage/has-password');
+    const hres = await serverFetch('/manage/has-password');
     if (!hres.ok) { manageEnabled = false; return; }  // 404 = manage disabled
     manageEnabled = true;
     const h = await hres.json();
@@ -1317,13 +1623,17 @@ async function _probeManageAuth() {
       _managePwRequired = true;
     }
   } catch (e) {}
+  finally { _manageProbed = true; }
 }
 
 async function _initSecondary() {
   var needsRerender = false;
-  _manageProbe = _probeManageAuth().then(() => { needsRerender = true; });
+  // Reuse the probe init() already kicked off in parallel with /list; only
+  // start one here if that didn't run (e.g. a code path that skips init()).
+  if (!_manageProbe) _manageProbe = _probeManageAuth();
+  var _probeDone = _manageProbe.then(() => { needsRerender = true; });
   await Promise.allSettled([
-    _manageProbe,
+    _probeDone,
     // Collections/favorites
     fetch('/collections').then(async cres => {
       if (cres.ok) { collectionsCache = await cres.json(); needsRerender = true; }
@@ -1348,18 +1658,29 @@ async function _initSecondary() {
     enterManage(null, _validMsSection(params.get('manage')));
     return;
   }
-  // Re-render homepage if manage/collections changed (adds collection sections, manage button)
-  if (needsRerender && !readerOpen && !currentSource && !readerSource) renderHome();
+  // Re-render homepage if manage/collections changed (adds collection sections,
+  // manage button). Not while manage is open: on a slow library the gear can be
+  // used long before this resolves, and painting home over it leaves the manage
+  // chrome (X button, catalog placeholder) on top of the home view.
+  if (needsRerender && mode !== 'manage' && !readerOpen && !currentSource && !readerSource) renderHome();
 }
 
 function route(push) {
   const path = location.pathname;
   const search = location.search;
   const params = new URLSearchParams(search);
-  // Restore Almanac on reload if #almanac hash is present
+  // Restore Almanac on reload if #almanac hash is present. The head bootstrap
+  // already stamped html.almanac-boot, so the home render below stays invisible
+  // and the dark almanac shell is what the first paint shows.
   if (location.hash === '#almanac') {
     enterHome(false);
     openAlmanac(true);
+    // Backstop: if the almanac never comes up (a module error mid-parse slips
+    // past the loader's onerror), drop the boot gate so the library isn't left
+    // permanently hidden behind an empty shell.
+    setTimeout(function () {
+      if (!_almanacOpen) document.documentElement.classList.remove('almanac-boot');
+    }, 8000);
     return;
   }
   if (params.get('manage') !== null && manageEnabled) { enterManage(null, _validMsSection(params.get('manage'))); return; }
@@ -1827,17 +2148,6 @@ function _ciGearClick(btn) {
   _openZimMenu(btn.dataset.zim, r.left, r.bottom + 2, true);
 }
 
-// Deep-link from the card menu to the manage reorder panel (expanded).
-function _openReorderPanel() {
-  _reorderAutoExpand = true;
-  if (mode === 'manage' && manageTab === 'settings') {
-    switchMs('library');
-  } else {
-    _pendingMsSection = 'library';
-    enterManage();
-  }
-}
-
 // Tag glyph marking a category reorder row, so collections (layers glyph) and
 // categories read as different kinds of section at a glance while sharing one list.
 var _CATEGORY_GLYPH = '<svg class="reorder-type-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg>';
@@ -2182,6 +2492,15 @@ document.addEventListener('touchcancel', _reorderTouchEnd);
 
 // ── Render: Home ──
 function renderHome(filter) {
+  // We could not ask the server. Say so — never "No knowledge sources found",
+  // which reads as "your library was wiped". Discover is skipped too: its cards
+  // are drawn from the (unknown) installed set.
+  if (!_libraryKnown) {
+    statsBar.innerHTML = ''; statsBar.style.display = 'none';
+    pillsBar.innerHTML = ''; pillsBar.style.display = 'none'; pillsBar.className = 'pills';
+    output.innerHTML = _libraryUnavailableHtml();
+    return;
+  }
   if (!zimsCache || zimsCache.length === 0) {
     statsBar.innerHTML = ''; statsBar.style.display = 'none';
     pillsBar.innerHTML = ''; pillsBar.style.display = 'none'; pillsBar.className = 'pills';
@@ -2732,6 +3051,7 @@ function renderCardGrid(items, showStars, showCategory) {
         (z.description ? '<div class="desc">' + esc(z.description) + '</div>' : '') +
         '<div class="detail">' + catPrefix + _zimCountHtml(z) +
         ' &middot; ' + fmtSize(z.size_gb) +
+        (_isZimiExport(z) && z.date ? ' &middot; ' + esc(z.date) : '') +
         '</div>' +
       '</div></div>';
   }).join('') + '</div>';
@@ -2872,6 +3192,31 @@ function _renderMoonSprite(illumFrac, waxing, sizePx) {
   return url;
 }
 
+// The unshaded source pixels for a sprite size — the moon photo (or, before it
+// loads, a neutral grey disc) rasterized at N and read back ONCE per size.
+// _moonSpriteCanvas used to drawImage + getImageData per phase bucket; the
+// readback is a GPU sync stall (WebKit measured ~6.6ms/bucket at 128px, ~100
+// buckets on a cold fast lever throw). Shading now copies these cached pixels,
+// so a new bucket costs only the JS shading loop + one putImageData.
+var _moonTexBaseCache = {};
+function _moonTexBaseData(N) {
+  var key = N + (_moonTexReady ? 't' : '');
+  if (_moonTexBaseCache[key]) return _moonTexBaseCache[key];
+  var cv = document.createElement('canvas');
+  cv.width = cv.height = N;
+  var ctx = cv.getContext('2d', { willReadFrequently: true });
+  // Same-origin photo, so getImageData won't taint.
+  if (_moonTexReady) {
+    ctx.drawImage(_MOON_TEX, 0, 0, N, N);
+  } else {
+    ctx.fillStyle = '#b8b4aa';
+    ctx.beginPath(); ctx.arc(N / 2, N / 2, N / 2, 0, Math.PI * 2); ctx.fill();
+  }
+  var img = ctx.getImageData(0, 0, N, N);
+  _moonTexBaseCache[key] = img;
+  return img;
+}
+
 // The shaded moon as a <canvas> (cached) — the sky scene draws it directly so
 // its dark side shows the same earthshine as the hero, not a black shadow.
 var _moonSpriteCanvasCache = {};
@@ -2890,15 +3235,8 @@ function _moonSpriteCanvas(illumFrac, waxing, sizePx) {
   var cv = document.createElement('canvas');
   cv.width = cv.height = N;
   var ctx = cv.getContext('2d');
-  // Base: the moon photo (same-origin, so getImageData won't taint). Before it
-  // loads, a neutral grey disc so the shape is still right.
-  if (_moonTexReady) {
-    ctx.drawImage(_MOON_TEX, 0, 0, N, N);
-  } else {
-    ctx.fillStyle = '#b8b4aa';
-    ctx.beginPath(); ctx.arc(N / 2, N / 2, N / 2, 0, Math.PI * 2); ctx.fill();
-  }
-  var img = ctx.getImageData(0, 0, N, N);
+  var base = _moonTexBaseData(N);
+  var img = new ImageData(new Uint8ClampedArray(base.data), N, N);
   var data = img.data;
 
   // Sun direction: phase angle P from illuminated fraction (k = (1+cosP)/2).
@@ -2946,7 +3284,7 @@ function _moonSpriteCanvas(illumFrac, waxing, sizePx) {
 // untilted so it's phase-cacheable; orientation is a whole-disc rotation).
 function _renderMoonHTML(m, wrapClass, tiltDeg) {
   var illumFrac = m.illumination / 100;
-  var waxing = m.phase < 0.5;
+  var waxing = _moonIsWaxing(m);
   var isHero = wrapClass === 'almanac-moon';
   var size = isHero ? 200 : 48;
   var url = _renderMoonSprite(illumFrac, waxing, size);
@@ -2977,28 +3315,77 @@ function _repaintMoons() {
   }
 }
 
-// Lightweight parallactic angle for Today card (runs before almanac.js loads).
-// Uses same math as _moonPosition but only computes the tilt angle.
-function _quickMoonTilt(date) {
+// ── Canonical moon orientation — ONE derivation for every renderer ──
+// The hero disc (almanac.js _heroMoonTiltDeg), the sky-scene moon
+// (almanac-sky.js) and the Today discover card (below) must all show the SAME
+// moon for the same instant and place. They all rotate the same untilted
+// sprite (lit limb at 3 o'clock when waxing) by the screen tilt computed here:
+// -(chi - q) - 90, where chi is the bright-limb position angle (Meeus 48.5)
+// and q the parallactic angle. This lives in app.js because the Today card
+// renders before almanac.js loads; almanac.js delegates to it.
+
+// Geocentric equatorial coordinates of the Moon — the same orbital-element
+// evaluation _moonPosition (almanac.js) starts from, hoisted here so the two
+// files cannot drift apart.
+function _moonEqCoords(date) {
   var JD = 2440587.5 + date.getTime() / 86400000;
   var T = (JD - 2451545.0) / 36525;
   var D2R = Math.PI / 180;
-  var L0 = (218.3165 + 481267.8813 * T) % 360;
-  var M  = (134.9634 + 477198.8676 * T) % 360;
-  var Ms = (357.5291 + 35999.0503 * T) % 360;
-  var F  = (93.2720  + 483202.0175 * T) % 360;
-  var D  = (297.8502 + 445267.1115 * T) % 360;
-  var lng = L0 + 6.289*Math.sin(M*D2R) - 1.274*Math.sin((2*D-M)*D2R) - 0.658*Math.sin(2*D*D2R);
-  var lat_ec = 5.128*Math.sin(F*D2R);
-  var eps = 23.44 * D2R, lngR = lng*D2R, latR = lat_ec*D2R;
-  var dec = Math.asin(Math.sin(latR)*Math.cos(eps) + Math.cos(latR)*Math.sin(eps)*Math.sin(lngR));
-  var ra = Math.atan2(Math.sin(lngR)*Math.cos(eps) - Math.tan(latR)*Math.sin(eps), Math.cos(lngR));
+  var L0 = (218.3165 + 481267.8813 * T) % 360;   // mean longitude
+  var M  = (134.9634 + 477198.8676 * T) % 360;   // mean anomaly
+  var Ms = (357.5291 +  35999.0503 * T) % 360;   // sun mean anomaly
+  var F  = (93.2720  + 483202.0175 * T) % 360;   // argument of latitude
+  var D  = (297.8502 + 445267.1115 * T) % 360;   // mean elongation
+  var lng = L0
+    + 6.289 * Math.sin(M * D2R)
+    - 1.274 * Math.sin((2 * D - M) * D2R)
+    - 0.658 * Math.sin(2 * D * D2R)
+    - 0.214 * Math.sin(2 * M * D2R)
+    - 0.186 * Math.sin(Ms * D2R);
+  var lat_ec = 5.128 * Math.sin(F * D2R)
+    + 0.281 * Math.sin((M + F) * D2R)
+    + 0.278 * Math.sin((F - M) * D2R);
+  var eps = 23.44 * D2R;
+  var lngR = lng * D2R, latR = lat_ec * D2R;
+  var dec = Math.asin(Math.sin(latR) * Math.cos(eps) + Math.cos(latR) * Math.sin(eps) * Math.sin(lngR));
+  var ra = Math.atan2(Math.sin(lngR) * Math.cos(eps) - Math.tan(latR) * Math.sin(eps), Math.cos(lngR));
+  return { JD: JD, T: T, ra: ra, dec: dec, eps: eps, Ms: Ms };
+}
+
+// Screen tilt (degrees, CSS/canvas rotation sense) of the untilted moon sprite
+// for an observer at lat/lon: the bright limb faces the Sun as seen in that
+// sky. chi is measured from celestial north; subtracting the parallactic
+// angle q gives it from the observer's vertical; the sprite's lit limb starts
+// at 3 o'clock and CSS rotation runs opposite the position-angle sense, hence
+// -(chi - q) - 90.
+function _moonScreenTiltDeg(date, lat, lon) {
+  var eq = _moonEqCoords(date);
+  var D2R = Math.PI / 180;
+  var GMST = (280.46061837 + 360.98564736629 * (eq.JD - 2451545.0)) % 360;
+  var HA = (GMST + lon) * D2R - eq.ra;
+  var latR = lat * D2R;
+  var q = Math.atan2(Math.sin(HA), Math.tan(latR) * Math.cos(eq.dec) - Math.sin(eq.dec) * Math.cos(HA));
+  // Sun's equatorial position (low-precision) for the bright-limb angle chi.
+  var Lsun = 280.4665 + 36000.7698 * eq.T;
+  var lamSun = (Lsun + 1.915 * Math.sin(eq.Ms * D2R) + 0.020 * Math.sin(2 * eq.Ms * D2R)) * D2R;
+  var raSun = Math.atan2(Math.cos(eq.eps) * Math.sin(lamSun), Math.cos(lamSun));
+  var decSun = Math.asin(Math.sin(eq.eps) * Math.sin(lamSun));
+  var dA = raSun - eq.ra;
+  var chi = Math.atan2(Math.cos(decSun) * Math.sin(dA),
+    Math.sin(decSun) * Math.cos(eq.dec) - Math.cos(decSun) * Math.sin(eq.dec) * Math.cos(dA));
+  return -((chi - q) * 180 / Math.PI) - 90;
+}
+
+// Waxing predicate — shared so no renderer flips the terminator side on its
+// own convention (the sky scene once used <= where the hero used <).
+function _moonIsWaxing(m) { return m.phase < 0.5; }
+
+// Today-card tilt: canonical derivation at the almanac's location fallback
+// (same synthetic default as almanac.js _getLocation, which may not be loaded).
+function _quickMoonTilt(date) {
   var ll = _getSessionJSON(SK.ALMANAC_LOC, null);
-  var obsLat = ll ? ll.lat : 34, obsLon = ll ? ll.lon : -date.getTimezoneOffset() / 60 * 15;
-  var LST = ((280.46061837 + 360.98564736629*(JD-2451545.0))%360 + obsLon) * D2R;
-  var HA = LST - ra;
-  var latR2 = obsLat * D2R;
-  return Math.atan2(Math.sin(HA), Math.tan(latR2)*Math.cos(dec) - Math.sin(dec)*Math.cos(HA)) * 180 / Math.PI;
+  var lat = ll ? ll.lat : 34, lon = ll ? ll.lon : -date.getTimezoneOffset() / 60 * 15;
+  return _moonScreenTiltDeg(date, lat, lon);
 }
 
 // Lightweight almanac teaser for the Today discover card.
@@ -3074,7 +3461,7 @@ function _renderTodayCard() {
   var glowOpacity = (m.illumination / 100 * 0.12 + 0.02).toFixed(2);
   return '<div class="dc-today">' + stars +
     '<div class="dc-moon-glow" style="background:radial-gradient(circle, rgba(232,224,208,' + glowOpacity + ') 0%, transparent 65%)"></div>' +
-    _renderMoonHTML(m, 'dc-moon-wrap', tilt, 0.5) +
+    _renderMoonHTML(m, 'dc-moon-wrap', tilt) +
     '</div>';
 }
 
@@ -3108,7 +3495,17 @@ function openAlmanac(replaceState) {
       var s = document.createElement('script');
       s.src = almanacModules[i];
       s.onload = function() { loadNext(i + 1); };
-      s.onerror = function() { console.error('Failed to load ' + almanacModules[i]); };
+      // Offline with a cold cache: these modules were never fetched, so there is
+      // nothing to serve. Say so — a console line and a button that appears to
+      // do nothing is the same "silent absence" the connection banner exists to
+      // eliminate.
+      s.onerror = function() {
+        console.error('Failed to load ' + almanacModules[i]);
+        // Drop the reload-into-almanac boot gate so the library becomes
+        // visible again instead of an empty dark shell.
+        document.documentElement.classList.remove('almanac-boot');
+        _showToast(t('almanac_unavailable_offline'));
+      };
       document.head.appendChild(s);
     };
     loadNext(0);
@@ -3763,12 +4160,53 @@ function _moveZimTo(zim, category) {
     }
   });
 
-  var CTX_SUB_W = 190;  // .ctx-sub min-width (170) + padding/border headroom
+  var CTX_EDGE = 8;     // keep-clear margin from every viewport edge
+  var CTX_SUB_TOP = 4;  // a submenu overhangs its trigger's top edge by this much
+  var CTX_SUB_GAP = 4;  // clearance a pinned submenu keeps from its trigger row
+  // Where a submenu of size sw×sh goes, given its trigger's viewport rect `r`.
+  // Horizontally it prefers to open right, else flips left, else PINS to the
+  // viewport: the parent menu is itself clamped on screen, so on a phone its
+  // right edge sits ~8px from the edge and neither side has room — the old
+  // "no room right, not enough room left, open right anyway" path is what put
+  // the category list off screen with every label truncated.
+  // Vertically it hangs from the trigger's top edge, pulled up and capped so a
+  // long category list scrolls inside itself rather than running off the bottom.
+  // Pure function of numbers so the contract is unit-testable.
+  function _ctxSubPlacement(r, sw, sh, vw, vh) {
+    var w = Math.min(sw, vw - 2 * CTX_EDGE), h = Math.min(sh, vh - 2 * CTX_EDGE);
+    var x, y, pinned = false;
+    if (r.right + w <= vw - CTX_EDGE) x = r.right;
+    else if (r.left - w >= CTX_EDGE) x = r.left - w;
+    else { pinned = true; x = Math.min(Math.max(CTX_EDGE, r.left), vw - w - CTX_EDGE); }
+    if (!pinned) {
+      y = Math.max(CTX_EDGE, Math.min(r.top - CTX_SUB_TOP, vh - h - CTX_EDGE));
+    } else {
+      // Pinned means the submenu lands on top of its own parent menu, so it has
+      // to clear the TRIGGER ROW: the finger that opened it is still on that
+      // row, and the click that tap becomes would otherwise activate whichever
+      // category ended up underneath — one tap silently moving a ZIM. Drop it
+      // below the trigger, else above, else take the taller side and scroll.
+      var below = vh - r.bottom - CTX_EDGE - CTX_SUB_GAP;
+      var above = r.top - CTX_EDGE - CTX_SUB_GAP;
+      if (h <= below || below >= above) { h = Math.min(h, below); y = r.bottom + CTX_SUB_GAP; }
+      else { h = Math.min(h, above); y = r.top - CTX_SUB_GAP - h; }
+    }
+    return { x: x, y: y, w: w, h: h, pinned: pinned };
+  }
   function posMenu(x, y) {
+    // Measure off-paint: reveal for layout but keep it invisible until it sits at
+    // its final spot, so it never flashes at (0,0) before we know its size — the
+    // "flaky open"/edge-flash the two-step position used to show for a frame.
+    menu.style.maxHeight = ''; menu.style.overflowY = '';  // clear any prior clamp
+    menu.style.visibility = 'hidden';
     menu.style.left = '0'; menu.style.top = '0';
     menu.classList.add('visible');
     var vw = window.innerWidth, vh = window.innerHeight;
     var mw = menu.offsetWidth, mh = menu.offsetHeight;
+    // A menu taller than the viewport must scroll inside itself, not run off the
+    // bottom: cap its height and let it scroll before the on-screen clamp runs.
+    var maxH = vh - 16;
+    if (mh > maxH) { menu.style.maxHeight = maxH + 'px'; menu.style.overflowY = 'auto'; mh = maxH; }
     // Clamp the menu fully on-screen on both axes — a long-press near the
     // bottom or left edge of a phone must never park the menu off-viewport.
     // Math.max(8,…) guards the near edge; the outer Math.max keeps the near
@@ -3777,31 +4215,32 @@ function _moveZimTo(zim, category) {
     var finalY = Math.min(Math.max(8, y), Math.max(8, vh - mh - 8));
     menu.style.left = finalX + 'px';
     menu.style.top = finalY + 'px';
-    // Each submenu (Move to…'s category list, Collections, …) opens from its
-    // trigger's top-right by default. Per trigger, decide horizontal side and
-    // vertical direction from the room actually available, then clamp width and
-    // height so a long list scrolls inside the viewport rather than running off
-    // any edge — the mobile failure mode. Done for every trigger, not just
-    // Move to….
+    // Place every submenu (Move to…'s categories, Collections, the Users role
+    // list) while the menu is still hidden, so the whole assembly appears in one
+    // paint. Each one is MEASURED rather than assumed: the width a submenu
+    // actually wants decides which side it can open on, and it is measured twice
+    // — once for its natural width, then again for the height that width implies
+    // once long labels wrap. Assuming a fixed width is what made the old
+    // flip-left test answer "there's room" when there wasn't.
     _ctxItems(menu).forEach(function(item) {
       var sub = _ctxSubOf(item);
       if (!sub) return;
       var r = item.getBoundingClientRect();
-      // Horizontal: open right unless it lacks room and the left side has it.
-      var rightFits = r.right + CTX_SUB_W <= vw - 8;
-      var leftFits = r.left - CTX_SUB_W >= 8;
-      var goLeft = !rightFits && leftFits;
-      sub.classList.toggle('flip-left', goLeft);
-      var availW = (goLeft ? r.left : vw - r.right) - 8;
-      sub.style.maxWidth = Math.max(140, availW) + 'px';
-      // Vertical: hang from the top edge unless the bottom lacks room and the
-      // top has more; cap height to the room so .ctx-sub's own scroll kicks in.
-      var spaceBelow = vh - r.top - 8;
-      var spaceAbove = r.bottom - 8;
-      var flipUp = spaceBelow < 120 && spaceAbove > spaceBelow;
-      sub.classList.toggle('flip-up', flipUp);
-      sub.style.maxHeight = Math.max(100, flipUp ? spaceAbove : spaceBelow) + 'px';
+      sub.classList.remove('fitted');
+      sub.style.cssText = 'visibility:hidden;display:block;width:auto;max-width:none;max-height:none';
+      var natW = sub.offsetWidth;
+      var w = Math.min(natW, vw - 2 * CTX_EDGE);
+      sub.style.width = w + 'px';
+      // Narrower than it wants: labels wrap onto a second line instead of being
+      // cut off, and the height below accounts for the taller result.
+      if (w < natW) sub.classList.add('fitted');
+      var p = _ctxSubPlacement(r, w, sub.offsetHeight, vw, vh);
+      // Offsets are relative to the trigger (its padding box is the submenu's
+      // containing block); the values above are viewport coordinates.
+      sub.style.cssText = 'left:' + (p.x - r.left) + 'px;top:' + (p.y - r.top) + 'px;' +
+        'width:' + p.w + 'px;max-height:' + p.h + 'px';
     });
+    menu.style.visibility = '';  // reveal at the final position: a single paint
     _prepMenuA11y();
   }
 
@@ -3894,10 +4333,21 @@ function _moveZimTo(zim, category) {
   // ── Long-press = right-click on touch (#37) ──
   // Touch has no contextmenu, so a 500ms press on a ZIM card (home .stat-card or
   // an Installed row) opens the same menu right-click does — the mobile answer to
-  // "where's Move to…". Movement cancels it (so it never hijacks a scroll), a
-  // short haptic confirms it fired, and the synthetic click that follows is
-  // swallowed so the press doesn't also open the ZIM. iOS's own callout is killed
-  // by -webkit-touch-callout:none on the cards (app.css).
+  // "where's Move to…". iOS's own callout is killed by -webkit-touch-callout:none
+  // on the cards (app.css).
+  //
+  // One lifecycle, one latch (`_lpFired` = "this gesture opened the menu"):
+  //   arm     touchstart on a card → reset the latch, add lp-armed, start 500ms timer
+  //   fire    timer elapses undisturbed → latch=true, haptic, open menu at the press
+  //   cancel  a >10px move (a scroll) or multi-touch clears the armed timer
+  //   suppress touchend after a fire eats the ONE trailing synthetic click on the
+  //           pressed card (so the press doesn't also open the ZIM)
+  //   dismiss tap-away / scroll / Esc / action-selected — the shared menu machinery
+  //
+  // The latch MUST describe only the gesture that is ending. It is reset at the top
+  // of every touchstart so a fire never leaks into the next tap: a stale true there
+  // made touchend swallow the tap-away's dismiss click, leaving the menu closeable
+  // only by scrolling — the exact inversion field-testing hit.
   var _lpTimer = null, _lpCard = null, _lpStartX = 0, _lpStartY = 0, _lpFired = false;
   function _lpHit(target) {
     var card = target.closest && target.closest('.stat-card, .catalog-item[data-zim]');
@@ -3920,11 +4370,12 @@ function _moveZimTo(zim, category) {
     if (_lpTimer || _lpFired) e.preventDefault();
   });
   document.addEventListener('touchstart', function(e) {
+    _lpFired = false;  // gesture start: never inherit a prior press's fired latch
     if (e.touches.length !== 1) { _lpCancel(); return; }
     var hit = _lpHit(e.target);
     if (!hit) return;
     var t = e.touches[0];
-    _lpStartX = t.clientX; _lpStartY = t.clientY; _lpFired = false;
+    _lpStartX = t.clientX; _lpStartY = t.clientY;
     document.documentElement.classList.add('lp-armed');
     _lpTimer = setTimeout(function() {
       _lpTimer = null; _lpFired = true; _lpCard = hit.card;
@@ -3940,13 +4391,17 @@ function _moveZimTo(zim, category) {
     var t = e.touches[0];
     if (t && (Math.abs(t.clientX - _lpStartX) > 10 || Math.abs(t.clientY - _lpStartY) > 10)) _lpCancel();
   }, { passive: true });
+  // Suppress the ONE synthetic open-click a fire leaves behind, two ways for two
+  // engines — both now safe because the latch can't outlive its gesture (reset at
+  // the next touchstart). iOS: preventDefault on touchend cancels the simulated
+  // click outright. Android: touchend can't, so the capture-phase guard below eats
+  // it — but only when it lands on the pressed card, so a tap-away is never caught
+  // and always reaches the outside-dismiss handler.
   document.addEventListener('touchend', function(e) {
     _lpCancel();
-    if (_lpFired) e.preventDefault();  // block the trailing synthetic click/open
+    if (_lpFired) e.preventDefault();
   });
   document.addEventListener('touchcancel', _lpCancel, { passive: true });
-  // Capture-phase guard: swallow the click a long-press would otherwise fire on
-  // the pressed card (not menu taps — those land outside the card).
   document.addEventListener('click', function(e) {
     if (_lpFired && _lpCard && _lpCard.contains(e.target)) {
       e.preventDefault(); e.stopPropagation(); _lpFired = false;
@@ -3956,7 +4411,22 @@ function _moveZimTo(zim, category) {
   // Dismiss on scroll like a native menu: the fixed-position menu would
   // otherwise float detached over scrolled-away content. Capture so a scroll in
   // any nested scroller (the manage list, the home grid) closes it too.
+  //
+  // …but only for a scroll the USER started. A tap that lands on the menu makes
+  // a scroll-snap container underneath it (the discover strip) re-snap and emit
+  // a scroll event with its offsets unchanged — dismissing on that closed the
+  // whole menu the instant a finger touched "Move to…", which is what made the
+  // submenu look unreachable on a phone. A pointer that went down inside the
+  // menu cannot be dragging the page, so any scroll it produces is the menu's
+  // own doing; a wheel outside the menu is a real scroll and re-arms dismissal.
+  var _ctxSelfScroll = false;
+  function _ctxTrackPointer(e) { _ctxSelfScroll = menu.contains(e.target); }
+  document.addEventListener('touchstart', _ctxTrackPointer, { capture: true, passive: true });
+  document.addEventListener('mousedown', _ctxTrackPointer, true);
+  document.addEventListener('wheel', function(e) { if (!menu.contains(e.target)) _ctxSelfScroll = false; },
+    { capture: true, passive: true });
   window.addEventListener('scroll', function() {
+    if (_ctxSelfScroll) return;
     if (menu.classList.contains('visible')) closeCtx();
   }, true);
 
@@ -4411,7 +4881,7 @@ async function doSearch(query, push) {
   try {
     // ── Progressive two-phase search: fast title matches first, then full FTS ──
     // Phase 1: fast title search (parallel per-ZIM, no lock contention)
-    const r1 = await fetch('/search?q=' + encodeURIComponent(query) + '&limit=10' + zimParam + '&fast=1',
+    const r1 = await serverFetch('/search?q=' + encodeURIComponent(query) + '&limit=10' + zimParam + '&fast=1',
       { signal: searchController.signal });
     const d1 = await r1.json();
     const phase1Elapsed = ((performance.now() - searchT0) / 1000).toFixed(1);
@@ -4453,7 +4923,7 @@ async function doSearch(query, push) {
       }, 1000);
 
       // Phase 2: full Xapian FTS (sequential under _zim_lock, searches every ZIM)
-      const r2 = await fetch('/search?q=' + encodeURIComponent(query) + '&limit=10' + zimParam,
+      const r2 = await serverFetch('/search?q=' + encodeURIComponent(query) + '&limit=10' + zimParam,
         { signal: searchController.signal });
       const d2 = await r2.json();
       clearInterval(timerInterval);
@@ -4464,6 +4934,14 @@ async function doSearch(query, push) {
     }
   } catch(e) {
     if (e.name === 'AbortError') return;
+    // "Search failed / try again" implies the server tried and something went
+    // wrong there. If we never reached it, say that instead and offer Retry.
+    if (_isOfflineError(e)) {
+      output.innerHTML = '<div class="empty conn-empty"><p>' + tH('search_offline') + '</p>' +
+        '<p class="hint">' + tH('search_offline_hint') + '</p>' +
+        '<button type="button" class="conn-retry conn-retry-inline" onclick="_connRetryClick(this)">' + tH('conn_retry') + '</button></div>';
+      return;
+    }
     output.innerHTML = '<div class="empty"><p>' + tH('search_failed') + '</p><p class="hint">' + tH('try_again') + '</p></div>';
   }
 }
@@ -5031,9 +5509,19 @@ function _restoreSavedReader() {
   return true;
 }
 
-function enterManage(e, section) {
+async function enterManage(e, section) {
   if (e && e.preventDefault) e.preventDefault();
-  if (!manageEnabled) return;
+  if (!manageEnabled) {
+    // The gear must respond from first paint. On a large library the boot's
+    // /list call blocks for seconds, and if the user clicks before the
+    // manage-auth probe has set manageEnabled we must not leave the button
+    // dead (#44). Resolve the probe on demand (cheap, lock-free endpoint) and
+    // only bail if management is genuinely disabled.
+    if (_manageProbed) return;            // probe already finished: disabled
+    if (!_manageProbe) _manageProbe = _probeManageAuth();
+    await _manageProbe;
+    if (!manageEnabled) return;           // resolved to disabled
+  }
   // Decide which settings section to land on: an explicit arg (deep link /
   // ?manage=<section>) wins, else a section a caller already staged in
   // _pendingMsSection (e.g. Reorder → preferences), else the last one used
@@ -6471,7 +6959,7 @@ function renderCatalogItem(group) {
     const withLabels = variants.filter(v => v.download_url).map(v => {
       const label = variantLabel(v.download_url) || t('full');
       const size = formatSize(v.size_bytes);
-      return { label, size, url: v.download_url };
+      return { label, size, url: v.download_url, bytes: v.size_bytes || 0 };
     });
     withLabels.sort((a, b) => _flavorOrder(b.url) - _flavorOrder(a.url));
     if (withLabels.length > 1) {
@@ -6558,6 +7046,16 @@ function _toggleDownloadSelection(cb) {
     _selectedDownloads.delete(url);
   }
   _renderSelectionBar();
+}
+
+// Re-key a selected download when its flavor changes so the selection-bar
+// total tracks the chosen variant (a checked item plus a flavor switch used
+// to keep totalling the OLD flavor's size). Returns true when it changed.
+function _reselectDownloadUrl(oldUrl, newUrl, bytes) {
+  if (oldUrl === newUrl || !_selectedDownloads.has(oldUrl)) return false;
+  _selectedDownloads.delete(oldUrl);
+  _selectedDownloads.set(newUrl, bytes || 0);
+  return true;
 }
 
 function _renderSelectionBar() {
@@ -7351,6 +7849,9 @@ function _msUsersHtml() {
   h += _publicAccessCard();
 
   h += '<div class="ms-users-section">';
+  // Titled like the two cards above it (Your account / Public access), so the
+  // pane reads as three named sections instead of an unlabeled list.
+  h += '<div class="ms-section-label">' + tH('ms_users') + '</div>';
   h += '<div class="ms-users-intro">' + tH('users_intro') + '</div>';
   if (others.length) {
     h += '<div class="ms-users-list">';
@@ -8045,31 +8546,16 @@ function _msToggleCollapse(id, btn) {
 }
 
 // Section reorder + add-section panel (#37). Lives under Library settings — the
-// one obvious home for organizing the library. Collapsed by default; deep-linked
-// open from the card menu and the Installed-tab "Reorder" pill via
-// _reorderAutoExpand. Draggable rows, ▲▼ keyboard fallback, Add/remove sections.
+// one obvious home for organizing the library. Collapsed by default.
+// Draggable rows, ▲▼ keyboard fallback, Add/remove sections.
 function _msReorderHtml() {
-  var reOpen = _reorderAutoExpand; _reorderAutoExpand = false;
-  var h = '<div class="ms-section-label" style="margin-top:20px">' + tH('reorder_sections') + '</div>' +
+  return '<div class="ms-section-label" style="margin-top:20px">' + tH('reorder_sections') + '</div>' +
     '<div class="ms-hint">' + tH('reorder_hint') + '</div>' +
-    '<button class="pill" onclick="_msToggleCollapse(\'ms-reorder\', this)">' + (reOpen ? tH('hide_list') : tH('show_list')) + '</button>' +
-    '<div class="ms-collapsed-list' + (reOpen ? ' ms-open' : '') + '" id="ms-reorder"' +
+    '<button class="pill" onclick="_msToggleCollapse(\'ms-reorder\', this)">' + tH('show_list') + '</button>' +
+    '<div class="ms-collapsed-list" id="ms-reorder"' +
       ' onclick="_reorderClick(event)" ondragstart="_reorderDragStart(event)"' +
       ' ondragover="_reorderDragOver(event)" ondrop="_reorderDrop(event)"' +
       ' ondragend="_reorderDragEnd(event)">' + _reorderSectionsHtml() + '</div>';
-  if (reOpen) {
-    // Deep-linked open from the "Customize categories" pill: scroll the panel
-    // into view AND flash it, so the pointer lands the eye on the block (same
-    // scroll+flash the almanac holidays caption uses for its location control).
-    setTimeout(function() {
-      var el = document.getElementById('ms-reorder');
-      if (!el) return;
-      el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-      el.classList.add('ms-flash');
-      setTimeout(function() { el.classList.remove('ms-flash'); }, 1600);
-    }, 60);
-  }
-  return h;
 }
 
 function _msPreferencesHtml() {
@@ -8109,14 +8595,6 @@ function _msPreferencesHtml() {
     '<div class="ms-hint" style="margin-top:8px">' + tH('catalog_languages_hint_short') + '</div>' +
     '<button class="pill" onclick="_msToggleCollapse(\'ms-lang-pills\', this)">' + tH('show_list') + '</button>' +
     '<div class="ms-lang-pills ms-collapsed-list" id="ms-lang-pills">' + _renderLangPrefPills() + '</div>';
-  // Section reorder moved to Library settings (#37). Leave a one-release pointer
-  // here so anyone who remembers the old home still lands in the right place.
-  h += '<div class="ms-section-label" style="margin-top:20px">' + tH('reorder_sections') + '</div>' +
-    '<div class="ms-hint">' + tH('reorder_moved_hint') + '</div>' +
-    '<button type="button" class="pill reorder-pill" onclick="_openReorderPanel()">' +
-      esc(t('open_library_settings')) +
-      '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 17 17 7"/><path d="M8 7h9v9"/></svg>' +
-    '</button>';
   // Reader section — mirror of the in-article palette's AUTO switch, so the
   // setting is discoverable without first opening an article. Same wording,
   // same localStorage key (via _setReaderAuto).
@@ -8835,7 +9313,12 @@ async function _renderMirrorSection() {
   const mirrorStatus = '<div id="ms-mirror-active" class="share-bt-status-right">' +
     _mirrorStatusHtml(mirrorActive) + '</div>';
   const prog = m.progress || {};
-  const mirrorInner =
+  // "When is the backup updated?" — surface the offline catalog copy's last
+  // write (refreshed on catalog revalidation and every 12h maintenance pass,
+  // the same pass that refreshes mirror seeds + the .torrent archive).
+  const backupTs = m.enabled && m.catalog_backup_ts
+    ? '<div class="ms-hint">' + tH('mirror_backup_updated', {when: _relTime(m.catalog_backup_ts)}) + '</div>' : '';
+  const mirrorInner = backupTs +
     '<div class="ms-hint share-mirror-progress" id="mirror-progress-line"' + (prog.phase ? '' : ' style="display:none"') + '>' +
       (prog.phase ? _mirrorProgressText(prog) : '') + '</div>';
 
@@ -8999,8 +9482,11 @@ function _myDataCardHtml() {
     ? '<button class="pill" onclick="saveMyDataToServer()">' + tH('backup_save_server') + '</button>' +
       '<button class="pill" onclick="restoreMyDataFromServer()">' + tH('backup_restore_server') + '</button>'
     : '';
+  // Signed-in named users get the account explanation (Save to server exists
+  // for them); everyone else gets browser-local + file export only.
+  var intro = signedIn ? tH('backup_mydata_intro_account') : tH('backup_mydata_intro');
   return '<div class="ms-section-label">' + tH('backup_mydata_title') + '</div>' +
-    '<div class="ms-hint">' + tH('backup_mydata_intro') + '</div>' +
+    '<div class="ms-hint">' + intro + '</div>' +
     '<div class="ms-backup-actions">' +
       '<button class="pill" onclick="exportMyData()">' + tH('backup_export_file') + '</button>' +
       '<button class="pill" onclick="document.getElementById(\'ms-mydata-file\').click()">' + tH('backup_import_file') + '</button>' +
@@ -9064,10 +9550,16 @@ function _mergeByKey(current, incoming, keyFn, overwrite) {
 function _collectBrowserData() {
   return {
     bookmarks: _getStorageJSON(SK.BOOKMARKS, []),
+    folders: _getStorageJSON(SK.BM_FOLDERS, []),
     history: _getStorageJSON(SK.BROWSE_HISTORY, []),
     preferences: _collectPreferences(),
   };
 }
+
+// Folders merge by id (not zim+path). Newer (higher order/updated wins isn't
+// meaningful for folders, so incoming simply overrides an existing id) — this
+// keeps a restored/synced tree consistent with the bookmarks that reference it.
+function _folderKey(f) { return (f && f.id) ? String(f.id) : ''; }
 
 function _applyBrowserData(data, overwrite) {
   var res = { bm: { added: 0, dupes: 0 } };
@@ -9080,6 +9572,12 @@ function _applyBrowserData(data, overwrite) {
   if (data && Array.isArray(data.bookmarks)) {
     res.bm = _mergeByKey(_getStorageJSON(SK.BOOKMARKS, []), data.bookmarks, _bookmarkKey, overwrite);
     _setStorageJSON(SK.BOOKMARKS, res.bm.list);
+    if (typeof _bookmarks !== 'undefined') _bookmarks = null;  // drop the in-memory cache
+  }
+  if (data && Array.isArray(data.folders)) {
+    var fm = _mergeByKey(_getStorageJSON(SK.BM_FOLDERS, []), data.folders, _folderKey, overwrite);
+    _setStorageJSON(SK.BM_FOLDERS, fm.list);
+    if (typeof _bmFolders !== 'undefined') _bmFolders = null;  // drop the in-memory cache
   }
   if (data && Array.isArray(data.history)) {
     _setStorageJSON(SK.BROWSE_HISTORY, _mergeByKey(_getStorageJSON(SK.BROWSE_HISTORY, []), data.history, _bookmarkKey, overwrite).list);
@@ -9265,12 +9763,17 @@ async function _renderMissingZims(library) {
   if (!box) return;
   box.innerHTML = '';
   if (!Array.isArray(library) || !library.length) return;
-  // Which backup ZIMs aren't installed here?
+  // Which backup ZIMs aren't installed here? An unreachable server would leave
+  // this set empty and declare every ZIM in the backup missing — a fabricated
+  // shopping list. Bail with an honest note instead.
   var installed = new Set();
   try {
-    var list = await (await fetch('/list')).json();
+    var list = await (await serverFetch('/list')).json();
     (Array.isArray(list) ? list : (list.zims || [])).forEach(function(z) { if (z && z.name) installed.add(z.name); });
-  } catch (e) {}
+  } catch (e) {
+    box.innerHTML = '<div class="ms-hint">' + tH('conn_offline_msg') + '</div>';
+    return;
+  }
   var missing = library.filter(function(z) { return z && z.name && !installed.has(z.name); });
   if (!missing.length) {
     box.innerHTML = '<div class="ms-hint">' + tH('backup_library_complete') + '</div>';
@@ -9406,27 +9909,21 @@ function getInstalledPillsHtml() {
       langCounts[lang] = (langCounts[lang] || 0) + 1;
     }
   }
-  // The reorder surface shows every home section — collections AND categories —
-  // in the saved order, so what you drag is exactly what home renders (dragging
-  // a category can no longer jump invisibly past a collection). Collection pills
-  // are visually distinct (glyph + col-pill) and open the Collections tab;
-  // category pills double as filters. Both are draggable. `allCats` is still
-  // computed above purely to gate the language row below.
+  // Sections are read in the saved home order so the filter pills match what
+  // home renders. `allCats` is still computed above purely to gate the language
+  // row below.
   const allCats = _orderCatsBySaved([...new Set(Object.keys(langsByCat))]);
   const sections = _currentReorderSections();
   let h = '';
-  // These pills FILTER the installed library (click a category to scope, click a
-  // collection to open its tab). Reordering is not done here — it lives in its
-  // own view behind the trailing link-out pill, which opens the reorder panel.
-  if (sections.length > 1) {
+  // These pills FILTER the installed library: one row, one job. Collections
+  // live in their own tab and reordering lives in Library settings, so neither
+  // gets a look-alike pill here that navigates away instead of filtering.
+  // Count only what actually renders: a lone category pill filters nothing, so
+  // the row stays hidden until there are at least two categories to choose from.
+  const catSections = sections.filter(function(s) { return s.key.indexOf('col:') !== 0; });
+  if (catSections.length > 1) {
     h += '<div class="pills installed-cat-pills" style="margin-bottom:8px">';
-    for (const s of sections) {
-      if (s.key.indexOf('col:') === 0) {
-        h += '<button type="button" class="pill col-pill" data-key="' + escAttr(s.key) +
-          '" onclick="switchManageTab(\'collections\')">' +
-          _COLLECTION_GLYPH + esc(s.label) + '</button>';
-        continue;
-      }
+    for (const s of catSections) {
       // The Other catch-all rides the reserved 'other' key (not a cat: slice).
       const cat = s.key === OTHER_KEY ? OTHER_CAT : s.key.slice(4);
       const dimmed = manageLangFilter && langsByCat[cat] && !langsByCat[cat].has(manageLangFilter);
@@ -9434,12 +9931,6 @@ function getInstalledPillsHtml() {
         '" data-key="' + escAttr(s.key) + '" data-cat="' + escAttr(cat) +
         '" onclick="filterManageCategory(\'' + escAttr(cat) + '\')">' + esc(_catDisplayName(cat)) + '</button>';
     }
-    // Link-out ACTION pill (not a filter) → the separate reorder view.
-    h += '<button type="button" class="pill reorder-pill" onclick="_openReorderPanel()" title="' +
-      escAttr(t('reorder_sections')) + '" aria-label="' + escAttr(t('reorder_sections')) + '">' +
-      esc(t('reorder')) +
-      '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 17 17 7"/><path d="M8 7h9v9"/></svg>' +
-      '</button>';
     h += '</div>';
   }
   // Language pills — horizontal scroll with counts, no search button
@@ -9509,6 +10000,8 @@ function renderInstalled(filterText) {
   const el = document.getElementById('manage-installed');
   if (!el) return;
   const zims = zimsCache || [];
+  // Same rule as home: only claim "nothing installed" when the server said so.
+  if (!_libraryKnown) { el.innerHTML = _libraryUnavailableHtml(); return; }
   if (!zims.length) {
     el.innerHTML = '<div class="empty"><p>' + tH('no_zims_installed') + '</p><div class="hint">' + tH('switch_to_catalog') + '</div></div>';
     return;
@@ -9564,8 +10057,10 @@ function renderInstalled(filterText) {
       const countHtml = _zimCountHtml(z);
       if (countHtml) meta.push(countHtml);
       meta.push(fmtSize(z.size_gb));
-      // Show date from ZIM metadata
-      const dateStr = z.date ? z.date.substring(0, 7) : null;
+      // Show date from ZIM metadata. Bookmark exports keep the full creation
+      // date (their whole identity is "what I saved, when"); catalog ZIMs
+      // stay on the YYYY-MM release stamp.
+      const dateStr = z.date ? (_isZimiExport(z) ? z.date : z.date.substring(0, 7)) : null;
       if (dateStr) meta.push(dateStr);
       // Flavor badge from filename
       const flavor = variantLabel(z.file);
@@ -9907,6 +10402,15 @@ function selectCatalogFlavor(optionEl, index) {
   split.dataset.selected = index;
   var mainBtn = split.querySelector('.ci-dl-main');
   mainBtn.textContent = t('download_size', {size: v.label + ' (' + v.size + ')'});
+  // Point the row's multi-select checkbox at the chosen flavor too; if the
+  // item is already checked, re-total the selection bar with the new size.
+  var itemEl = split.closest('.catalog-item');
+  var cb = itemEl ? itemEl.querySelector('.ci-select') : null;
+  if (cb) {
+    if (_reselectDownloadUrl(cb.dataset.url, v.url, v.bytes)) _renderSelectionBar();
+    cb.dataset.url = v.url;
+    cb.dataset.size = String(v.bytes || 0);
+  }
 }
 
 async function _downloadPack(btn, urls) {
@@ -10140,7 +10644,53 @@ function _updateDownloadsTabBadge(activeCount) {
 let _dlRefreshing = false;
 // Last downloads payload, cached so tapping a filter pill can repaint instantly
 // from data we already have instead of waiting for the next fetch (#6).
-let _dlLastDls = null, _dlLastSeeds = [], _dlLastSeedCap = 2;
+let _dlLastDls = null, _dlLastSeeds = [], _dlLastSeedCap = 2, _dlLastOps = null;
+// The export state persists server-side until the NEXT export, so a done/error
+// card is only shown after we watched this export run in this page session —
+// otherwise last week's export would haunt the panel forever.
+let _dlExportSeen = false;
+
+// Synthetic job cards for background server operations (bookmark→ZIM export,
+// library health check). Visibility only — controls live in their own UIs.
+function _dlOpsCardsHtml(ops) {
+  const ex = (ops && ops.export) || {};
+  const hc = (ops && ops.health) || {};
+  if (ex.phase === 'running') _dlExportSeen = true;
+  const bar = (done, total) => {
+    const pct = total ? Math.round((done / total) * 100) : 0;
+    return '<div class="dl-progress' + (total ? '' : ' dl-indeterminate') +
+      '"><div class="dl-progress-bar"' + (total ? ' style="width:' + pct + '%"' : '') + '></div></div>';
+  };
+  const row = (label, right) =>
+    '<div class="dl-row"><span class="dl-name">' + label + '</span>' + right + '</div>';
+  let h = '';
+  if (ex.phase === 'running') {
+    h += '<div class="dl-item dl-op-item">' +
+      row(tH('dl_export_job'), '<span class="dl-size">' + (ex.total ? (ex.done || 0) + ' / ' + ex.total : '') + '</span>') +
+      bar(ex.done || 0, ex.total || 0) + '</div>';
+  } else if (_dlExportSeen && ex.phase === 'done') {
+    h += '<div class="dl-item dl-op-item">' +
+      row(tH('dl_export_job'), '<span class="dl-done">\u2713 ' + tH('dl_complete') + '</span>') + '</div>';
+  } else if (_dlExportSeen && ex.phase === 'error') {
+    h += '<div class="dl-item dl-op-item">' +
+      row(tH('dl_export_job'), '<span class="dl-error">' + tH('save_to_zim_failed') + '</span>') + '</div>';
+  }
+  if (hc.phase === 'running') {
+    h += '<div class="dl-item dl-op-item">' +
+      row(tH('dl_health_job'), '<span class="dl-size">' + (hc.total ? (hc.done || 0) + ' / ' + hc.total : '') + '</span>') +
+      bar(hc.done || 0, hc.total || 0) + '</div>';
+  }
+  return h;
+}
+
+// True while an op should keep the downloads panel alive (rendered card or
+// active work) — feeds both the empty-state check and the poll cadence.
+function _dlOpsActive(ops) {
+  const ex = (ops && ops.export) || {};
+  const hc = (ops && ops.health) || {};
+  return ex.phase === 'running' || hc.phase === 'running' ||
+    (_dlExportSeen && (ex.phase === 'done' || ex.phase === 'error'));
+}
 async function refreshDownloads() {
   // Re-entrancy guard: overlapping calls double-fetch /list and corrupt
   // the completed-count bookkeeping.
@@ -10156,13 +10706,14 @@ async function _refreshDownloadsInner(useCache) {
   const dlEl = document.getElementById('manage-downloads');
   if (!dlEl) return;
   try {
-    let dls, seedingTorrents = [], seedingCap = 2;
+    let dls, seedingTorrents = [], seedingCap = 2, ops = null;
     if (useCache && _dlLastDls) {
-      dls = _dlLastDls; seedingTorrents = _dlLastSeeds; seedingCap = _dlLastSeedCap;
+      dls = _dlLastDls; seedingTorrents = _dlLastSeeds; seedingCap = _dlLastSeedCap; ops = _dlLastOps;
     } else {
-      const [res, seedRes] = await Promise.all([
+      const [res, seedRes, actRes] = await Promise.all([
         manageFetch('/manage/downloads'),
         authedFetch('/manage/seeding').catch(() => null),
+        authedFetch('/manage/activity', { credentials: 'same-origin' }).catch(() => null),
       ]);
       const data = await res.json();
       dls = data.downloads || [];
@@ -10173,9 +10724,13 @@ async function _refreshDownloadsInner(useCache) {
           seedingCap = sd.ratio_cap || 2;
         } catch (e) {}
       }
-      _dlLastDls = dls; _dlLastSeeds = seedingTorrents; _dlLastSeedCap = seedingCap;
+      if (actRes && actRes.ok) {
+        try { ops = await actRes.json(); } catch (e) {}
+      }
+      _dlLastDls = dls; _dlLastSeeds = seedingTorrents; _dlLastSeedCap = seedingCap; _dlLastOps = ops;
     }
-    if (!dls.length && !seedingTorrents.length) {
+    const opsHtml = _dlOpsCardsHtml(ops);
+    if (!dls.length && !seedingTorrents.length && !opsHtml) {
       // Grace period: keep polling fast for 10s after a download was started
       // (server may not have registered it yet)
       if (!useCache && _dlRecentStart && Date.now() - _dlRecentStart < 10000) {
@@ -10232,10 +10787,11 @@ async function _refreshDownloadsInner(useCache) {
       } catch (e) {}
     }
     _dlPrevCompletedCount = completedDls.length;
-    let h = '<div class="manage-card"><h2>' + tH('downloads') + '</h2>';
+    let h = '<div class="manage-card"><div class="dl-head"><h2>' + tH('downloads') + '</h2>';
     if (allDone) {
       h += '<button class="dl-clear-btn" onclick="clearDownloads()">' + tH('clear') + '</button>';
     }
+    h += '</div>';
     // Filter pill bar — All / Downloading / Queued / Completed
     const pill = (key, label, count) =>
       '<button class="pill dl-filter-pill' + (filter === key ? ' active' : '') +
@@ -10262,9 +10818,31 @@ async function _refreshDownloadsInner(useCache) {
       h += '</div>';
     }
     h += '<div class="dl-grid">';
+    // Background-operation cards ride at the top of the default view only —
+    // they aren't downloads, so the specific filters leave them out.
+    if (filter === 'all') h += opsHtml;
     // Seed cards render under "Seeding" AND under "All" — All means all.
     // (With zero downloads and active seeds, All used to render blank.)
     if (filter === 'seeding' || filter === 'all') {
+      // Bulk seed controls sit at the TOP RIGHT of the seeds section (title
+      // left, actions right — same reading order as the downloads bulk bar).
+      // Pause/Resume all only when a seed is in that state to act on;
+      // Remove all always. Under "All" they appear once there are 2+ seeds
+      // (a single seed's own row buttons cover it). The hint line spells out
+      // what Remove actually does — see /manage/seeding-action: the torrent
+      // is de-listed and its ledger intent dropped, files stay on disk.
+      if (seedingTorrents.length && (filter === 'seeding' || seedingTorrents.length >= 2)) {
+        const anyPausableSeed = seedingTorrents.some(s => s.state !== 'paused');
+        const anyResumableSeed = seedingTorrents.some(s => s.state === 'paused');
+        h += '<div class="dl-seed-head">' +
+          '<span class="dl-seed-head-title">' + tH('seeding_tab') + '</span>' +
+          '<div class="dl-seed-actions">' +
+            (anyPausableSeed ? '<button class="dl-bulk-btn" onclick="pauseAllSeeds()">' + tH('dl_pause_all') + '</button>' : '') +
+            (anyResumableSeed ? '<button class="dl-bulk-btn" onclick="resumeAllSeeds()">' + tH('dl_resume_all') + '</button>' : '') +
+            '<button class="dl-cancel-btn" onclick="_seedAction(null, \'stop_all\', this)" title="' + escAttr(t('stop_all_seeds_tip')) + '">' + tH('stop_all_seeds') + '</button>' +
+          '</div></div>' +
+          '<div class="dl-seed-hint">' + tH('seed_remove_hint') + '</div>';
+      }
       for (const sd of seedingTorrents) {
         // Prefer the installed ZIM's real title; the card opens it
         const base = (sd.filename || '').replace(/\.zim$/, '');
@@ -10300,17 +10878,18 @@ async function _refreshDownloadsInner(useCache) {
           '<span class="dl-name dl-seed-link" onclick="enterSource(\'' + escAttr(escJs(zimName)) + '\', true)" title="' + escAttr(sName) + '">' + esc(sName) + '</span>' +
           _dlLangBadge(zimName, (_zimInfo(zimName) || {}).language) +
           '<span class="dl-size">' + meta + '</span></div>' +
-          '<div class="dl-seed-goal">' + esc(goalStr) + '</div>' +
+          '<div class="dl-seed-goal">' + esc(goalStr) +
+            (sd.added ? '<span class="dl-seed-age"> · ' + tH('seed_added_when', {when: _relTime(sd.added)}) + '</span>' : '') +
+          '</div>' +
           (isMirror ? '' : '<div class="dl-progress" title="' + escAttr(t('seed_bar_tip', {cap: seedingCap})) + '"><div class="dl-progress-bar" style="width:' + pct + '%"></div></div>') +
-          '<div class="dl-actions">' +
+          '<div class="dl-actions"><div class="dl-meta"></div><div class="dl-btns">' +
             '<button class="dl-pause-btn" onclick="_seedAction(\'' + escAttr(escJs(sd.id)) + '\', \'' + (paused ? 'resume' : 'pause') + '\', this)">' + (paused ? tH('resume') : tH('pause')) + '</button>' +
             '<button class="dl-cancel-btn" onclick="_seedAction(\'' + escAttr(escJs(sd.id)) + '\', \'stop\', this)">' + tH('stop_seed') + '</button>' +
-          '</div>' +
+          '</div></div>' +
           '</div>';
       }
-      if (filter === 'seeding') {
-        if (!seedingTorrents.length) h += '<div class="dl-empty">' + tH('seeding_empty') + '</div>';
-        else h += '<div class="dl-seed-actions"><button class="dl-cancel-btn" onclick="_seedAction(null, \'stop_all\', this)">' + tH('stop_all_seeds') + '</button></div>';
+      if (filter === 'seeding' && !seedingTorrents.length) {
+        h += '<div class="dl-empty">' + tH('seeding_empty') + '</div>';
       }
     }
     if (filter !== 'seeding' && filter !== 'all' && !visibleDls.length) {
@@ -10388,11 +10967,14 @@ async function _refreshDownloadsInner(useCache) {
             ? '<button class="dl-pause-btn" disabled>' + tH('dl_switching_direct') + '</button>'
             : '<button class="dl-pause-btn" onclick="switchToDirect(\'' + escAttr(dl.id) + '\')" title="' + escAttr(t('dl_switch_direct_tip')) + '">' + tH('dl_switch_direct') + '</button>';
         }
-        h += '<div class="dl-actions">' + sourcePill + reusePill + mirrorInfo + switchBtn + startNowBtn + pauseBtn +
-          '<button class="dl-cancel-btn" onclick="cancelDownload(\'' + escAttr(dl.id) + '\')">' + tH('cancel') + '</button></div>';
+        // Status chips left, controls right — the same two columns in every row.
+        h += '<div class="dl-actions"><div class="dl-meta">' + sourcePill + reusePill + mirrorInfo +
+          '</div><div class="dl-btns">' + switchBtn + startNowBtn + pauseBtn +
+          '<button class="dl-cancel-btn" onclick="cancelDownload(\'' + escAttr(dl.id) + '\')">' + tH('cancel') + '</button></div></div>';
       }
       if (dl.error && dl.error !== 'Cancelled') {
-        h += '<div class="dl-actions"><button class="dl-retry-btn" onclick="downloadZim(\'' + escAttr(dl.url) + '\')">' + tH('retry') + '</button></div>';
+        h += '<div class="dl-actions"><div class="dl-meta"></div><div class="dl-btns">' +
+          '<button class="dl-retry-btn" onclick="downloadZim(\'' + escAttr(dl.url) + '\')">' + tH('retry') + '</button></div></div>';
       }
       h += '</div>';
     }
@@ -10502,6 +11084,7 @@ async function _refreshDownloadsInner(useCache) {
       const sel = document.getElementById('auto-update-freq');
       const autoOn = sel && sel.value !== 'disabled';
       if (anyActive) _dlTimer = setTimeout(refreshDownloads, 2000);
+      else if (_dlOpsActive(ops)) _dlTimer = setTimeout(refreshDownloads, 2000);
       else if (autoOn) _dlTimer = setTimeout(refreshDownloads, 10000);
     }
   } catch(e) {
@@ -10530,6 +11113,7 @@ async function _seedAction(id, action, btn) {
 async function clearDownloads() {
   try {
     await manageFetch('/manage/clear-downloads', { method: 'POST' });
+    _dlExportSeen = false; // also dismiss a finished export's job card
     const dlEl = document.getElementById('manage-downloads');
     if (dlEl) dlEl.innerHTML = '';
   } catch(e) {}
@@ -10635,6 +11219,25 @@ async function deleteAllDownloads() {
   await _bulkDownloadAction('/manage/cancel', active);
   try { await manageFetch('/manage/clear-downloads', { method: 'POST' }); } catch (e) {}
   refreshDownloads();
+}
+
+// Bulk seed controls: fan out the existing per-seed pause/resume endpoint over
+// the last-rendered seed list (same pattern as _bulkDownloadAction — seed
+// counts are small, and each call is one independent engine flag, so a batch
+// endpoint would buy nothing). Failures are swallowed per seed.
+async function _bulkSeedAction(action, targets) {
+  await Promise.all((targets || []).map(s => manageFetch('/manage/seeding-action', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({id: s.id, action: action}),
+  }).catch(() => {})));
+  refreshDownloads();
+  _renderSeedingSection();
+}
+function pauseAllSeeds() {
+  return _bulkSeedAction('pause', (_dlLastSeeds || []).filter(s => s.state !== 'paused'));
+}
+function resumeAllSeeds() {
+  return _bulkSeedAction('resume', (_dlLastSeeds || []).filter(s => s.state === 'paused'));
 }
 
 // Override the nightly window for one scheduled item — start it now.
@@ -11311,8 +11914,26 @@ function _readerViewInjectStyle(doc) {
     // overflows. Shared with the normal reader frame; see the constant above.
     _READER_LIGHTBOX_OVERLAY_CSS,
     '.zimi-reader figure{margin:1.3em auto}',
-    '.zimi-reader figcaption{font-size:0.78em;color:var(--rv-muted);font-family:-apple-system,sans-serif;',
-      'text-align:center;margin-top:0.4em;line-height:1.45}',
+    // Caption legibility: mwoffliner ships two markup generations — Parsoid
+    // (<figure typeof>/<figcaption>, background-color:inherit from a hardcoded
+    // #f9f9f9 painted on the figure) and legacy (.thumb>.thumbinner>.thumbcaption,
+    // no explicit color of its own). Either shape can carry a caption box
+    // color/background baked into the ZIM's own (still-live, see head comment
+    // above) stylesheet that has no idea which reader theme is active — it reads
+    // fine in the ZIM's native page but can land as illegible (e.g. dark text on
+    // a dark strip) once our light/dark/sepia palette is layered on top.
+    // !important forces both shapes onto the theme's own muted-text/no-fill
+    // pair so contrast always matches the active palette, never the source.
+    '.zimi-reader figcaption,.zimi-reader .thumbcaption{font-size:0.78em;',
+      'color:var(--rv-muted) !important;background:none !important;',
+      'font-family:-apple-system,sans-serif;margin-top:0.4em;line-height:1.45}',
+    '.zimi-reader figcaption{text-align:center}',
+    // Every figure shape, not just the two MediaWiki ones — a warc2zim or
+    // devdocs capture emits a bare <figure> with its own fill, and forcing the
+    // caption to the theme's muted ink over a fill we left alone is how a
+    // legible caption becomes an illegible one.
+    '.zimi-reader .thumb,.zimi-reader .thumbinner,.zimi-reader figure{',
+      'background:none !important;border-color:var(--rv-border) !important}',
     '.zimi-reader ul,.zimi-reader ol{margin:0 0 1.1em 1.4em}',
     '.zimi-reader li{margin:0.3em 0}',
     '.zimi-reader blockquote{border-left:3px solid var(--rv-border);margin:1.3em 0;padding-left:1em;color:var(--rv-muted)}',
@@ -11540,6 +12161,60 @@ function _bindVideoResume(frame, zim, path) {
       if (led[key]) { delete led[key]; _setStorageJSON(SK.VIDEO_RESUME, led); }
     });
   })(vids[i], i);
+}
+
+// Graceful "video not included in this ZIM" affordance. Broken-scrape ZIMs
+// (e.g. ted_en_technology) render an article whose <video> points at a 0-byte /
+// missing media entry — the player just sits dead. On a GENUINE load/decode
+// failure we swap the dead player for a small centered message. "Genuine" =
+// the element carries a MediaError (v.error) or has exhausted every <source>
+// with none playable (networkState === NETWORK_NO_SOURCE). A healthy video mid-
+// load is networkState LOADING with error === null, so it never trips this.
+// The box uses neutral grey tones + color:inherit so it reads correctly whether
+// the app is light, dark, or the raw page is running under the auto-dark invert.
+function _bindVideoError(frame) {
+  var doc; try { doc = frame.contentDocument; } catch(e) { return; }
+  if (!doc) return;
+  var vids = doc.querySelectorAll('video');
+  for (var i = 0; i < vids.length; i++) (function(v) {
+    if (v.__zimiErrBound) return;
+    v.__zimiErrBound = true;
+    var shown = false;
+    function failed() {
+      // NETWORK_NO_SOURCE === 3: browser tried all sources, none playable.
+      return !!v.error || v.networkState === 3;
+    }
+    function show() {
+      if (shown || !failed() || !v.parentNode) return;
+      shown = true;
+      var w = v.offsetWidth || parseInt(v.getAttribute('width'), 10) || 0;
+      var h = v.offsetHeight || parseInt(v.getAttribute('height'), 10) || 0;
+      var box = doc.createElement('div');
+      box.className = 'zimi-video-missing';
+      box.setAttribute('role', 'status');
+      box.style.cssText = 'display:flex;flex-direction:column;gap:10px;' +
+        'align-items:center;justify-content:center;text-align:center;' +
+        'box-sizing:border-box;padding:24px 16px;border-radius:8px;' +
+        'background:rgba(127,127,127,0.14);border:1px solid rgba(127,127,127,0.35);' +
+        'color:inherit;font:500 14px/1.4 system-ui,-apple-system,sans-serif;' +
+        'min-height:' + (h > 40 ? h : 160) + 'px;' +
+        (w > 40 ? 'max-width:' + w + 'px;' : '') + 'width:100%;';
+      box.innerHTML = '<svg aria-hidden="true" width="26" height="26" viewBox="0 0 24 24" ' +
+        'fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" ' +
+        'stroke-linejoin="round" style="opacity:.7"><path d="m23 7-7 5 7 5V7z"/>' +
+        '<rect x="1" y="5" width="15" height="14" rx="2" ry="2"/><line x1="2" y1="2" x2="22" y2="22"/></svg>' +
+        '<span></span>';
+      box.lastChild.textContent = t('video_not_included');
+      v.parentNode.insertBefore(box, v);
+      v.style.display = 'none';
+    }
+    // Capture so a failing <source> child's error (which doesn't bubble) is seen.
+    v.addEventListener('error', show, true);
+    v.addEventListener('stalled', show);
+    v.addEventListener('emptied', show);
+    // Catch sources that already resolved to nothing before we bound.
+    if (failed()) show(); else setTimeout(show, 1500);
+  })(vids[i]);
 }
 
 // Bind the tap-to-full-size lightbox to the NORMAL (non-Reader-View) article
@@ -12080,7 +12755,7 @@ function openReader(url) {
         var _fdoc = _frame0.contentDocument;
         var _dec = _frag; try { _dec = decodeURIComponent(_frag); } catch (e) {}
         var _tgt = _fdoc.getElementById(_dec) || _fdoc.getElementById(_frag) ||
-                   _fdoc.querySelector('[name="' + (window.CSS && CSS.escape ? CSS.escape(_dec) : _dec) + '"]');
+                   _fdoc.querySelector('[name="' + _cssEsc(_dec) + '"]');
         if (_tgt) _tgt.scrollIntoView();
       } catch (e) {}
       updateTopbar();
@@ -12236,6 +12911,9 @@ function openReader(url) {
         var _vm = _frameLoc.match(/^\/w\/([^\/]+)\/(.+)$/);
         if (_vm) _bindVideoResume(frame, decodeURIComponent(_vm[1]), decodeURIComponent(_vm[2]));
       } catch(e) {}
+      // Dead-player affordance for broken-scrape ZIMs (0-byte / missing media).
+      // Independent of the resume binding above — runs for any /w/ article frame.
+      try { _bindVideoError(frame); } catch(e) {}
       var _handleFrameLink = function(e) {
         var a = e.target.closest('a[href]');
         if (!a) return;
@@ -12565,6 +13243,8 @@ function renderLibraryPanel() {
     html += _renderBookmarksContent();
   }
   panel.innerHTML = html;
+  _bmEnsureBound();  // idempotent — attaches the bookmark-tree delegation once
+  if (!isHistory) _bmSyncRovingTabindex(false);
 }
 function _renderHistoryContent() {
   var h = _histLoad();
@@ -12613,7 +13293,7 @@ function _renderHistoryContent() {
       }
       i = j;
     } else if (item.type === 'article') {
-      var aIcon = item.zim ? _sourceIconHtml(item.zim, 20) : '\uD83D\uDCC4';
+      var aIcon = item.zim ? _sourceIconHtml(item.zim, 20) : _BM_PAGE_SVG;
       var aSub = item.zim ? _zimTitleWithLang(item.zim) : '';
       html += '<div class="hp-item" onclick="_closeLibraryPanel();openArticle(\'' + escJs(item.zim) + '\',\'' + escJs(item.path) + '\',\'' + escJs(item.title || '') + '\')">' +
         '<div class="hp-icon">' + aIcon + '</div>' +
@@ -12628,26 +13308,675 @@ function _renderHistoryContent() {
   if (currentGroup) html += '</div>';
   return html;
 }
+// \u2500\u2500 Bookmarks tab: folder tree (v2) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+// Rows are data-attribute driven so one delegated handler set on the persistent
+// #history-panel covers click-to-open, collapse, context menus and pointer DnD
+// across innerHTML re-renders (see _bmEnsureBound). Folders render above their
+// bookmarks within a parent; each is independently ordered.
+var _BM_INDENT = 14;        // px of indent per nesting level
+var _bmBound = false;       // delegated listeners attached once to the panel
+
+// Folder/page glyphs in the app's own icon language (thin stroke, currentColor,
+// round caps and joins, the same family as the topbar SVGs). The OS-flavored
+// emoji folder read as foreign next to them and ignored the theme ink.
+var _BM_SVG_ATTRS = 'viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"';
+var _BM_FOLDER_SVG = '<svg width="17" height="17" ' + _BM_SVG_ATTRS + '><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/></svg>';
+var _BM_FOLDER_OPEN_SVG = '<svg width="17" height="17" ' + _BM_SVG_ATTRS + '><path d="M6 14l1.45-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.55 6a2 2 0 0 1-1.94 1.5H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.93a2 2 0 0 1 1.66.9l.82 1.2a2 2 0 0 0 1.66.9H18a2 2 0 0 1 2 2v2"/></svg>';
+var _BM_PAGE_SVG = '<svg width="15" height="15" ' + _BM_SVG_ATTRS + '><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>';
+
 function _renderBookmarksContent() {
   var bk = _bkLoad();
-  if (!bk.length) {
-    return '<div class="hp-empty">' + tH('no_bookmarks') + '</div>';
+  var folders = _folLoad();
+  if (!bk.length && !folders.length) {
+    // Still offer New folder so an empty library can start organizing. The
+    // (empty) tree host must exist even now, because _bmNewFolderPrompt mounts
+    // its inline input INTO #bm-tree — without it the very first folder could
+    // never be created (the button did nothing on a pristine bookmarks tab).
+    return '<div class="hp-actions bm-actions">' +
+      '<button class="hp-action-btn" onclick="_bmNewFolderPrompt(\'\')">' + tH('bm_new_folder') + '</button></div>' +
+      '<div class="hp-empty">' + tH('no_bookmarks') + '</div>' +
+      '<div class="bm-tree" id="bm-tree" data-fid="" role="tree" aria-label="' + escAttr(t('bookmarks')) + '"></div>';
   }
-  var html = '<div class="hp-actions"><button id="export-bookmarks-btn" class="hp-action-btn" onclick="exportBookmarksToZim()">' + tH('save_to_zim') + '</button>' +
-    '<span id="export-bookmarks-status" class="hp-action-status"></span></div>';
-  html += '<div class="hp-group">';
-  for (var i = 0; i < bk.length; i++) {
-    var b = bk[i];
-    var icon = b.zim ? _sourceIconHtml(b.zim, 20) : '\uD83D\uDCC4';
-    var sub = b.zim ? _zimTitleWithLang(b.zim) : '';
-    html += '<div class="hp-item" onclick="_closeLibraryPanel();openArticle(\'' + escJs(b.zim) + '\',\'' + escJs(b.path) + '\',\'' + escJs(b.title || '') + '\')">' +
-      '<div class="hp-icon">' + icon + '</div>' +
-      '<div class="hp-detail"><div class="hp-title">' + esc(b.title || _titleFromPath(b.path)) + '</div>' +
-      '<div class="hp-sub">' + esc(sub) + '</div></div>' +
-      '<button class="hp-item-del" onclick="event.stopPropagation();_bkRemove(\'' + escJs(b.zim) + '\',\'' + escJs(b.path) + '\');renderLibraryPanel()">\u2715</button></div>';
-  }
-  html += '</div>';
+  var html = '<div class="hp-actions bm-actions">' +
+    '<button class="hp-action-btn" onclick="_bmNewFolderPrompt(\'\')">' + tH('bm_new_folder') + '</button>' +
+    '<button id="export-bookmarks-btn" class="hp-action-btn" onclick="_bmOpenExport()">' + tH('save_to_zim') + '</button></div>';
+  html += '<div class="bm-tree" id="bm-tree" data-fid="" role="tree"' +
+    ' aria-label="' + escAttr(t('bookmarks')) + '">' + _bmChildrenHtml(_BM_ROOT, 0) + '</div>';
   return html;
+}
+
+// Recursive body of a folder (its child folders, then its bookmarks).
+function _bmChildrenHtml(folderId, depth) {
+  var html = '';
+  _folChildren(folderId).forEach(function (f) {
+    html += _bmFolderRowHtml(f, depth);
+    if (!_folIsCollapsed(f.id)) html += _bmChildrenHtml(f.id, depth + 1);
+  });
+  _bkInFolder(folderId).forEach(function (b) { html += _bmBookmarkRowHtml(b, depth); });
+  return html;
+}
+
+function _bmFolderRowHtml(f, depth) {
+  var collapsed = _folIsCollapsed(f.id);
+  var count = _folBookmarkCount(f.id);
+  var pad = 6 + depth * _BM_INDENT;
+  return '<div class="bm-row bm-folder" data-fid="' + escAttr(f.id) + '" data-depth="' + depth + '"' +
+    ' style="padding-left:' + pad + 'px" role="treeitem" aria-level="' + (depth + 1) + '"' +
+    ' aria-expanded="' + (!collapsed) + '" tabindex="-1">' +
+    '<span class="bm-twist' + (collapsed ? '' : ' open') + '" data-role="twist">\u25B8</span>' +
+    '<span class="bm-ficon">' + (collapsed ? _BM_FOLDER_SVG : _BM_FOLDER_OPEN_SVG) + '</span>' +
+    '<span class="bm-name">' + esc(f.name) + '</span>' +
+    '<span class="bm-count">' + count + '</span>' +
+    '<button class="bm-gear" data-role="menu" title="' + escAttr(t('more_actions')) + '" aria-label="' + escAttr(t('more_actions')) + '">\u22EF</button>' +
+    '</div>';
+}
+
+// True once the library list has arrived and this bookmark's ZIM is not in it \u2014
+// the source was deleted or renamed under the bookmark. Opening one of these
+// lands the reader on a page that never loads, so the row says so up front.
+// Gated on a loaded list, or every row would read as dead during boot.
+function _bkSourceMissing(b) {
+  return !!(b.zim && zimsCache && zimsCache.length && !_zimInfo(b.zim));
+}
+
+function _bmBookmarkRowHtml(b, depth) {
+  var missing = _bkSourceMissing(b);
+  var icon = b.zim ? _sourceIconHtml(b.zim, 20) : _BM_PAGE_SVG;
+  var sub = missing ? t('bm_source_missing') : (b.zim ? _zimTitleWithLang(b.zim) : '');
+  var pad = 6 + depth * _BM_INDENT;
+  return '<div class="bm-row bm-bk' + (missing ? ' bm-missing' : '') + '"' +
+    ' data-zim="' + escAttr(b.zim) + '" data-path="' + escAttr(b.path) + '"' +
+    ' data-fid="' + escAttr(_bkFolderOf(b)) + '" data-depth="' + depth + '"' +
+    ' style="padding-left:' + pad + 'px" role="treeitem" aria-level="' + (depth + 1) + '" tabindex="-1">' +
+    // Stands in for the folder rows' twist so a bookmark sits to the RIGHT of
+    // the folder holding it, not left of it.
+    '<span class="bm-twist bm-twist-gap"></span>' +
+    '<span class="bm-bicon">' + icon + '</span>' +
+    '<span class="bm-detail"><span class="bm-name">' + esc(b.title || _titleFromPath(b.path)) + '</span>' +
+    (sub ? '<span class="bm-sub">' + esc(sub) + '</span>' : '') + '</span>' +
+    '<button class="bm-gear" data-role="menu" title="' + escAttr(t('more_actions')) + '" aria-label="' + escAttr(t('more_actions')) + '">\u22EF</button>' +
+    '</div>';
+}
+
+// ── Keyboard: the tree behaves like one ────────────────────────────────────
+// Roving tabindex (ARIA tree pattern): Tab reaches the tree once, arrows move
+// within it. Rows are rebuilt wholesale on every change, so the focused row is
+// remembered by key and re-focused after the rebuild.
+var _bmFocusKey = null;
+
+function _bmRowKey(row) {
+  if (!row) return null;
+  return row.classList.contains('bm-folder')
+    ? 'f:' + row.dataset.fid
+    : 'b:' + row.dataset.zim + '\n' + row.dataset.path;
+}
+function _bmRowByKey(key) {
+  if (!key) return null;
+  var host = document.getElementById('bm-tree');
+  if (!host) return null;
+  if (key.slice(0, 2) === 'f:') return host.querySelector('.bm-folder[data-fid="' + _cssEsc(key.slice(2)) + '"]');
+  var parts = key.slice(2).split('\n');
+  return host.querySelector('.bm-bk[data-zim="' + _cssEsc(parts[0]) + '"][data-path="' + _cssEsc(parts[1]) + '"]');
+}
+function _bmRows() {
+  var host = document.getElementById('bm-tree');
+  return host ? Array.prototype.slice.call(host.querySelectorAll('.bm-row')) : [];
+}
+// Exactly one row is tabbable: the remembered one, else the first.
+function _bmSyncRovingTabindex(focus) {
+  var rows = _bmRows();
+  if (!rows.length) return;
+  var target = _bmRowByKey(_bmFocusKey) || rows[0];
+  rows.forEach(function (r) { r.tabIndex = (r === target) ? 0 : -1; });
+  if (focus) target.focus();
+}
+function _bmFocusRow(row) {
+  if (!row) return;
+  _bmFocusKey = _bmRowKey(row);
+  _bmRows().forEach(function (r) { r.tabIndex = (r === row) ? 0 : -1; });
+  row.focus();
+}
+// The row whose subtree contains `row` — Left arrow's "go to my parent".
+function _bmParentRow(row) {
+  var fid = row.classList.contains('bm-folder')
+    ? _folNorm((_folById(row.dataset.fid) || {}).parent)
+    : _folNorm(row.dataset.fid);
+  if (fid === _BM_ROOT) return null;
+  return _bmRowByKey('f:' + fid);
+}
+
+function _bmTreeKeydown(e) {
+  // An inline edit (rename / new folder) owns the keyboard. Without this guard
+  // the tree handler steals ArrowUp/Down (focus moves to another row, the input
+  // blurs and commits) and Space (preventDefault + row.click() rerenders the
+  // tree), killing the edit mid-word.
+  var tag = e.target && e.target.tagName;
+  if (tag === 'INPUT' || tag === 'TEXTAREA' || (e.target && e.target.isContentEditable)) return;
+  var row = e.target.closest ? e.target.closest('.bm-row') : null;
+  if (!row || !row.parentNode || row.parentNode.id !== 'bm-tree') return;
+  var rows = _bmRows();
+  var i = rows.indexOf(row);
+  var isFolder = row.classList.contains('bm-folder');
+  var expanded = isFolder && !_folIsCollapsed(row.dataset.fid);
+  switch (e.key) {
+    case 'ArrowDown': e.preventDefault(); _bmFocusRow(rows[Math.min(i + 1, rows.length - 1)]); break;
+    case 'ArrowUp': e.preventDefault(); _bmFocusRow(rows[Math.max(i - 1, 0)]); break;
+    case 'Home': e.preventDefault(); _bmFocusRow(rows[0]); break;
+    case 'End': e.preventDefault(); _bmFocusRow(rows[rows.length - 1]); break;
+    case 'ArrowRight':
+      e.preventDefault();
+      if (isFolder && !expanded) { _bmFocusKey = _bmRowKey(row); _folToggleCollapse(row.dataset.fid); _bmRerender(); }
+      else if (isFolder && rows[i + 1]) _bmFocusRow(rows[i + 1]);
+      break;
+    case 'ArrowLeft':
+      e.preventDefault();
+      if (isFolder && expanded) { _bmFocusKey = _bmRowKey(row); _folToggleCollapse(row.dataset.fid); _bmRerender(); }
+      else _bmFocusRow(_bmParentRow(row));
+      break;
+    case 'Enter': case ' ':
+      e.preventDefault();
+      _bmFocusKey = _bmRowKey(row);
+      row.click();
+      break;
+    case 'ContextMenu': case 'F2': {
+      e.preventDefault();
+      var r = row.getBoundingClientRect();
+      _bmOpenRowMenu(row, r.left + 24, r.bottom + 2);
+      break;
+    }
+    default: return;
+  }
+}
+
+// Re-render the bookmarks tab. renderLibraryPanel rebuilds the panel innerHTML;
+// the delegated listeners live on the persistent panel element so they survive.
+function _bmRerender() {
+  if (_getLibraryTab() !== 'bookmarks') return;
+  var hadFocus = document.activeElement && document.activeElement.closest &&
+    !!document.activeElement.closest('.bm-row');
+  renderLibraryPanel();
+  _bmSyncRovingTabindex(hadFocus);
+}
+
+// Export entry point: the tree selector, optionally pre-ticked to one folder.
+function _bmOpenExport(folderId) {
+  _bmExportSelector(folderId);
+}
+
+// One keyboard contract for every inline edit input in the tree: Enter commits,
+// Escape cancels, and EVERY key stops here. The blanket stopPropagation is the
+// fix for edits dying mid-word \u2014 upstream of this input sit the tree's
+// delegated keydown (_bmTreeKeydown: arrows move row focus, blurring the input,
+// which commits; Space "clicks" the row) and the document-level Escape handler
+// that would slam the whole panel shut. Blur commits, so clicking away keeps
+// what was typed.
+function _bmBindEditInput(input, commit) {
+  input.addEventListener('keydown', function (e) {
+    e.stopPropagation();
+    if (e.key === 'Enter') { e.preventDefault(); commit(true); }
+    else if (e.key === 'Escape') { e.preventDefault(); commit(false); }
+  });
+  input.addEventListener('blur', function () { commit(true); });
+}
+
+// \u2500\u2500 New folder (inline input, not prompt()) \u2500\u2500
+function _bmNewFolderPrompt(parentId) {
+  _bmCloseInlineInput();
+  var host = document.getElementById('bm-tree');
+  if (!host) { // empty state: rerender with a tree first
+    _bmRerender();
+    host = document.getElementById('bm-tree');
+    if (!host) return;
+  }
+  var depth = 0;
+  if (parentId) {
+    var pr = host.querySelector('.bm-folder[data-fid="' + _cssEsc(parentId) + '"]');
+    depth = pr ? (parseInt(pr.dataset.depth, 10) + 1) : 0;
+  }
+  var wrap = document.createElement('div');
+  wrap.className = 'bm-row bm-newfolder';
+  wrap.style.paddingLeft = (6 + depth * _BM_INDENT) + 'px';
+  wrap.innerHTML = '<span class="bm-ficon">' + _BM_FOLDER_SVG + '</span>' +
+    '<input class="bm-newfolder-input" type="text" placeholder="' + escAttr(t('bm_folder_name')) + '" maxlength="60">';
+  // Insert at the top of the target parent's child region (root: top of tree).
+  if (parentId) {
+    var anchor = host.querySelector('.bm-folder[data-fid="' + _cssEsc(parentId) + '"]');
+    if (anchor && anchor.nextSibling) host.insertBefore(wrap, anchor.nextSibling);
+    else host.appendChild(wrap);
+  } else {
+    host.insertBefore(wrap, host.firstChild);
+  }
+  var input = wrap.querySelector('input');
+  input.focus();
+  var commit = function (save) {
+    if (wrap._done) return; wrap._done = true;
+    if (save) {
+      var name = input.value.trim();
+      if (name) { _folCreate(name, parentId); }
+    }
+    _bmRerender();
+  };
+  _bmBindEditInput(input, commit);
+}
+function _bmCloseInlineInput() {
+  var ex = document.querySelector('.bm-newfolder, .bm-renaming');
+  if (ex && ex.parentNode) ex.parentNode.removeChild(ex);
+}
+
+// \u2500\u2500 Inline rename (folders and bookmarks share one mechanism) \u2500\u2500
+// Swap the row's .bm-name for an input; Enter/blur commit (apply gets the
+// trimmed value, empty string included), Escape cancels. Semantics of an empty
+// commit are the caller's call: folders keep their old name, bookmarks revert
+// to the article's own title.
+function _bmInlineRenameRow(row, value, apply) {
+  if (!row) return;
+  var nameEl = row.querySelector('.bm-name');
+  if (!nameEl) return;
+  var input = document.createElement('input');
+  input.className = 'bm-rename-input';
+  input.type = 'text'; input.value = value; input.maxLength = 60;
+  nameEl.replaceWith(input);
+  row.classList.add('bm-renaming');
+  input.focus(); input.select();
+  var done = function (save) {
+    if (row._renDone) return; row._renDone = true;
+    if (save) apply(input.value.trim());
+    _bmRerender();
+  };
+  _bmBindEditInput(input, done);
+}
+function _bmRenameFolder(fid) {
+  var f = _folById(fid);
+  if (!f) return;
+  var row = document.querySelector('.bm-folder[data-fid="' + _cssEsc(fid) + '"]');
+  _bmInlineRenameRow(row, f.name, function (name) { if (name) _folRename(fid, name); });
+}
+function _bmRenameBookmark(zim, path) {
+  var idx = _bkFind(zim, path);
+  if (idx < 0) return;
+  var b = _bkLoad()[idx];
+  var row = document.querySelector('.bm-bk[data-zim="' + _cssEsc(zim) + '"][data-path="' + _cssEsc(path) + '"]');
+  _bmInlineRenameRow(row, b.title || _titleFromPath(b.path), function (name) { _bkRename(zim, path, name); });
+}
+
+// \u2500\u2500 Delete (a non-empty folder asks what to do with its contents) \u2500\u2500
+function _bmDeleteFolder(fid) {
+  var f = _folById(fid);
+  if (!f) return;
+  var count = _folBookmarkCount(fid);
+  var kids = _folChildren(fid).length;
+  if (!count && !kids) { _folDelete(fid, 'promote'); _bmRerender(); return; }
+  // Non-empty \u2192 offer Move-out vs Delete-all. Reuse the generic menu at center.
+  // Deferred so the folder menu's own closeCtx (fired after this action) doesn't
+  // immediately close the choice menu we're opening. A folder holding only
+  // subfolders is counted in subfolders \u2014 "0 bookmarks" is not what's at stake.
+  var note = count
+    ? tH('bm_delete_folder_q', { name: f.name, n: count })
+    : tH('bm_delete_folder_subs_q', { name: f.name, n: kids });
+  var html = '<div class="ctx-note">' + note + '</div>' +
+    '<div class="ctx-item" data-action="promote">' + tH('bm_delete_keep') + '</div>' +
+    '<div class="ctx-item danger" data-action="purge">' + tH('bm_delete_all') + '</div>';
+  var vw = window.innerWidth, vh = window.innerHeight;
+  setTimeout(function () {
+    window._openMenuAt(html, vw / 2 - 90, vh / 2 - 60, function (action) {
+      if (action === 'promote') { _folDelete(fid, 'promote'); _bmRerender(); }
+      else if (action === 'purge') { _folDelete(fid, 'contents'); _bmRerender(); }
+    });
+  }, 0);
+}
+
+// \u2500\u2500 Move to\u2026 submenu (flat, indented list of every folder + Root) \u2500\u2500
+function _bmMoveSubmenuHtml(excludeFolderId) {
+  // excludeFolderId (for moving a FOLDER) hides itself and its subtree so a
+  // cycle can't be picked.
+  var banned = {};
+  if (excludeFolderId) {
+    banned[_folNorm(excludeFolderId)] = 1;
+    _folDescendants(excludeFolderId).forEach(function (d) { banned[d] = 1; });
+  }
+  var html = '<div class="ctx-item" data-action="mv-root">' + tH('bm_root') + '</div>';
+  var walk = function (parentId, depth) {
+    _folChildren(parentId).forEach(function (f) {
+      if (banned[f.id]) return;
+      html += '<div class="ctx-item" data-action="mv" data-fid="' + escAttr(f.id) + '"' +
+        ' style="padding-left:' + (10 + depth * 12) + 'px"><span class="ctx-fico">' + _BM_FOLDER_SVG + '</span>' + esc(f.name) + '</div>';
+      walk(f.id, depth + 1);
+    });
+  };
+  walk(_BM_ROOT, 0);
+  return html;
+}
+
+function _bmFolderMenu(fid, x, y) {
+  var f = _folById(fid);
+  if (!f) return;
+  var html = '<div class="ctx-item" data-action="newsub">' + tH('bm_new_subfolder') + '</div>' +
+    '<div class="ctx-item">' + tH('move_to') + ' \u203A<div class="ctx-sub">' + _bmMoveSubmenuHtml(fid) + '</div></div>' +
+    '<div class="ctx-item" data-action="rename">' + tH('rename') + '</div>' +
+    '<div class="ctx-sep"></div>' +
+    '<div class="ctx-item" data-action="export">' + tH('bm_export_folder') + '</div>' +
+    '<div class="ctx-sep"></div>' +
+    '<div class="ctx-item danger" data-action="delete">' + tH('delete') + '</div>';
+  window._openMenuAt(html, x, y, function (action, itemEl) {
+    if (action === 'newsub') _bmNewFolderPrompt(fid);
+    else if (action === 'rename') _bmRenameFolder(fid);
+    else if (action === 'delete') _bmDeleteFolder(fid);
+    else if (action === 'export') _bmOpenExport(fid);
+    else if (action === 'mv-root') { _folReparent(fid, _BM_ROOT); _bmRerender(); }
+    else if (action === 'mv') { _folReparent(fid, itemEl.dataset.fid); _bmRerender(); }
+  });
+}
+
+function _bmBookmarkMenu(zim, path, x, y) {
+  var row = document.querySelector('.bm-bk[data-zim="' + _cssEsc(zim) + '"][data-path="' + _cssEsc(path) + '"]');
+  var missing = !!(row && row.classList.contains('bm-missing'));
+  var html = (missing
+      ? '<div class="ctx-note">' + tH('bm_source_missing') + '</div>'
+      : '<div class="ctx-item" data-action="open">' + tH('open') + '</div>') +
+    '<div class="ctx-item">' + tH('move_to') + ' \u203A<div class="ctx-sub">' + _bmMoveSubmenuHtml('') + '</div></div>' +
+    '<div class="ctx-item" data-action="rename">' + tH('rename') + '</div>' +
+    '<div class="ctx-sep"></div>' +
+    '<div class="ctx-item danger" data-action="remove">' + tH('bm_remove') + '</div>';
+  window._openMenuAt(html, x, y, function (action, itemEl) {
+    if (action === 'open') { _closeLibraryPanel(); openArticle(zim, path, ''); }
+    else if (action === 'rename') _bmRenameBookmark(zim, path);
+    else if (action === 'remove') { _bkRemove(zim, path); _bmRerender(); }
+    else if (action === 'mv-root') { _bkSetFolder(zim, path, _BM_ROOT); _bmRerender(); }
+    else if (action === 'mv') { _bkSetFolder(zim, path, itemEl.dataset.fid); _bmRerender(); }
+  });
+}
+
+// \u2500\u2500 Delegated interaction: click / contextmenu / pointer DnD + long-press \u2500\u2500
+var _bmDrag = null;        // active drag state
+var _bmLpTimer = null;     // touch long-press timer
+var _bmPointerStart = null;
+
+function _bmEnsureBound() {
+  if (_bmBound) return;
+  var panel = document.getElementById('history-panel');
+  if (!panel) return;
+  _bmBound = true;
+
+  panel.addEventListener('click', function (e) {
+    if (_getLibraryTab() !== 'bookmarks') return;
+    var menuBtn = e.target.closest('.bm-gear');
+    var row = e.target.closest('.bm-row');
+    if (!row) return;
+    // A row mid-edit acts as a form, not a row: a click inside it must neither
+    // open the article nor toggle collapse (the input's blur already committed).
+    if (row.classList.contains('bm-renaming') || row.classList.contains('bm-newfolder')) return;
+    if (menuBtn) {
+      e.preventDefault(); e.stopPropagation();
+      var r = menuBtn.getBoundingClientRect();
+      _bmOpenRowMenu(row, r.left, r.bottom + 2);
+      return;
+    }
+    if (row.classList.contains('bm-folder')) {
+      // Twist or anywhere on the folder row toggles collapse.
+      _folToggleCollapse(row.dataset.fid);
+      _bmRerender();
+    } else if (row.classList.contains('bm-bk')) {
+      if (row.classList.contains('bm-missing')) { _showToast(t('bm_source_missing')); return; }
+      _closeLibraryPanel();
+      openArticle(row.dataset.zim, row.dataset.path, row.querySelector('.bm-name') ? row.querySelector('.bm-name').textContent : '');
+    }
+  });
+
+  panel.addEventListener('contextmenu', function (e) {
+    if (_getLibraryTab() !== 'bookmarks') return;
+    var row = e.target.closest('.bm-row');
+    if (!row) return;
+    e.preventDefault();
+    e.stopPropagation();  // keep the document-level closeCtx from closing what we just opened
+    _bmOpenRowMenu(row, e.clientX + 2, e.clientY + 2);
+  });
+
+  // Pointer DnD + touch long-press. One handler set, both input types.
+  panel.addEventListener('pointerdown', _bmPointerDown);
+  panel.addEventListener('keydown', function (e) {
+    if (_getLibraryTab() !== 'bookmarks') return;
+    _bmTreeKeydown(e);
+  });
+  // Clicking a row makes it the tabbable one, so Tab returns where you were.
+  panel.addEventListener('focusin', function (e) {
+    var row = e.target.closest ? e.target.closest('.bm-row') : null;
+    if (row) _bmFocusKey = _bmRowKey(row);
+  });
+}
+
+function _bmOpenRowMenu(row, x, y) {
+  if (row.classList.contains('bm-folder')) _bmFolderMenu(row.dataset.fid, x, y);
+  else if (row.classList.contains('bm-bk')) _bmBookmarkMenu(row.dataset.zim, row.dataset.path, x, y);
+}
+
+function _bmPointerDown(e) {
+  if (_getLibraryTab() !== 'bookmarks') return;
+  if (e.button && e.button !== 0) return;  // primary button only — right-click opens the menu
+  if (e.target.closest('.bm-gear') || e.target.closest('input')) return; // let buttons/inputs work
+  var row = e.target.closest('.bm-row');
+  if (!row || row.classList.contains('bm-newfolder') || row.classList.contains('bm-renaming')) return;
+  var touch = e.pointerType === 'touch';
+  _bmPointerStart = { x: e.clientX, y: e.clientY, row: row, id: e.pointerId, touch: touch, moved: false };
+  document.addEventListener('pointermove', _bmPointerMove, { passive: false });
+  document.addEventListener('pointerup', _bmPointerUp);
+  document.addEventListener('pointercancel', _bmPointerUp);
+  if (touch) {
+    // Long-press-to-lift: hold 320ms without a scroll \u2192 drag mode + haptic.
+    _bmLpTimer = setTimeout(function () {
+      _bmLpTimer = null;
+      if (_bmPointerStart && !_bmPointerStart.moved) {
+        if (navigator.vibrate) { try { navigator.vibrate(8); } catch (_) {} }
+        _bmBeginDrag(_bmPointerStart.row, _bmPointerStart.x, _bmPointerStart.y);
+      }
+    }, 320);
+  }
+}
+
+function _bmBeginDrag(row, x, y) {
+  var kind = row.classList.contains('bm-folder') ? 'folder' : 'bk';
+  var ghost = document.createElement('div');
+  ghost.className = 'bm-drag-ghost';
+  ghost.textContent = (row.querySelector('.bm-name') || {}).textContent || '';
+  document.body.appendChild(ghost);
+  ghost.style.left = x + 'px'; ghost.style.top = y + 'px';
+  row.classList.add('bm-dragging');
+  _bmDrag = { kind: kind, row: row, ghost: ghost, liftX: x, liftY: y, movedSinceLift: false };
+}
+
+function _bmPointerMove(e) {
+  if (!_bmPointerStart) return;
+  var dx = e.clientX - _bmPointerStart.x, dy = e.clientY - _bmPointerStart.y;
+  if (!_bmDrag) {
+    if (Math.abs(dx) > 4 || Math.abs(dy) > 4) {
+      _bmPointerStart.moved = true;
+      if (_bmPointerStart.touch) {
+        // Movement before the hold fired = a scroll; let it be, cancel the lift.
+        if (_bmLpTimer) { clearTimeout(_bmLpTimer); _bmLpTimer = null; _bmTeardownPointer(); }
+        return;
+      }
+      _bmBeginDrag(_bmPointerStart.row, e.clientX, e.clientY);  // mouse: lift on move
+    } else { return; }
+  }
+  e.preventDefault();
+  _bmDrag.movedSinceLift = _bmDrag.movedSinceLift || Math.abs(e.clientX - _bmDrag.liftX) > 4 || Math.abs(e.clientY - _bmDrag.liftY) > 4;
+  _bmDrag.x = e.clientX; _bmDrag.y = e.clientY;
+  _bmDrag.ghost.style.left = e.clientX + 'px';
+  _bmDrag.ghost.style.top = e.clientY + 'px';
+  _bmUpdateDropTarget(e.clientX, e.clientY);
+  _bmEdgeScroll(e.clientY);
+}
+
+// Hold the pointer near the top or bottom edge of the panel and the tree
+// scrolls under it. Without this, a drop target more than one screen away from
+// the lift point is simply unreachable — which is every real library.
+var _BM_EDGE = 52;          // px from a panel edge that starts the scroll
+var _BM_EDGE_STEP = 14;     // px per frame
+var _bmEdgeTimer = null, _bmEdgeDir = 0;
+function _bmEdgeScroll(y) {
+  var panel = document.getElementById('history-panel');
+  if (!panel) return;
+  var r = panel.getBoundingClientRect();
+  _bmEdgeDir = (y < r.top + _BM_EDGE) ? -1 : (y > r.bottom - _BM_EDGE) ? 1 : 0;
+  if (!_bmEdgeDir) { _bmStopEdgeScroll(); return; }
+  if (_bmEdgeTimer) return;
+  _bmEdgeTimer = setInterval(function () {
+    if (!_bmDrag) { _bmStopEdgeScroll(); return; }
+    var before = panel.scrollTop;
+    panel.scrollTop += _bmEdgeDir * _BM_EDGE_STEP;
+    if (panel.scrollTop === before) { _bmStopEdgeScroll(); return; }  // hit an end
+    _bmUpdateDropTarget(_bmDrag.x, _bmDrag.y);  // rows moved under a still pointer
+  }, 16);
+}
+function _bmStopEdgeScroll() {
+  if (_bmEdgeTimer) { clearInterval(_bmEdgeTimer); _bmEdgeTimer = null; }
+  _bmEdgeDir = 0;
+}
+
+// Resolve what a drop at (x,y) would do and reflect it with indicator classes.
+function _bmUpdateDropTarget(x, y) {
+  _bmClearDropMarks();
+  var el = document.elementFromPoint(x, y);
+  var host = document.getElementById('bm-tree');
+  if (!host) return;
+  var row = el && el.closest ? el.closest('.bm-row') : null;
+  if (row && (row === _bmDrag.row)) { _bmDrag.drop = null; return; }
+  if (!row) {
+    // Over the tree but not a row \u2192 drop into root (append).
+    if (host.contains(el)) { host.classList.add('bm-drop-root'); _bmDrag.drop = { mode: 'into', fid: _BM_ROOT }; }
+    else { _bmDrag.drop = null; }
+    return;
+  }
+  var rect = row.getBoundingClientRect();
+  var rel = (y - rect.top) / rect.height;
+  if (row.classList.contains('bm-folder')) {
+    if (_bmDrag.kind === 'bk') {
+      // A bookmark can only ever go INSIDE a folder \u2014 bookmarks always sort
+      // after folders within a parent, so "before this folder" has no meaning.
+      // Show the one thing that can happen rather than a line that lies.
+      row.classList.add('bm-drop-into');
+      _bmDrag.drop = { mode: 'into', fid: row.dataset.fid };
+      return;
+    }
+    // Dropping a folder into its own descendant is illegal \u2014 treat as reorder.
+    var intoOk = !_folWouldCycle(_bmDrag.row.dataset.fid, row.dataset.fid);
+    if (rel < 0.30 || !intoOk) {
+      row.classList.add('bm-drop-before');
+      _bmDrag.drop = { mode: 'before-folder', fid: row.dataset.fid };
+    } else {
+      row.classList.add('bm-drop-into');
+      _bmDrag.drop = { mode: 'into', fid: row.dataset.fid };
+    }
+  } else if (_bmDrag.kind === 'folder') {
+    // A folder over a bookmark resolves to that bookmark's folder \u2014 otherwise
+    // every bookmark row is a dead zone that still draws a drop line.
+    var into = _folNorm(row.dataset.fid);
+    if (_folNorm(_folById(_bmDrag.row.dataset.fid).parent) === into ||
+        _folWouldCycle(_bmDrag.row.dataset.fid, into)) { _bmDrag.drop = null; return; }
+    _bmMarkFolderTarget(into);
+    _bmDrag.drop = { mode: 'into', fid: into };
+  } else {  // bookmark over bookmark \u2192 reorder within its folder (before / after)
+    if (rel < 0.5) { row.classList.add('bm-drop-before'); _bmDrag.drop = { mode: 'before-bk', row: row }; }
+    else { row.classList.add('bm-drop-after'); _bmDrag.drop = { mode: 'after-bk', row: row }; }
+  }
+}
+
+// Highlight the row of the folder a drop would land in (the tree itself when
+// that folder is root), so the target is never left to inference.
+function _bmMarkFolderTarget(fid) {
+  var host = document.getElementById('bm-tree');
+  if (!host) return;
+  if (_folNorm(fid) === _BM_ROOT) { host.classList.add('bm-drop-root'); return; }
+  var row = host.querySelector('.bm-folder[data-fid="' + _cssEsc(fid) + '"]');
+  if (row) row.classList.add('bm-drop-into');
+}
+
+function _bmClearDropMarks() {
+  var host = document.getElementById('history-panel');
+  if (!host) return;
+  var tree = document.getElementById('bm-tree');
+  if (tree) tree.classList.remove('bm-drop-root');
+  host.querySelectorAll('.bm-drop-into,.bm-drop-before,.bm-drop-after').forEach(function (n) {
+    n.classList.remove('bm-drop-into', 'bm-drop-before', 'bm-drop-after');
+  });
+}
+
+function _bmPointerUp(e) {
+  if (_bmLpTimer) { clearTimeout(_bmLpTimer); _bmLpTimer = null; }
+  var drag = _bmDrag, start = _bmPointerStart;
+  _bmTeardownPointer();
+  if (!drag) return;  // was never lifted \u2192 a plain click/scroll, handled elsewhere
+  if (drag.ghost && drag.ghost.parentNode) drag.ghost.parentNode.removeChild(drag.ghost);
+  drag.row.classList.remove('bm-dragging');
+  _bmClearDropMarks();
+  // Touch lift released in place without moving \u2192 show the context menu instead.
+  if (start && start.touch && !drag.movedSinceLift) {
+    _bmSwallowNextClick(drag.row);
+    _bmOpenRowMenu(drag.row, start.x + 2, start.y + 2);
+    _bmDrag = null;
+    return;
+  }
+  _bmCommitDrop(drag);
+  _bmDrag = null;
+}
+
+function _bmCommitDrop(drag) {
+  var d = drag.drop;
+  if (!d) return;
+  if (d.mode === 'into') _folExpand(d.fid);  // never drop something into a folder that hides it
+  if (drag.kind === 'bk') {
+    var zim = drag.row.dataset.zim, path = drag.row.dataset.path;
+    if (d.mode === 'into') _bkSetFolder(zim, path, d.fid);
+    else if (d.mode === 'before-bk' || d.mode === 'after-bk') {
+      var tgt = d.row;
+      var destFid = tgt.dataset.fid;
+      var beforeKey = null;
+      if (d.mode === 'before-bk') beforeKey = tgt.dataset.zim + '\n' + tgt.dataset.path;
+      else {
+        // after \u2192 before the NEXT bookmark sibling in the same folder, if any
+        var sibs = _bkInFolder(destFid);
+        var ti = sibs.findIndex(function (b) { return b.zim === tgt.dataset.zim && b.path === tgt.dataset.path; });
+        if (ti >= 0 && ti + 1 < sibs.length) beforeKey = sibs[ti + 1].zim + '\n' + sibs[ti + 1].path;
+      }
+      _bkSetFolder(zim, path, destFid, beforeKey);
+    }
+  } else {  // folder
+    var fid = drag.row.dataset.fid;
+    if (d.mode === 'into') _folReparent(fid, d.fid);
+    else if (d.mode === 'before-folder') {
+      var tf = _folById(d.fid);
+      if (tf) {
+        // reparent to the target's parent, then order before it
+        if (_folNorm(tf.parent) !== _folNorm(_folById(fid).parent)) _folReparent(fid, tf.parent);
+        _folReorder(fid, d.fid);
+      }
+    }
+  }
+  _bmRerender();
+}
+
+// A touch release fires a synthetic click a moment later. Left alone it lands on
+// the row, and the document's outside-dismiss handler shuts the menu the
+// long-press just opened — making the row menu unreachable by finger. Swallow
+// that one click, but scope it to the pressed ROW: an early tap on a menu item
+// (which sits outside the row) must still reach the menu, or opening then quickly
+// choosing an action reads as flaky. Time-boxed and one-shot as a backstop.
+var _BM_SYNTH_CLICK_MS = 400;
+function _bmSwallowNextClick(row) {
+  var until = Date.now() + _BM_SYNTH_CLICK_MS;
+  var kill = function (e) {
+    document.removeEventListener('click', kill, true);
+    if (Date.now() < until && (!row || row.contains(e.target))) { e.preventDefault(); e.stopPropagation(); }
+  };
+  document.addEventListener('click', kill, true);
+  setTimeout(function () { document.removeEventListener('click', kill, true); }, _BM_SYNTH_CLICK_MS);
+}
+
+function _bmTeardownPointer() {
+  _bmStopEdgeScroll();
+  document.removeEventListener('pointermove', _bmPointerMove);
+  document.removeEventListener('pointerup', _bmPointerUp);
+  document.removeEventListener('pointercancel', _bmPointerUp);
+  _bmPointerStart = null;
 }
 
 function _pushArticleHistory(zim, path) {
@@ -12690,50 +14019,481 @@ function _bkRemove(zim, path) {
   var idx = _bkFind(zim, path);
   if (idx >= 0) { _bkLoad().splice(idx, 1); _bkSave(); }
 }
-// Save to ZIM: POST the client's bookmark list (server has no copy) and poll
-// until the export ZIM is written and rescanned into the library.
-var _exportPoll = null;
-function exportBookmarksToZim() {
+// Rename a bookmark. The record's `title` stays THE display field, so every
+// consumer (tree rows, export-to-ZIM article titles, /userdata sync blob) sees
+// the custom name with no extra plumbing; the article's own title moves to
+// `origTitle` so an empty rename can restore it. Typing the original back is
+// the same revert (origTitle cleared) rather than a no-op custom name.
+function _bkRename(zim, path, name) {
+  var idx = _bkFind(zim, path);
+  if (idx < 0) return;
+  var b = _bkLoad()[idx];
+  var orig = (b.origTitle != null && b.origTitle !== '') ? b.origTitle : (b.title || _titleFromPath(b.path));
+  if (name && name !== orig) { b.origTitle = orig; b.title = name; }
+  else { delete b.origTitle; b.title = orig; }
+  _bkSave();
+}
+
+// ── Bookmark folders (v2) ──────────────────────────────────────────────────
+// Nested folders, arbitrary depth. Folders are their own records keyed by a
+// generated id; each bookmark carries a `folder` id (null/"" = root) plus an
+// `order` for intra-folder sort. Migration is implicit: a pre-v2 bookmark has
+// no `folder` (→ root) and no `order` (→ falls back to timestamp-desc). Empty
+// folders are representable (the whole reason folders are separate records).
+// The two localStorage keys ride in the same /userdata + backup blob as
+// BOOKMARKS (see _collectBrowserData). ROOT is the implicit null parent.
+var _BM_ROOT = '';               // canonical root folder id
+var _bmFolders = null;           // in-memory cache of the folders array
+
+function _folLoad() {
+  if (_bmFolders !== null) return _bmFolders;
+  try { _bmFolders = JSON.parse(localStorage.getItem(SK.BM_FOLDERS)) || []; }
+  catch (e) { _bmFolders = []; }
+  if (!Array.isArray(_bmFolders)) _bmFolders = [];
+  return _bmFolders;
+}
+function _folSave() {
+  if (!_bmFolders) return;
+  try { localStorage.setItem(SK.BM_FOLDERS, JSON.stringify(_bmFolders)); } catch (e) {}
+}
+function _folNorm(id) { return (id == null) ? _BM_ROOT : String(id); }
+function _folById(id) {
+  id = _folNorm(id);
+  if (id === _BM_ROOT) return null;
+  return _folLoad().find(function (f) { return f.id === id; }) || null;
+}
+function _folExists(id) { return _folNorm(id) === _BM_ROOT || !!_folById(id); }
+// A stable, collision-resistant id — time in base36 plus a little randomness.
+function _folNewId() {
+  return 'f_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 7);
+}
+// Child folders of `parentId`, ordered by `order` then name (case-insensitive).
+function _folChildren(parentId) {
+  parentId = _folNorm(parentId);
+  return _folLoad().filter(function (f) { return _folNorm(f.parent) === parentId; })
+    .sort(function (a, b) {
+      var d = (a.order || 0) - (b.order || 0);
+      return d || (a.name || '').toLowerCase().localeCompare((b.name || '').toLowerCase());
+    });
+}
+// The folder a bookmark actually lives in. A reference to a folder that no
+// longer exists (a merge from a device that deleted it, or data written by a
+// build that dropped a save) resolves to root, so such a bookmark stays
+// reachable instead of disappearing from every folder at once.
+function _bkFolderOf(b) {
+  var id = _folNorm(b.folder);
+  return _folExists(id) ? id : _BM_ROOT;
+}
+// Bookmarks directly inside `folderId`, ordered by `order` then timestamp-desc
+// (so pre-v2 bookmarks — no order — keep their recency ordering).
+function _bkInFolder(folderId) {
+  folderId = _folNorm(folderId);
+  return _bkLoad().filter(function (b) { return _bkFolderOf(b) === folderId; })
+    .sort(function (a, b) {
+      var ao = (a.order == null) ? Infinity : a.order;
+      var bo = (b.order == null) ? Infinity : b.order;
+      if (ao !== bo) return ao - bo;
+      return (b.timestamp || 0) - (a.timestamp || 0);
+    });
+}
+// Every descendant folder id of `id` (not including `id`) — for delete + the
+// reparent cycle guard.
+function _folDescendants(id) {
+  var out = [], stack = _folChildren(id).map(function (f) { return f.id; });
+  while (stack.length) {
+    var cur = stack.pop();
+    out.push(cur);
+    _folChildren(cur).forEach(function (f) { stack.push(f.id); });
+  }
+  return out;
+}
+// True if `candidate` is `id` or an ancestor of it — a folder can't be moved
+// into itself or its own subtree.
+function _folWouldCycle(id, candidateParent) {
+  candidateParent = _folNorm(candidateParent);
+  if (candidateParent === _folNorm(id)) return true;
+  return _folDescendants(id).indexOf(candidateParent) >= 0;
+}
+function _folNextOrder(parentId) {
+  var kids = _folChildren(parentId);
+  return kids.length ? (kids[kids.length - 1].order || 0) + 1 : 0;
+}
+function _bkNextOrder(folderId) {
+  var items = _bkInFolder(folderId);
+  var last = items[items.length - 1];
+  var lo = last && last.order != null ? last.order : items.length - 1;
+  return (items.length ? lo : -1) + 1;
+}
+function _folCreate(name, parentId) {
+  name = (name || '').trim() || t('bm_untitled_folder');
+  parentId = _folNorm(parentId);
+  var rec = { id: _folNewId(), name: name, parent: parentId, order: _folNextOrder(parentId) };
+  _folLoad().push(rec);
+  _folSave();
+  return rec.id;
+}
+function _folRename(id, name) {
+  var f = _folById(id);
+  if (!f) return;
+  f.name = (name || '').trim() || f.name;
+  _folSave();
+}
+// Reparent a folder. Returns false (no-op) when the move would create a cycle.
+function _folReparent(id, newParent) {
+  var f = _folById(id);
+  if (!f) return false;
+  newParent = _folNorm(newParent);
+  if (_folWouldCycle(id, newParent)) return false;
+  f.parent = newParent;
+  f.order = _folNextOrder(newParent);
+  _folSave();
+  return true;
+}
+// Delete a folder. mode 'contents' removes its bookmarks + subfolders (deep);
+// mode 'promote' lifts its bookmarks and child folders up to its own parent.
+function _folDelete(id, mode) {
+  var f = _folById(id);
+  if (!f) return;
+  var parent = _folNorm(f.parent);
+  var subtree = _folDescendants(id).concat([id]);
+  if (mode === 'promote') {
+    _bkLoad().forEach(function (b) { if (_folNorm(b.folder) === _folNorm(id)) b.folder = parent; });
+    _folChildren(id).forEach(function (c) { c.parent = parent; });
+    _bmFolders = _folLoad().filter(function (x) { return x.id !== id; });
+    _bkSave();  // the promoted bookmarks changed folder — persist, or they orphan
+  } else {  // 'contents' (default): purge everything under this folder
+    var kill = {};
+    subtree.forEach(function (sid) { kill[sid] = 1; });
+    _bookmarks = _bkLoad().filter(function (b) { return !kill[_folNorm(b.folder)]; });
+    _bmFolders = _folLoad().filter(function (x) { return !kill[x.id]; });
+    _bkSave();
+  }
+  _folSave();
+}
+// Move a bookmark into `folderId`. `beforeKey` (a _bookmarkKey) optionally
+// places it right before that sibling; omitted → appended to the end.
+function _bkSetFolder(zim, path, folderId, beforeKey) {
+  var idx = _bkFind(zim, path);
+  if (idx < 0) return;
   var bk = _bkLoad();
-  if (!bk.length) return; // guard: nothing to export
-  var btn = document.getElementById('export-bookmarks-btn');
-  var status = document.getElementById('export-bookmarks-status');
-  if (btn) btn.disabled = true;
-  if (status) status.textContent = t('save_to_zim_working');
-  var payload = bk.map(function(b) { return { zim: b.zim, path: b.path, title: b.title || '' }; });
+  var b = bk[idx];
+  folderId = _folExists(folderId) ? _folNorm(folderId) : _BM_ROOT;
+  b.folder = folderId;
+  // Reorder within the destination: rebuild the ordered sibling list with `b`
+  // inserted at the requested slot, then write back contiguous order values.
+  var sibs = _bkInFolder(folderId).filter(function (x) { return x !== b; });
+  var at = sibs.length;
+  if (beforeKey) {
+    var p = sibs.findIndex(function (x) { return _bookmarkKey(x) === beforeKey; });
+    if (p >= 0) at = p;
+  }
+  sibs.splice(at, 0, b);
+  sibs.forEach(function (x, i) { x.order = i; });
+  _bkSave();
+}
+// Reorder a folder among its siblings, before `beforeId` (or append).
+function _folReorder(id, beforeId) {
+  var f = _folById(id);
+  if (!f) return;
+  var sibs = _folChildren(f.parent).filter(function (x) { return x.id !== id; });
+  var at = sibs.length;
+  if (beforeId) {
+    var p = sibs.findIndex(function (x) { return x.id === beforeId; });
+    if (p >= 0) at = p;
+  }
+  sibs.splice(at, 0, f);
+  sibs.forEach(function (x, i) { x.order = i; });
+  _folSave();
+}
+// Per-device collapse state (not synced — it's UI, not data).
+function _folCollapsedSet() {
+  try { return new Set(JSON.parse(localStorage.getItem(SK.BM_COLLAPSED)) || []); }
+  catch (e) { return new Set(); }
+}
+function _folIsCollapsed(id) { return _folCollapsedSet().has(_folNorm(id)); }
+function _folSaveCollapsed(s) {
+  try { localStorage.setItem(SK.BM_COLLAPSED, JSON.stringify(Array.from(s))); } catch (e) {}
+}
+function _folToggleCollapse(id) {
+  var s = _folCollapsedSet();
+  id = _folNorm(id);
+  if (s.has(id)) s.delete(id); else s.add(id);
+  _folSaveCollapsed(s);
+}
+function _folExpand(id) {
+  var s = _folCollapsedSet();
+  if (s.delete(_folNorm(id))) _folSaveCollapsed(s);
+}
+// Recursive count of bookmarks under a folder (self + descendants) — the badge.
+function _folBookmarkCount(id) {
+  var ids = [_folNorm(id)].concat(_folDescendants(id).map(_folNorm));
+  var set = {}; ids.forEach(function (x) { set[x] = 1; });
+  return _bkLoad().filter(function (b) { return set[_bkFolderOf(b)]; }).length;
+}
+
+// Export to ZIM: POST the client's bookmark list (server has no copy) and poll
+// until the export ZIM is written and rescanned into the library.
+// ── Tree export selector ─────────────────────────────────────────────────────
+// A folder-tree checkbox picker. Grouping DECISION (v1.8.2): ONE ZIM per
+// export, named by the user (the name field prefills from the selection).
+// Every selected top-level folder becomes a SECTION inside that ZIM; nested
+// selected subfolders keep their place as "Parent / Child" sections. A single
+// selected folder keeps the old shape (its own bookmarks unsectioned, its
+// subfolders as sections). An EMPTY selected folder still contributes its
+// section header — a ticked folder is never silently dropped — and a selection
+// with zero articles overall disables Export with a "nothing to export" note.
+// Each ZIM carries the real article HTML + images + styling.
+function _bmExportSelector(preFolderId) {
+  _bmCloseExport();
+  var rootBk = _bkInFolder(_BM_ROOT).length;
+  var tree = '';
+  // Opened from a folder's menu → just that subtree. Opened from the tab's
+  // "Export to ZIM" → everything, matching what that button did before the
+  // selector existed. Opening a picker with nothing ticked makes its own
+  // primary button fail on the first press.
+  var walk = function (parentId, depth) {
+    _folChildren(parentId).forEach(function (f) {
+      var checked = preFolderId
+        ? (f.id === preFolderId || _folDescendants(preFolderId).indexOf(f.id) >= 0)
+        : true;
+      tree += '<label class="bm-exp-row" style="padding-left:' + (8 + depth * 16) + 'px">' +
+        '<input type="checkbox" data-fid="' + escAttr(f.id) + '"' + (checked ? ' checked' : '') + '>' +
+        '<span class="bm-exp-ico">' + _BM_FOLDER_SVG + '</span>' +
+        '<span class="bm-exp-name">' + esc(f.name) + '</span>' +
+        '<span class="bm-exp-count">' + _folBookmarkCount(f.id) + '</span></label>';
+      walk(f.id, depth + 1);
+    });
+  };
+  walk(_BM_ROOT, 0);
+  if (rootBk) {
+    tree += '<label class="bm-exp-row" style="padding-left:8px">' +
+      '<input type="checkbox" data-fid="__unfiled__"' + (preFolderId ? '' : ' checked') + '>' +
+      '<span class="bm-exp-ico">' + _BM_PAGE_SVG + '</span>' +
+      '<span class="bm-exp-name">' + tH('bm_export_unfiled') + '</span>' +
+      '<span class="bm-exp-count">' + rootBk + '</span></label>';
+  }
+  if (!tree) tree = '<div class="bm-exp-empty">' + tH('no_bookmarks') + '</div>';
+  var ov = document.createElement('div');
+  ov.className = 'bm-export-overlay';
+  ov.id = 'bm-export-overlay';
+  ov.innerHTML =
+    '<div class="bm-export-modal" role="dialog" aria-modal="true" aria-label="' + escAttr(t('bm_export_title')) + '">' +
+    '<div class="bm-export-head">' + tH('bm_export_title') + '</div>' +
+    '<div class="bm-export-desc">' + tH('bm_export_desc') + '</div>' +
+    '<div class="bm-export-tree" id="bm-export-tree">' + tree + '</div>' +
+    '<label class="bm-export-name-row" for="bm-export-name">' + tH('bm_export_name_label') +
+    '<input id="bm-export-name" type="text" maxlength="60" spellcheck="false" autocomplete="off"></label>' +
+    '<div class="bm-export-count" id="bm-export-count"></div>' +
+    '<div class="bm-export-status" id="bm-export-status"></div>' +
+    '<div class="bm-export-actions">' +
+    '<button class="hp-action-btn" id="bm-export-all" onclick="_bmExportToggleAll()"></button>' +
+    '<span style="flex:1"></span>' +
+    '<button class="hp-action-btn" onclick="_bmCloseExport()">' + tH('cancel') + '</button>' +
+    '<button class="hp-action-btn primary" id="bm-export-go" onclick="_bmExportSubmit()">' + tH('bm_export_go') + '</button>' +
+    '</div></div>';
+  document.body.appendChild(ov);
+  // Name prefills from the selection and keeps tracking it until the user
+  // types; a manual edit pins it (the picker never overwrites user input).
+  var nameInput = ov.querySelector('#bm-export-name');
+  nameInput.value = _bmExportDefaultName();
+  nameInput.addEventListener('input', function () { nameInput.dataset.dirty = '1'; });
+  // Checking a folder auto-(un)checks its descendants; you can still uncheck one.
+  ov.querySelector('#bm-export-tree').addEventListener('change', function (e) {
+    var cb = e.target.closest('input[type=checkbox]');
+    if (!cb) return;
+    if (cb.dataset.fid !== '__unfiled__') {
+      _folDescendants(cb.dataset.fid).forEach(function (id) {
+        var d = ov.querySelector('input[data-fid="' + _cssEsc(id) + '"]');
+        if (d) d.checked = cb.checked;
+      });
+    }
+    _bmExportSyncUI();
+  });
+  ov.addEventListener('click', function (e) { if (e.target === ov) _bmCloseExport(); });
+  _bmExportSyncUI();
+}
+function _bmCloseExport() {
+  clearTimeout(_exportPoll);
+  var ov = document.getElementById('bm-export-overlay');
+  if (ov && ov.parentNode) ov.parentNode.removeChild(ov);
+}
+// One button for both directions — with the tree pre-ticked, a "Select all"
+// that can only ever be a no-op is a dead control.
+function _bmExportBoxes() {
+  var ov = document.getElementById('bm-export-overlay');
+  return ov ? Array.prototype.slice.call(ov.querySelectorAll('#bm-export-tree input[type=checkbox]')) : [];
+}
+function _bmExportToggleAll() {
+  var boxes = _bmExportBoxes();
+  var wantAll = boxes.some(function (cb) { return !cb.checked; });
+  boxes.forEach(function (cb) { cb.checked = wantAll; });
+  _bmExportSyncAllBtn();
+}
+function _bmExportSyncAllBtn() {
+  var btn = document.getElementById('bm-export-all');
+  if (!btn) return;
+  var boxes = _bmExportBoxes();
+  btn.textContent = boxes.length && boxes.every(function (cb) { return cb.checked; })
+    ? t('select_none') : t('select_all');
+}
+// One pass that keeps the modal honest after every tick: the Select all/none
+// label, the live article count, the name prefill (until user-edited) and the
+// Export button. ZERO selected articles disables Export — an all-empty
+// selection reads "nothing to export" instead of silently writing a husk.
+function _bmExportSyncUI() {
+  _bmExportSyncAllBtn();
+  var ov = document.getElementById('bm-export-overlay');
+  if (!ov) return;
+  var nameInput = ov.querySelector('#bm-export-name');
+  if (nameInput && !nameInput.dataset.dirty) nameInput.value = _bmExportDefaultName();
+  var sel = _bmExportSelection();
+  var picked = sel.ids.length > 0 || sel.unfiled;
+  var n = _bmComposeExportJob(sel.ids, sel.unfiled, '').bookmarks.length;
+  var countEl = ov.querySelector('#bm-export-count');
+  if (countEl) countEl.textContent = tPlural('bm_count', n);
+  var go = ov.querySelector('#bm-export-go');
+  if (go) go.disabled = !n;
+  var status = ov.querySelector('#bm-export-status');
+  if (status) {
+    status.style.color = picked && !n ? 'var(--amber)' : '';
+    status.textContent = !picked ? t('bm_export_none_selected') : (!n ? t('bm_export_nothing') : '');
+  }
+}
+// Checked folder ids in tree (DOM) order + the unfiled flag.
+function _bmExportSelection() {
+  var ids = [], unfiled = false;
+  _bmExportBoxes().forEach(function (cb) {
+    if (!cb.checked) return;
+    if (cb.dataset.fid === '__unfiled__') unfiled = true;
+    else ids.push(cb.dataset.fid);
+  });
+  return { ids: ids, unfiled: unfiled };
+}
+// Client mirror of the server's _safe_name (manage.py): the characters a ZIM
+// filename base may carry. Used only for the prefill/preview; the server
+// re-sanitizes what it receives.
+function _bmSanitizeZimName(s) {
+  s = String(s == null ? '' : s).replace(/[^a-zA-Z0-9._-]+/g, '_')
+    .replace(/^[_.]+/, '').replace(/[_.]+$/, '');
+  return s.slice(0, 60);
+}
+function _bmHasSelectedAncestor(fid, selSet) {
+  var f = _folById(fid);
+  var p = f ? _folNorm(f.parent) : _BM_ROOT;
+  while (p !== _BM_ROOT) {
+    if (selSet[p]) return true;
+    var pf = _folById(p);
+    p = pf ? _folNorm(pf.parent) : _BM_ROOT;
+  }
+  return false;
+}
+// The name the picker suggests: the folder's own name when exactly one
+// top-level folder is ticked, otherwise plain "Bookmarks".
+function _bmExportDefaultName() {
+  var sel = _bmExportSelection();
+  var selSet = {};
+  sel.ids.forEach(function (id) { selSet[id] = 1; });
+  var roots = sel.ids.filter(function (id) {
+    return _folById(id) && !_bmHasSelectedAncestor(id, selSet);
+  });
+  if (roots.length === 1 && !sel.unfiled) return _folById(roots[0]).name;
+  return 'Bookmarks';
+}
+// Compose THE export job (one ZIM per export — see the grouping decision
+// above). `ids` = checked folder ids in tree order, `unfiled` = loose
+// bookmarks ticked, `nameRaw` = the user's name-field text. Empty selected
+// folders still land in `sections` so the ZIM index shows them honestly.
+function _bmComposeExportJob(ids, unfiled, nameRaw) {
+  var selSet = {};
+  ids.forEach(function (id) { selSet[id] = 1; });
+  var roots = ids.filter(function (id) {
+    return _folById(id) && !_bmHasSelectedAncestor(id, selSet);
+  });
+  var single = roots.length === 1 && !unfiled;
+  var bms = [];
+  var sections = [];
+  var addSection = function (name) {
+    if (name && sections.indexOf(name) < 0) sections.push(name);
+  };
+  roots.forEach(function (rootId) {
+    var rootName = _folById(rootId).name;
+    var queue = [rootId];
+    while (queue.length) {
+      var cur = queue.shift();
+      var isSelf = (cur === rootId);
+      var secName = single
+        ? (isSelf ? '' : _folById(cur).name)
+        : (isSelf ? rootName : rootName + ' / ' + _folById(cur).name);
+      addSection(secName);
+      _bkInFolder(cur).forEach(function (b) {
+        bms.push({ zim: b.zim, path: b.path, title: b.title || '', section: secName });
+      });
+      _folChildren(cur).forEach(function (c) { if (selSet[c.id]) queue.push(c.id); });
+    }
+  });
+  if (unfiled) {
+    _bkInFolder(_BM_ROOT).forEach(function (b) {
+      bms.push({ zim: b.zim, path: b.path, title: b.title || '', section: '' });
+    });
+  }
+  var title = String(nameRaw || '').trim().slice(0, 120);
+  return {
+    name: _bmSanitizeZimName(title) || null,
+    title: title || null,
+    sections: sections,
+    bookmarks: bms,
+  };
+}
+function _bmExportSubmit() {
+  var sel = _bmExportSelection();
+  var nameEl = document.getElementById('bm-export-name');
+  var job = _bmComposeExportJob(sel.ids, sel.unfiled, nameEl ? nameEl.value : '');
+  var status = document.getElementById('bm-export-status');
+  var go = document.getElementById('bm-export-go');
+  if (!sel.ids.length && !sel.unfiled) {
+    if (status) { status.textContent = t('bm_export_none_selected'); status.style.color = 'var(--amber)'; }
+    return;
+  }
+  if (!job.bookmarks.length) {
+    if (status) { status.textContent = t('bm_export_nothing'); status.style.color = 'var(--amber)'; }
+    return;
+  }
+  if (go) go.disabled = true;
+  if (status) { status.style.color = ''; status.textContent = t('save_to_zim_working'); }
   manageFetch('/manage/export-bookmarks', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ bookmarks: payload }),
-  }).then(function(r) { return r.json(); }).then(function(res) {
-    if (res && res.error) { _exportBookmarksFail(); return; }
-    _pollExportBookmarks();
-  }).catch(_exportBookmarksFail);
+    body: JSON.stringify({ exports: [job] }),
+  }).then(function (r) { return r.json(); }).then(function (res) {
+    if (res && res.error) { _bmExportModalFail(); return; }
+    _bmPollExport();
+  }).catch(_bmExportModalFail);
 }
-function _exportBookmarksFail() {
-  var btn = document.getElementById('export-bookmarks-btn');
-  var status = document.getElementById('export-bookmarks-status');
-  if (btn) btn.disabled = false;
+function _bmExportModalFail() {
+  var status = document.getElementById('bm-export-status');
+  var go = document.getElementById('bm-export-go');
+  if (go) go.disabled = false;
   if (status) { status.textContent = t('save_to_zim_failed'); status.style.color = 'var(--amber)'; }
 }
-function _pollExportBookmarks() {
+function _bmPollExport() {
   clearTimeout(_exportPoll);
-  manageFetch('/manage/export-bookmarks').then(function(r) { return r.json(); }).then(function(st) {
-    var btn = document.getElementById('export-bookmarks-btn');
-    var status = document.getElementById('export-bookmarks-status');
+  manageFetch('/manage/export-bookmarks').then(function (r) { return r.json(); }).then(function (st) {
+    var status = document.getElementById('bm-export-status');
     if (st.phase === 'running') {
-      _exportPoll = setTimeout(_pollExportBookmarks, 600);
+      if (status) status.textContent = t('save_to_zim_working') + (st.total ? ' (' + st.done + '/' + st.total + ')' : '');
+      _exportPoll = setTimeout(_bmPollExport, 600);
     } else if (st.phase === 'done') {
-      if (btn) btn.disabled = false;
-      if (status) { status.style.color = '#34d399'; status.textContent = t('save_to_zim_done', { file: st.file || '' }); }
-      _revealExportedZim(st.file); // surface the new ZIM in the library without a manual refresh
+      var files = (st.files && st.files.length) ? st.files : (st.file ? [st.file] : []);
+      if (status) { status.style.color = '#34d399'; status.textContent = tPlural('bm_export_done', files.length); }
+      // Close the modal shortly, then reveal the first new ZIM in the library.
+      setTimeout(function () { _bmCloseExport(); _revealExportedZim(files[0]); }, 900);
     } else if (st.phase === 'error') {
-      _exportBookmarksFail();
-    } else {
-      if (btn) btn.disabled = false; // idle/unknown
+      _bmExportModalFail();
     }
-  }).catch(_exportBookmarksFail);
+  }).catch(_bmExportModalFail);
 }
+
+var _exportPoll = null;
 // After a successful bookmark export, pull the refreshed library list (the
 // server already rescanned the new file into its cache), re-render the home
 // library so the new source's card exists, close the library panel so it's
@@ -12752,7 +14512,7 @@ async function _revealExportedZim(file) {
   _closeLibraryPanel();
   // Defer so the freshly rendered cards + the panel close settle first.
   setTimeout(function() {
-    var sel = '.stat-card[data-zim="' + ((window.CSS && CSS.escape) ? CSS.escape(name) : name) + '"]';
+    var sel = '.stat-card[data-zim="' + _cssEsc(name) + '"]';
     var card = document.querySelector(sel);
     if (!card) return;
     try { card.scrollIntoView({ behavior: 'smooth', block: 'center' }); } catch (e) { try { card.scrollIntoView(); } catch (e2) {} }
@@ -13409,6 +15169,9 @@ window.addEventListener('popstate', (e) => {
 // ── Util ──
 function esc(s) { const d = document.createElement('div'); d.textContent = s || ''; return d.innerHTML; }
 function escAttr(s) { return esc(s).replace(/'/g, '&#39;').replace(/"/g, '&quot;'); }
+// Escape a value for use inside a CSS attribute selector. Generated ids and ZIM
+// names reach querySelector all over the app; older engines lack CSS.escape.
+function _cssEsc(s) { s = String(s == null ? '' : s); return (window.CSS && CSS.escape) ? CSS.escape(s) : s; }
 // Escape for JS string literal inside HTML onclick attribute (survives HTML decode then JS parse)
 // Escape a value for a JS string literal INSIDE an onclick="..." attribute.
 // The result is parsed as HTML first, so quotes/&/< are emitted as HTML
@@ -14087,6 +15850,15 @@ function _renderActivity(a) {
   if ((dl.queued || 0) > 0) parts.push(dl.queued + ' ' + t('activity_queued'));
   const seed = (a.seeding || {}).torrents || 0;
   if (seed > 0) parts.push(seed + ' ' + t('activity_seeding'));
+  // Other background jobs: bookmark→ZIM export, library health check.
+  const ex = a.export || {};
+  if (ex.phase === 'running') {
+    parts.push(t('activity_exporting') + (ex.total ? ' ' + (ex.done || 0) + '/' + ex.total : ''));
+  }
+  const hc = a.health || {};
+  if (hc.phase === 'running') {
+    parts.push(t('activity_health') + (hc.total ? ' ' + (hc.done || 0) + '/' + hc.total : ''));
+  }
 
   _activityBadge.count = dlCount;
   _activityBadge.active = parts.length > 0;

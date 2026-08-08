@@ -136,3 +136,93 @@ Surface this list at the start of every release cycle.
   device. Same-device-only, low severity, deliberate 1.8.1 tradeoff
   (identity/library endpoints are network-only as of the r3 fix).
   Candidate: purge content caches on logout when mode=private.
+
+## Vision: the hero moon lives in the real solar system (Eric, 2026-08-03)
+
+"The moon hero in almanac is in place in the real solar system / universe with
+the rest semi visible somehow and accurately placed."
+
+Why it's more than decoration: today the moon's phase is COMPUTED and then
+drawn as a shaded disc. In this version the phase EMERGES from geometry. The
+moon occupies its true position relative to Earth and Sun; the terminator is a
+consequence of where the sun actually is, not a separate calculation. That is
+the same principle that just fixed the 1.8.2 travel bug (disc and readout
+derived from one source cannot disagree) taken to its conclusion: ONE
+simulation drives every number on the page.
+
+What "accurately placed" buys, concretely:
+- Sun direction implied/visible, so the lit limb points at the real sun.
+- Earth present enough for earthshine on the dark limb (a real, visible effect).
+- Libration: the moon genuinely wobbles and shows ~59% of its surface over
+  time. A fixed texture is a lie the time machine makes obvious.
+- Apparent size varies with perigee/apogee (~14%). Supermoons become real
+  rather than a label.
+- Parallactic angle already computed for the observer's location: the moon
+  tilts correctly for where you are, not just what phase it is.
+- Planets and bright stars ghosted at true positions behind it ("semi visible"),
+  so the disc is IN space rather than on a card.
+
+Pieces already exist and are accurate; this is unification, not new astronomy:
+- almanac-orrery.js: Keplerian planet positions.
+- almanac-sky.js: real HYG bright-star catalogue + horizon projection.
+- almanac.js: moon phase/age/distance/tilt, all real.
+The work is a shared scene graph + a camera, not new math.
+
+Pairs with the Time Machine: scrubbing should move ONE simulation, so the
+whole scene evolves together (moon orbits, phase follows, planets march,
+stars wheel). That is the payoff shot.
+
+Scope: too big for a dot release. 1.9 candidate at the earliest, plausibly the
+2.0 "Time Machine" centerpiece alongside the period-newspaper idea.
+
+## Vision: accurate tides in the live sky (Eric, 2026-08-03)
+
+"Live sky can show accurate tides for location."
+
+**The astronomy is already free.** Tide-generating force is a function of Moon
+and Sun position, which the almanac computes accurately today. From that alone,
+with no data files and no network:
+- spring vs neap tides (the Moon/Sun alignment IS the mechanism)
+- the semidiurnal rhythm on the 24h50m lunar day
+- tidal phase through the month, and how it tracks the phase display already
+  on screen
+This is the "equilibrium tide" and it is honest physics, not an approximation
+of someone else's table.
+
+**What needs data: height in metres at a named coast.** Real amplitude depends
+on bathymetry and coastline resonance (Bay of Fundy vs Mediterranean), which
+is why tide tables use per-station harmonic constants. Two tiers, both small
+enough to ship offline:
+DECIDED (Eric, 2026-08-03): go straight to **harmonic constants** —
+M2/S2/N2/K1/O1 amplitude+phase, ~8-10 numbers per port, real HEIGHTS, still
+tiny offline. Skip the lunitidal-interval tier. Sourcing/licensing homework
+before build: NOAA publishes US station constants; global coverage varies.
+
+**Design fit:** tide tables are a classic almanac feature, and computing them
+from first principles with no network is exactly the Zimi story. Pairs with the
+Time Machine (scrub time, watch the tide curve move with the Moon) and with the
+hero-moon-in-real-space vision, where the same geometry drives both.
+
+**Honesty constraints (non-negotiable if this ships):**
+- Inland locations have no tide; say so rather than inventing one, or offer the
+  nearest coastal reference explicitly labelled as such.
+- Accuracy varies enormously by coast. Present as an almanac estimate.
+- NEVER present as navigational authority. People take boats out on tide data.
+  A clear "not for navigation" framing is required, not optional.
+
+Scope: the equilibrium-tide half could land in a dot release; named-port
+heights want the data question answered first. 1.9 candidate.
+
+## Addendum to the hero-moon vision (Eric, 2026-08-03)
+
+"When we do the new system we can change the hero to any planet or star or hop
+into a full drivable solar system and zoom out or hero in on anything." He
+immediately asked whether that is scope creep. Ruling recorded here:
+
+It is the ACCEPTANCE CRITERION for the scene-graph engine, not a scheduled
+feature. Built correctly (one simulation, one scene graph, a movable camera),
+"hero on Saturn" or "zoom out to everything" is just pointing the camera —
+nearly free. If those are expensive, the engine was built wrong. So: design the
+2.0 engine so that a drivable system falls out of it; commit to shipping only
+the moon hero first. The drive-anywhere mode ships when it is a camera change,
+and not before.

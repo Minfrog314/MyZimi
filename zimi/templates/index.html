@@ -60,11 +60,16 @@
     settle();
   }
   apply();
+  // Booting straight into the almanac (#almanac in the URL): stamp a class
+  // synchronously, before the first paint, so the home/library view is never
+  // visible first — CSS hides #main-view and shows the dark almanac shell
+  // until almanac.js takes over and removes the class (_openAlmanacInner).
+  if (location.hash === '#almanac') el.classList.add('almanac-boot');
   window.addEventListener('pageshow', function(e){ if (e.persisted) apply(); });
 })();
 </script>
 <link rel="stylesheet" href="/static/app.css?v=1">
-<link rel="stylesheet" href="/static/almanac.css?v=2">
+<link rel="stylesheet" href="/static/almanac.css?v=3">
 </head>
 <body>
 

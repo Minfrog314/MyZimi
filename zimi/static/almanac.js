@@ -45,13 +45,24 @@ function _getLocation() {
   return { lat: 34, lon: -new Date().getTimezoneOffset() / 60 * 15, name: '', stored: false };
 }
 
+// The device's IANA zone, resolved once. It cannot change within a page
+// lifetime, but Intl.DateTimeFormat().resolvedOptions() builds a full
+// formatter every call — far too heavy for the per-frame travel path that
+// reads this (measured ~1ms per construction).
+var _almDeviceTzCache;
+function _almDeviceTz() {
+  if (_almDeviceTzCache === undefined) {
+    try { _almDeviceTzCache = Intl.DateTimeFormat().resolvedOptions().timeZone || null; }
+    catch (e) { _almDeviceTzCache = null; }
+  }
+  return _almDeviceTzCache;
+}
+
 // Timezone used to DISPLAY times for the almanac's home location: the chosen
 // location's zone, or the device's own zone when nothing was ever chosen.
 function _almDisplayTz(loc) {
   loc = loc || _getLocation();
-  return loc.stored
-    ? _almTzForLocation(loc.lat, loc.lon)
-    : Intl.DateTimeFormat().resolvedOptions().timeZone;
+  return loc.stored ? _almTzForLocation(loc.lat, loc.lon) : _almDeviceTz();
 }
 
 function _saveLocation(lat, lon, name) {
@@ -118,8 +129,6 @@ function _lc(name) { var s = _tc(name); var k = _CONST_KEYS[name]; return k ? _a
 function _lterm(suffix, html) { return _alLink('term:' + suffix, html); }
 // Link a season by its article key ('winter'|'spring'|'summer'|'autumn').
 function _lseason(key, html) { return key ? _alLink('season:' + key, html) : html; }
-// Link a Messages Across Time inscription by its manifest id (key = 'rosetta:<id>').
-function _lrosetta(id, html) { return id ? _alLink('rosetta:' + id, html) : html; }
 
 function _dayOfYear(date) {
   // setFullYear, not new Date(year,…): the constructor folds years 0–99 into
@@ -175,6 +184,9 @@ var _almReturnScroll = null;
 function _openAlmanacInner(replaceState) {
   _almanacOpen = true;
   document.body.classList.add('almanac-mode');
+  // The reload-into-almanac boot gate (stamped by the head bootstrap before
+  // first paint) has done its job once the real almanac chrome is up.
+  document.documentElement.classList.remove('almanac-boot');
   var url = location.pathname + location.search + '#almanac';
   if (replaceState) history.replaceState({ mode: 'almanac' }, '', url);
   else history.pushState({ mode: 'almanac' }, '', url);
@@ -198,6 +210,7 @@ function _openAlmanacInner(replaceState) {
 function _almanacTeardown() {
   _almanacOpen = false;
   document.body.classList.remove('almanac-mode');
+  if (typeof _almTravelUnfreeze === 'function') _almTravelUnfreeze();
   _cancelAllRAF();
   _activeSkyLoop = null;
   _almSelectedTz = null;
@@ -265,9 +278,18 @@ function _reopenAlmanacFromLink() {
 }
 
 // ── Timezone formatting ──
+// Cached per lang|tz: the travel clock reads this every frame, and the name
+// was always computed from NOW (not the focused instant), so within a session
+// it is constant. (A session running across a live DST switch would keep the
+// pre-switch abbreviation until reload — an acceptable trade for dropping a
+// formatter construction + formatToParts from the per-frame path.)
+var _formatTzCache = {};
 function _formatTimezone(lang, tz) {
+  var loc = lang || ((typeof _currentLang !== 'undefined') ? _currentLang : 'en');
+  var key = loc + '|' + (tz || '');
+  if (key in _formatTzCache) return _formatTzCache[key];
+  var name = '';
   try {
-    var loc = lang || ((typeof _currentLang !== 'undefined') ? _currentLang : 'en');
     // Locale-aware short zone name (e.g. "PST"). An explicit tz names the
     // shown location's zone, not the device's.
     var opts = { timeZoneName: 'short' };
@@ -275,10 +297,11 @@ function _formatTimezone(lang, tz) {
     var fmt = new Intl.DateTimeFormat(loc, opts);
     var parts = fmt.formatToParts(new Date());
     for (var i = 0; i < parts.length; i++) {
-      if (parts[i].type === 'timeZoneName') return parts[i].value;
+      if (parts[i].type === 'timeZoneName') { name = parts[i].value; break; }
     }
-    return '';
-  } catch(e) { return ''; }
+  } catch(e) { name = ''; }
+  _formatTzCache[key] = name;
+  return name;
 }
 
 // Curated offline "on this day" feed — space & science milestones, keyed by
@@ -432,30 +455,34 @@ function _almIsToday(d) {
 // truth so the full header render and the lightweight scrub updater
 // (_almScrubClock) read time identically.
 //
-// The live "now" header must always read the VIEWER's own local time: the
-// person is at their device, and "what time is it right now" is unambiguous. A
-// stored almanac location drives the sky/sun math, but its derived zone must
-// never override the live clock -- a stale or wrong-hemisphere stored location
-// (e.g. a western longitude persisted with the wrong sign) otherwise resolves
-// to a far-eastern zone and paints tomorrow morning onto today's sky. Only a
-// scrubbed (non-today) focus, which has no "now", keeps the location zone so
-// its date reads consistently with the panels below.
+// The header clock always reads the VIEWER's own local time, travelling or
+// not. A stored almanac location drives the sky/sun math, but its derived zone
+// must never drive this clock: a stale or wrong-hemisphere stored location
+// (e.g. a western longitude persisted with the wrong sign) resolves to a
+// far-eastern zone and paints tomorrow morning onto today's sky.
+//
+// It must not switch zones on travel either, which it used to. The rest of the
+// instrument reads the focus instant in device-local fields -- the time
+// machine's readout via _almTmParts, the calendar grid via
+// _almSyncSelectedToFocus, the destination chooser via _almMakeInstant, which
+// is also what makes a typed destination round-trip unchanged. A header on the
+// location's zone therefore disagreed with all three, by a whole day within a
+// zone-offset of midnight: pick 23:50 from Los Angeles with Tokyo stored and
+// the grid highlights the 22nd while the header reads the 23rd. One zone for
+// the whole instrument, and it is the device's.
 function _almClockParts(focus) {
   var loc = _getLocation();
   var locTz = null;
   try { locTz = _almDisplayTz(loc); } catch (e) {}
   var live = _almIsToday(focus);
-  var deviceTz = null;
-  try { deviceTz = Intl.DateTimeFormat().resolvedOptions().timeZone; } catch (e) {}
-  var displayTz = live ? (deviceTz || locTz) : locTz;
+  var displayTz = _almDeviceTz() || locTz;
   var lang = (typeof _currentLang !== 'undefined') ? _currentLang : 'en';
-  var _dtOpts = { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' };
-  var _tmOpts = { hour: 'numeric', minute: '2-digit' };
-  if (displayTz) { _dtOpts.timeZone = displayTz; _tmOpts.timeZone = displayTz; }
+  // Cached formatters (_tzFmt), not toLocale*String: this runs on every travel
+  // frame, and each toLocale* call builds a fresh Intl.DateTimeFormat.
   return {
     loc: loc, locTz: locTz, lang: lang, live: live,
-    date: focus.toLocaleDateString(lang, _dtOpts),
-    time: focus.toLocaleTimeString(lang, _tmOpts),
+    date: _tzFmt(displayTz, { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' }).format(focus),
+    time: _tzFmt(displayTz, { hour: 'numeric', minute: '2-digit' }).format(focus),
     tz: _formatTimezone(lang, displayTz)
   };
 }
@@ -471,9 +498,18 @@ function _almHeadHtml(focus) {
   var cp = _almClockParts(focus);
   var loc = cp.loc, locTz = cp.locTz, lang = cp.lang;
 
+  // Both the big date and the time beneath it summon the time machine — the
+  // heading is the almanac's clearest "this is the moment shown" surface, so
+  // tapping it is the discoverable way into changing that moment. Shared
+  // attributes built once (DRY): only the id and content differ.
+  var tmTap = ' class="alm-head-tap" role="button" tabindex="0" onclick="_almTmShow()"' +
+    ' onkeydown="if(event.key===\'Enter\'||event.key===\' \'){event.preventDefault();_almTmShow();}"' +
+    ' title="' + _almEsc(t('alm_tm_open')) + '" aria-label="' + _almEsc(t('alm_tm_open')) + '"';
   var html = '<div style="text-align:center;margin-bottom:16px">';
-  html += '<div id="almanac-head-date" style="font-size:22px;font-weight:600;color:var(--text)">' + cp.date + '</div>';
-  html += '<div style="font-size:16px;color:var(--text2);margin-top:4px"><span id="almanac-head-time" class="almanac-head-time-btn" onclick="_almTmShow()" role="button" tabindex="0" onkeydown="if(event.key===\'Enter\'||event.key===\' \'){event.preventDefault();_almTmShow();}" title="' + _almEsc(t('alm_tm_open')) + '" aria-label="' + _almEsc(t('alm_tm_open')) + '">' + cp.time + '</span>' + (cp.tz ? ' &middot; ' + cp.tz : '') +
+  // No inline color: it would outrank .alm-head-tap:hover's amber. The body
+  // text color is var(--text) already.
+  html += '<div id="almanac-head-date"' + tmTap + ' style="font-size:22px;font-weight:600">' + cp.date + '</div>';
+  html += '<div style="font-size:16px;color:var(--text2);margin-top:4px"><span id="almanac-head-time"' + tmTap + '>' + cp.time + '</span>' + (cp.tz ? ' &middot; ' + cp.tz : '') +
     (cp.live ? '' : ' <button class="alm-sc-reset" onclick="_almBackToToday()">' + _almEsc(t('alm_today')) + '</button>') + '</div>';
   html += '</div>';
 
@@ -482,39 +518,73 @@ function _almHeadHtml(focus) {
   var moonTilt = _heroMoonTiltDeg(focus, loc);
   html += '<div class="almanac-hero">';
   html += _renderAlmanacMoon(m, moonTilt);
-  html += '<div class="almanac-moon-name">' + _lterm('lunar_phase', _localMoonName(m.name)) + '</div>';
+  // The name sits in its own span inside the deep-link wrapper so travel can
+  // rewrite the text without tearing out the encyclopedia link around it.
+  html += '<div class="almanac-moon-name">' + _lterm('lunar_phase', '<span id="alm-hc-phase">' + _localMoonName(m.name) + '</span>') + '</div>';
   html += '</div>';
 
-  // Sun cards render in the shown location's timezone (same locTz as the
-  // header), so the clock, sun times and moon all agree.
+  // Sun cards render in the LOCATION's timezone, not the header clock's: a
+  // sunrise is a fact about a place, and reading "sunrise 8:07 PM" because the
+  // viewer's own zone was applied to somewhere else's sky helps nobody. The two
+  // only differ once a location has actually been chosen (_almDisplayTz falls
+  // back to the device zone otherwise), and the header states its zone.
   var _locTzOff;
   try { _locTzOff = _tzUtcOffsetMin(locTz, focus); }
   catch (e) { _locTzOff = -focus.getTimezoneOffset(); }
   var sunInfo0 = _computeSunTimes(focus, loc.lat, loc.lon, _locTzOff);
 
-  html += '<div class="alm-cards">';
-  html += '<div class="alm-card"><div class="alm-card-lbl">' + t('alm_illuminated') + '</div><div class="alm-card-val">' + m.illumination + '%</div></div>';
-  html += '<div class="alm-card"><div class="alm-card-lbl">' + t('alm_moon_age') + '</div><div class="alm-card-val">' + age + ' ' + t('alm_days') + '</div></div>';
-  html += '<div class="alm-card"><div class="alm-card-lbl">' + t('alm_distance') + '</div><div class="alm-card-val">' + Math.round(dist).toLocaleString() + ' ' + t('alm_km') + '</div></div>';
   var _nfm = _nextFullMoon(focus);
-  if (_nfm) {
-    var _nfmStr = _nfm.date.toLocaleDateString(lang, { month: 'short', day: 'numeric' });
-    html += '<div class="alm-card"><div class="alm-card-lbl">' + t('alm_next_full') + '</div><div class="alm-card-val"' +
-      (_nfm.isSuper ? ' style="color:#e0b060"' : '') + '>' + _nfmStr +
-      (_nfm.isSuper ? ' \u00b7 ' + _lterm('supermoon', t('alm_supermoon')) : '') + '</div></div>';
-  }
-  if (sunInfo0.polar) {
-    html += '<div class="alm-card" style="grid-column:span 4"><div class="alm-card-val">' + sunInfo0.polar + '</div></div>';
-  } else {
-    html += '<div class="alm-card"><div class="alm-card-lbl">' + t('alm_sunrise') + '</div><div class="alm-card-val">' + sunInfo0.sunrise + '</div></div>';
-    html += '<div class="alm-card"><div class="alm-card-lbl">' + t('alm_sunset') + '</div><div class="alm-card-val">' + sunInfo0.sunset + '</div></div>';
-    html += '<div class="alm-card"><div class="alm-card-lbl">' + t('alm_daylight') + '</div><div class="alm-card-val">' + sunInfo0.dayLength + '</div></div>';
-    if (sunInfo0.goldenHour) {
-      html += '<div class="alm-card"><div class="alm-card-lbl">' + _lterm('golden_hour', t('alm_golden')) + '</div><div class="alm-card-val" style="color:#d4aa64">' + sunInfo0.goldenHour + '</div></div>';
-    }
-  }
+
+  html += '<div class="alm-cards">';
+  html += _almHeadCard(t('alm_illuminated'), m.illumination + '%', 'alm-hc-illum');
+  html += _almHeadCard(t('alm_moon_age'), age + ' ' + t('alm_days'), 'alm-hc-age');
+  html += _almHeadCard(t('alm_distance'), _almFmtNum(Math.round(dist)) + ' ' + t('alm_km'), 'alm-hc-dist');
+  html += _almHeadCard(t('alm_next_full'), _almNextFullHtml(_nfm, lang, focus), 'alm-hc-nextfull',
+    { cardId: 'alm-hc-nextfull-card', hidden: !_nfm, valClass: _nfm && _nfm.isSuper ? 'alm-card-super' : '' });
+  // Both faces of the sun row live in the DOM at once and only their `hidden`
+  // flags move. Travel crosses into and out of a polar day mid-scrub, and
+  // flipping a flag is something the per-frame updater can do; rebuilding the
+  // card grid is not, so the alternative was a stale row contradicting the
+  // date beside it.
+  html += _almHeadCard('', sunInfo0.polar || '', 'alm-hc-polar',
+    { cardId: 'alm-hc-polar-card', span: 4, hidden: !sunInfo0.polar });
+  html += _almHeadCard(t('alm_sunrise'), sunInfo0.sunrise || '', 'alm-hc-sunrise',
+    { cardId: 'alm-hc-sunrise-card', hidden: !!sunInfo0.polar });
+  html += _almHeadCard(t('alm_sunset'), sunInfo0.sunset || '', 'alm-hc-sunset',
+    { cardId: 'alm-hc-sunset-card', hidden: !!sunInfo0.polar });
+  html += _almHeadCard(t('alm_daylight'), sunInfo0.dayLength || '', 'alm-hc-daylight',
+    { cardId: 'alm-hc-daylight-card', hidden: !!sunInfo0.polar });
+  html += _almHeadCard(_lterm('golden_hour', t('alm_golden')), sunInfo0.goldenHour || '', 'alm-hc-golden',
+    { cardId: 'alm-hc-golden-card', hidden: !sunInfo0.goldenHour, valClass: 'alm-card-golden' });
   html += '</div>';
   return html;
+}
+
+// One card in the hero readout grid. Every value node carries an id so the
+// per-frame travel updater can rewrite it in place instead of the whole grid.
+// opts: cardId (id on the card, for hiding it), span (grid columns), hidden,
+// valClass (colour variant).
+function _almHeadCard(lbl, valHtml, valId, opts) {
+  opts = opts || {};
+  return '<div class="alm-card"' + (opts.cardId ? ' id="' + opts.cardId + '"' : '') +
+    (opts.span ? ' style="grid-column:span ' + opts.span + '"' : '') +
+    (opts.hidden ? ' hidden' : '') + '>' +
+    (lbl ? '<div class="alm-card-lbl">' + lbl + '</div>' : '') +
+    '<div class="alm-card-val' + (opts.valClass ? ' ' + opts.valClass : '') + '" id="' + valId + '">' +
+    valHtml + '</div></div>';
+}
+
+// Value markup for the next-full-moon card, shared by the full render and the
+// throttled travel refresh so the two can never disagree on format. The year
+// shows only when the full moon falls outside the focused year: a bare "Aug 27"
+// is unambiguous beside a header reading 2026 and meaningless beside one
+// reading 2183, and the card is a quarter of the grid wide.
+function _almNextFullHtml(nfm, lang, focus) {
+  if (!nfm) return '';
+  var opts = { month: 'short', day: 'numeric' };
+  if (nfm.date.getFullYear() !== focus.getFullYear()) opts.year = 'numeric';
+  return nfm.date.toLocaleDateString(lang, opts) +
+    (nfm.isSuper ? ' \u00b7 ' + _lterm('supermoon', t('alm_supermoon')) : '');
 }
 
 // Render one panel resiliently. Travel now reaches arbitrary epochs, where a
@@ -540,6 +610,10 @@ function _almSafePanel(fn, containerId) {
 function _almRepaintFocus() {
   var focus = _almFocusInstant();
   var loc = _getLocation();
+  // Every settle path lands here, so this is where live travel ends: drop the
+  // scrub overlay before the header is rebuilt, leaving _almHeroMoonSweep free
+  // to open a fresh one for the arrival sweep.
+  _heroMoonTravelEnd();
   var m;
   try { m = _moonPhase(focus); } catch (e) { m = null; }
   var head = document.getElementById('almanac-head');
@@ -571,6 +645,8 @@ function _almRepaintFocus() {
 }
 
 function _almBackToToday() {
+  // Reachable mid-hold via the Home key: make sure no height pin outlives it.
+  _almTravelUnfreeze();
   _almFocus = null;
   _almSelectedJDN = _almTodayJDN;
   // Snap the browsed month back to the present too — otherwise the grid is
@@ -587,12 +663,12 @@ function _almBackToToday() {
 
 // == Time machine — the almanac's skeuomorphic time-travel instrument ========
 // Replaces the old velocity scrubber + flux panel. Two faces on one object:
-//   REST   — a three-row time circuit: DISPLAYED (amber, what every panel is
-//            rendering), DESTINATION (neutral, tap to choose a time), NOW
-//            (dimmed, ticks).
+//   REST   — three LED time circuits: DISPLAYED (warm white, what every panel
+//            is rendering), DESTINATION (amber, tap its segments to edit the
+//            time in place), ACTUAL (dimmed, ticks).
 //   MOTION — while the side lever is thrown, the panel collapses to one large
-//            readout of the moving position. It stays collapsed after you land
-//            until tapped, then flips back to the three rows.
+//            readout of the moving position. Landing (the settle) flips it
+//            back to the three rows on its own.
 // The lever is a *displacement* control: distance from neutral sets a
 // directional speed (nonlinear — minutes/sec near the middle, centuries/sec at
 // the ends), springing back to neutral on release. All the time-state
@@ -648,18 +724,174 @@ function _almClampInstant(dt) {
 
 function _almYearBeyondPrecise(y) { return Math.abs(y - 2000) > _ALM_PRECISE_SPAN; }
 
-// Readout formatting: MON DD YEAR  HH:MM in the viewer's language, month
-// abbreviation upper-cased, 24-hour tabular time. The year is the signed
-// proleptic-Gregorian number (negative = BCE), matching the chooser's field so
-// it round-trips exactly.
-function _almTmFmt(d) {
-  var lang = (typeof _currentLang !== 'undefined') ? _currentLang : 'en';
-  var mon, hm;
-  try { mon = d.toLocaleDateString(lang, { month: 'short' }).toUpperCase(); }
+// Readout fields: MON DD YEAR HH:MM. Month abbreviation localized and
+// upper-cased (any trailing locale dot dropped so it sits clean in its
+// segment cell), day/time zero-padded, 24-hour. The year is the signed
+// proleptic-Gregorian number (negative = BCE), matching the in-place edit
+// field so it round-trips exactly. Split into parts because every readout on
+// the instrument is a row of per-field LED segment cells, not one string.
+var _ALM_TM_FIELDS = ['mon', 'day', 'year', 'hh', 'mi'];
+function _almTmParts(d) {
+  var mon;
+  // Cached formatter (_tzFmt): the motion face re-renders this every frame.
+  try { mon = _tzFmt(null, { month: 'short' }).format(d).toUpperCase().replace(/\./g, ''); }
   catch (e) { mon = ('0' + (d.getMonth() + 1)).slice(-2); }
-  try { hm = d.toLocaleTimeString(lang, { hour: '2-digit', minute: '2-digit', hour12: false }); }
-  catch (e) { hm = ('0' + d.getHours()).slice(-2) + ':' + ('0' + d.getMinutes()).slice(-2); }
-  return mon + ' ' + ('0' + d.getDate()).slice(-2) + ' ' + d.getFullYear() + ' ' + hm;
+  return {
+    mon: mon,
+    day: ('0' + d.getDate()).slice(-2),
+    year: String(d.getFullYear()),
+    hh: ('0' + d.getHours()).slice(-2),
+    mi: ('0' + d.getMinutes()).slice(-2)
+  };
+}
+
+// One LED readout: MON DD YYYY HH:MM as individual recessed segment cells,
+// shared by all three circuit rows and the solo travelling face so no two
+// readouts can disagree on format. `editable` adds the DESTINATION row's
+// in-place inputs, hidden at rest and revealed by .alm-tm-editing with the
+// exact geometry of the value they replace: identical view, click, type.
+var _ALM_TM_FIELD_LBL = { mon: 'alm_tm_month', day: 'alm_tm_day', year: 'alm_tm_year', hh: 'alm_tm_hour', mi: 'alm_tm_min' };
+function _almTmCellHtml(idBase, part, editable) {
+  var h = '<span class="alm-tm-cell alm-tm-cell-' + part + '">' +
+    '<span class="alm-tm-cval" id="' + idBase + '-' + part + '"></span>';
+  if (editable) {
+    h += '<input type="text" class="alm-tm-cin" id="alm-tm-in-' + part + '"' +
+      (part === 'mon' ? '' : ' inputmode="numeric"') +
+      ' autocomplete="off" spellcheck="false" aria-label="' + _almEsc(t(_ALM_TM_FIELD_LBL[part])) + '"' +
+      (part === 'year' ? ' title="' + _almEsc(t('alm_tm_year_hint')) + '" oninput="_almTmYearGrew(this)"' : '') +
+      // Typing into MONTH re-lights the matching cell on the month plate, so
+      // the plate and the field can never disagree about which month is set.
+      (part === 'mon' ? ' oninput="_almTmMonPopMark()"' : '') +
+      ' onkeydown="_almTmEditKey(event, \'' + part + '\')" onfocus="this.select()">';
+  }
+  return h + '</span>';
+}
+function _almTmCellsHtml(idBase, editable) {
+  return '<span class="alm-tm-cells">' +
+    _almTmCellHtml(idBase, 'mon', editable) +
+    _almTmCellHtml(idBase, 'day', editable) +
+    _almTmCellHtml(idBase, 'year', editable) +
+    '<span class="alm-tm-cell-group">' + _almTmCellHtml(idBase, 'hh', editable) +
+    '<span class="alm-tm-colon" aria-hidden="true">:</span>' + _almTmCellHtml(idBase, 'mi', editable) + '</span>' +
+    '</span>';
+}
+// Column headers over the primary readout — the one cue borrowed from the film's
+// time circuits, where every digit group is labelled MONTH DAY YEAR above the
+// lamps. Built from the very same cell classes as the readout, so the headers
+// and the figures are one grid: retrack a column and its label moves with it.
+// No AM/PM column, the instrument is 24-hour. The words reuse the five field
+// labels that already name the edit inputs, so this adds no new strings in any
+// locale. aria-hidden: each input already announces the same word as its own
+// accessible name, and the readout is read as a whole date, so exposing these
+// would make a screen reader say every field twice.
+// The word sits in a CHILD of the cell, not in the cell. The column widths are
+// in `ch` and `ch` is measured in the element's own font, so a header cell must
+// keep the readout's face and size or it would size itself to its label and the
+// header grid would come apart from the figures beneath it.
+function _almTmColCapHtml(part) {
+  return '<span class="alm-tm-cell alm-tm-cell-' + part + '">' +
+    '<span class="alm-tm-colcap">' + _almEsc(t(_ALM_TM_FIELD_LBL[part])) + '</span></span>';
+}
+function _almTmColsHtml() {
+  return '<div class="alm-tm-cols" aria-hidden="true"><span class="alm-tm-cells">' +
+    _almTmColCapHtml('mon') + _almTmColCapHtml('day') + _almTmColCapHtml('year') +
+    '<span class="alm-tm-cell-group">' + _almTmColCapHtml('hh') +
+    // The colon rides along invisibly so HOUR and MIN sit over their own drums
+    // rather than drifting by the colon's negative margins.
+    '<span class="alm-tm-colon alm-tm-colon-ghost">:</span>' + _almTmColCapHtml('mi') +
+    '</span></span></div>';
+}
+
+function _almTmSetCells(idBase, d) {
+  var p = _almTmParts(d);
+  for (var i = 0; i < _ALM_TM_FIELDS.length; i++) {
+    var el = document.getElementById(idBase + '-' + _ALM_TM_FIELDS[i]);
+    if (el) el.textContent = p[_ALM_TM_FIELDS[i]];
+  }
+  return p;
+}
+
+// -- Offset from the present ------------------------------------------------
+// The instrument's one live quantity while travelling: how far the readout is
+// from real now, in human terms ("+3 days", "-41 years 2 months", "+7 hours").
+// Calendar-aware above a day so a year reads as a year rather than 365.2422 of
+// them; clock arithmetic below one. At most two units, largest first, and the
+// smaller unit is dropped when it is zero — that keeps the lamp short enough to
+// share the legend line with the plate's stamped label at 320px.
+var _ALM_MS_MIN = 60000;
+var _ALM_MS_HOUR = 3600000;
+var _ALM_TM_DELTA_UNITS = { y: 'alm_tm_dyear', mo: 'alm_tm_dmonth', d: 'alm_tm_dday', h: 'alm_tm_dhour', mi: 'alm_tm_dmin' };
+
+// Whole calendar years/months/days between two local dates, `a` no later than
+// `b`. Borrowing walks back through the real length of the month it lands in,
+// so 31 Jan → 1 Mar is "1 month 1 day", not "1 month 4 days".
+function _almTmYmdBetween(a, b) {
+  var y = b.getFullYear() - a.getFullYear();
+  var mo = b.getMonth() - a.getMonth();
+  var d = b.getDate() - a.getDate();
+  if (d < 0) {
+    mo--;
+    d += new Date(b.getFullYear(), b.getMonth(), 0).getDate();  // day 0 = last day of previous month
+  }
+  if (mo < 0) { y--; mo += 12; }
+  return { y: y, mo: mo, d: d };
+}
+
+// The travelling face repaints this every animation frame, and tPlural builds
+// a fresh Intl.PluralRules per call. The rendered string only changes when a
+// whole unit does, so memoize on the unit tuple: at 60fps almost every frame is
+// a cache hit, and a miss costs what one repaint used to.
+var _almTmDeltaMemo = { key: null, text: '', lang: null };
+
+function _almTmDeltaText(d, now) {
+  var ms = d.getTime() - now.getTime();
+  var abs = Math.abs(ms);
+  if (abs < _ALM_MS_MIN) return '';                 // sitting on the present
+  var sign = ms < 0 ? '-' : '+';    // ASCII, so it keeps the monospace advance
+  var lo = ms < 0 ? d : now, hi = ms < 0 ? now : d;
+  var c = _almTmYmdBetween(lo, hi);
+  var u1, n1, u2 = null, n2 = 0;
+  if (c.y > 0)            { u1 = 'y';  n1 = c.y;  u2 = 'mo'; n2 = c.mo; }
+  else if (c.mo > 0)      { u1 = 'mo'; n1 = c.mo; u2 = 'd';  n2 = c.d; }
+  else if (c.d > 0)       { u1 = 'd';  n1 = c.d; }
+  else if (abs >= _ALM_MS_HOUR) { u1 = 'h';  n1 = Math.floor(abs / _ALM_MS_HOUR); }
+  else                    { u1 = 'mi'; n1 = Math.round(abs / _ALM_MS_MIN); }
+  var lang = (typeof _currentLang !== 'undefined') ? _currentLang : 'en';
+  var key = sign + u1 + n1 + (u2 && n2 > 0 ? '|' + u2 + n2 : '');
+  if (_almTmDeltaMemo.key === key && _almTmDeltaMemo.lang === lang) return _almTmDeltaMemo.text;
+  var out = sign + tPlural(_ALM_TM_DELTA_UNITS[u1], n1);
+  if (u2 && n2 > 0) out += ' ' + tPlural(_ALM_TM_DELTA_UNITS[u2], n2);
+  _almTmDeltaMemo = { key: key, text: out, lang: lang };
+  return out;
+}
+
+// Paint one offset lamp. Empty text collapses the element (CSS :empty), so a
+// readout parked on the present shows a clean plate.
+function _almTmSetDelta(id, d) {
+  var el = document.getElementById(id);
+  if (!el) return;
+  var txt = _almTmDeltaText(d, new Date());
+  if (el.textContent !== txt) el.textContent = txt;   // no write, no invalidation
+}
+
+// Approximate rendered width of a segment value in ch: CJK and other wide
+// glyphs occupy two monospace cells, everything else one.
+function _almTmChLen(s) {
+  var n = 0;
+  for (var i = 0; i < s.length; i++) n += (s.charCodeAt(i) > 0x2e7f) ? 2 : 1;
+  return n;
+}
+
+// Cached default-locale number formatter for the km distance readout — it is
+// rewritten on every travel frame, and bare Number.toLocaleString builds a
+// fresh Intl.NumberFormat per call.
+var _almNumFmtCache = null;
+function _almFmtNum(n) {
+  if (!_almNumFmtCache) {
+    try { _almNumFmtCache = new Intl.NumberFormat(); }
+    catch (e) { _almNumFmtCache = { format: String }; }
+  }
+  return _almNumFmtCache.format(n);
 }
 
 // Lightweight per-frame clock update while stepping -- just the two hero text
@@ -672,13 +904,213 @@ function _almScrubClock(focus) {
   if (tmEl) tmEl.textContent = cp.time;
 }
 
+// Travel updates run in two tiers (the visuals-first rule, see _almTravelLive):
+// canvases every frame, DOM text/layout at this cadence. 100ms nominal: the
+// throttle fires on the first rAF after the interval elapses, so with frame
+// quantization the worst observed gap stays under the ~150ms bound where a
+// lagging readout still reads as "with" the visuals (measured max 152ms at
+// 120ms nominal — the bound exactly, so one notch tighter). The settle repaint
+// makes everything exact the moment motion stops. Leading-edge (first call in
+// a quiet period fires immediately), so a single wheel notch or arrow key
+// updates the text with no perceptible delay.
+var _ALM_TRAVEL_DOM_MS = 100;
+// The calendar grid gets its own, coarser cadence: _almSyncSelectedToFocus is
+// a full month-grid innerHTML rebuild + style/layout/paint pass, and at full
+// lever speed the day moves every DOM tick, so at 100ms it fired 10x/s.
+// Measured in Playwright WebKit (warm, fast throw): grid on the 100ms tick =
+// p95 52ms frames; grid disabled = p95 31ms. At 300ms the rebuild still flips
+// months faster than the eye tracks them, and the settle repaint is exact.
+var _ALM_TRAVEL_GRID_MS = 300;
+var _almTravelThrottleAt = {};
+
+function _almTravelThrottled(key, ms, fn) {
+  var now = performance.now();
+  if (now - (_almTravelThrottleAt[key] || 0) < ms) return;
+  _almTravelThrottleAt[key] = now;
+  fn();
+}
+
+// Refresh the next-full-moon card. _nextFullMoon walks up to 45 days an hour at
+// a time (~0.3ms), several times the per-frame budget the sky redraw lives
+// inside, so it rides the throttle.
+function _almLiveNextFull(focus) {
+  var card = document.getElementById('alm-hc-nextfull-card');
+  var val = document.getElementById('alm-hc-nextfull');
+  if (!card || !val) return;
+  var nfm = null;
+  try { nfm = _nextFullMoon(focus); } catch (e) {}
+  card.hidden = !nfm;
+  if (!nfm) return;
+  val.innerHTML = _almNextFullHtml(nfm, (typeof _currentLang !== 'undefined') ? _currentLang : 'en', focus);
+  val.classList.toggle('alm-card-super', !!nfm.isSuper);
+}
+
+// Update the moon/sun readout cards in place (text nodes and `hidden` flags, no
+// header rebuild). DOM tier only — the hero disc itself is drawn by
+// _almTravelLive's visual tier, every frame, from its own _moonPhase call.
+//
+// Within this tier nothing may contradict anything else in it: the phase NAME
+// and the illumination figure come from the one _moonPhase call below, and the
+// sun row swaps between its polar and its sunrise/sunset face rather than
+// leaving yesterday's face standing. The next-full-moon card updates here too —
+// at this cadence its own throttle is redundant.
+// _almRepaintFocus recomputes everything exactly on settle.
+function _almLiveHeadCards(focus) {
+  var set = function (id, val) { var e = document.getElementById(id); if (e) e.textContent = val; };
+  var show = function (id, on) { var e = document.getElementById(id); if (e) e.hidden = !on; };
+  var m;
+  try { m = _moonPhase(focus); } catch (e) { return; }
+  set('alm-hc-illum', m.illumination + '%');
+  set('alm-hc-age', (m.phase * 29.53).toFixed(1) + ' ' + t('alm_days'));
+  set('alm-hc-phase', _localMoonName(m.name));
+  try { var dist = _moonDistance(focus); if (dist) set('alm-hc-dist', _almFmtNum(Math.round(dist)) + ' ' + t('alm_km')); } catch (e) {}
+  _almLiveNextFull(focus);
+  try {
+    var loc = _getLocation();
+    var off;
+    try { off = _tzUtcOffsetMin(_almDisplayTz(loc), focus); } catch (e) { off = -focus.getTimezoneOffset(); }
+    var s = _computeSunTimes(focus, loc.lat, loc.lon, off);
+    show('alm-hc-polar-card', !!s.polar);
+    show('alm-hc-sunrise-card', !s.polar);
+    show('alm-hc-sunset-card', !s.polar);
+    show('alm-hc-daylight-card', !s.polar);
+    show('alm-hc-golden-card', !!s.goldenHour);
+    if (s.polar) {
+      set('alm-hc-polar', s.polar);
+    } else {
+      set('alm-hc-sunrise', s.sunrise);
+      set('alm-hc-sunset', s.sunset);
+      set('alm-hc-daylight', s.dayLength);
+      if (s.goldenHour) set('alm-hc-golden', s.goldenHour);
+    }
+  } catch (e) {}
+}
+
+// The live update run during time travel — the single hook both the lever loop
+// (_almTravelFrame) and the wheel/key stepper (_almScrubStep) share.
+//
+// Two tiers, by decree (visuals first): what makes travel FEEL fast is the
+// picture moving, so the canvases — the hero moon disc here, the sky scene via
+// the caller's _skySetInstant — redraw every frame; they cost no style, layout
+// or reflow work. DOM text and anything that can move layout (the head clock,
+// the readout cards' text and hidden flags, the calendar grid rebuild) update
+// together on the _ALM_TRAVEL_DOM_MS cadence instead: per-frame innerHTML
+// rebuilds bought per-frame style/layout passes, which is exactly the jank a
+// fast throw exposed. The anti-contradiction rule survives in relaxed form —
+// every DOM value in the throttled tier updates in the same tick, so text
+// always agrees with text, may trail the visuals by at most ~150ms while the
+// lever is held, and _almScrubSettle recomputes everything exactly the moment
+// motion stops.
+//
+// Panels below the fold stay deferred to _almScrubSettle: the orrery, meteor
+// countdowns, deep-time, tonight's-sky planet ephemeris, sun-map terminator,
+// star chart and analemma are each a full innerHTML rebuild and/or resolve Q-ID
+// deep-links — and none of them shares a screen with the instrument.
+function _almTravelLive(focus) {
+  // Visual tier — every frame.
+  var m = null;
+  try { m = _moonPhase(focus); } catch (e) {}
+  if (m) _heroMoonTravelDraw(focus, m);
+  // DOM tier — one throttle key for the text, so the clock and cards always
+  // move as one and can never disagree with each other mid-scrub. The
+  // calendar grid rides its own coarser cadence (see _ALM_TRAVEL_GRID_MS):
+  // it is the tier's one full innerHTML rebuild, and in WebKit its layout
+  // pass was most of the remaining scrub jank. A month trailing the clock by
+  // up to ~300ms at multi-month-per-second speeds is imperceptible, and
+  // _almScrubSettle redraws it exactly the moment motion stops.
+  _almTravelThrottled('dom', _ALM_TRAVEL_DOM_MS, function () {
+    _almScrubClock(focus);
+    _almLiveHeadCards(focus);
+  });
+  _almTravelThrottled('grid', _ALM_TRAVEL_GRID_MS, _almSyncSelectedToFocus);
+}
+
 function _almIsLiveNow(d) { return Math.abs(d.getTime() - Date.now()) < _SCRUB_LIVE_EPS; }
 
-// Move the calendar selection + browsed month onto the focused instant's day.
+// -- Scrub-time layout freeze ------------------------------------------------
+// The header card grid and the calendar panel change height as travel crosses
+// months (a five- vs six-week grid, a day-detail holiday list growing and
+// shrinking, polar sun cards swapping in). Mid-scrub that reflowed the whole
+// page every DOM tick — visible jank, and the sticky dock under the lever
+// shifted under the user's finger. So travel pins each variable-height section
+// at its current height (overflow clipped; a truncated holiday list for the
+// duration of a throw is invisible next to the page breathing) and releases the
+// pins on settle, when the exact repaint lands.
+var _ALM_TRAVEL_FREEZE_IDS = ['almanac-head', 'almanac-calendar'];
+var _almTravelFrozen = false;
+
+function _almTravelFreeze() {
+  if (_almTravelFrozen) return;
+  _almTravelFrozen = true;
+  // Record where each pinned section and its next sibling sit BEFORE pinning:
+  // the pin itself moves them (below), and these are the positions to restore.
+  var marks = [];
+  for (var i = 0; i < _ALM_TRAVEL_FREEZE_IDS.length; i++) {
+    var el = document.getElementById(_ALM_TRAVEL_FREEZE_IDS[i]);
+    if (!el || !el.offsetHeight) continue;
+    marks.push({
+      el: el, next: el.nextElementSibling,
+      top: el.getBoundingClientRect().top,
+      nextTop: el.nextElementSibling ? el.nextElementSibling.getBoundingClientRect().top : null
+    });
+  }
+  for (i = 0; i < marks.length; i++) {
+    marks[i].el.style.height = marks[i].el.offsetHeight + 'px';
+    marks[i].el.style.overflow = 'hidden';
+  }
+  // Pinning changes margin behaviour: a fixed height plus clipped overflow
+  // stops child margins collapsing out of the section (the hero card grid's
+  // 20px bottom margin, the calendar nav's 16px top margin), so the gaps those
+  // escaped margins formed vanish and the sky scene slides up into the hero
+  // cards for the duration of the throw. Give each pinned section explicit
+  // margins that put itself and its neighbour back exactly where they were;
+  // the extra passes absorb adjacent-sibling margin collapse, which can eat
+  // part of a first correction.
+  for (var pass = 0; pass < 3; pass++) {
+    var moved = false;
+    for (i = 0; i < marks.length; i++) {
+      var mk = marks[i];
+      var dTop = mk.top - mk.el.getBoundingClientRect().top;
+      if (Math.abs(dTop) > 0.5) {
+        mk.el.style.marginTop = ((parseFloat(getComputedStyle(mk.el).marginTop) || 0) + dTop) + 'px';
+        moved = true;
+      }
+      if (mk.next) {
+        var dNext = mk.nextTop - mk.next.getBoundingClientRect().top;
+        if (Math.abs(dNext) > 0.5) {
+          mk.el.style.marginBottom = ((parseFloat(getComputedStyle(mk.el).marginBottom) || 0) + dNext) + 'px';
+          moved = true;
+        }
+      }
+    }
+    if (!moved) break;
+  }
+}
+
+function _almTravelUnfreeze() {
+  if (!_almTravelFrozen) return;
+  _almTravelFrozen = false;
+  for (var i = 0; i < _ALM_TRAVEL_FREEZE_IDS.length; i++) {
+    var el = document.getElementById(_ALM_TRAVEL_FREEZE_IDS[i]);
+    if (!el) continue;
+    el.style.height = '';
+    el.style.overflow = '';
+    el.style.marginTop = '';
+    el.style.marginBottom = '';
+  }
+}
+
+// Move the calendar selection + browsed month onto the focused instant's day,
+// reading the instant in device-local fields — the same zone the header clock
+// and the time machine's readout use, so the three never disagree on the date.
+// Redraws only when the day actually moved: the grid is a full innerHTML
+// rebuild (~1.5ms), and scrubbing within a single day changes nothing in it.
 function _almSyncSelectedToFocus() {
   var f = _almFocusInstant();
-  _almSelectedJDN = _gregorianToJDN(f.getFullYear(), f.getMonth() + 1, f.getDate());
-  var cal = _jdnToCalendar(_almSystem, _almSelectedJDN);
+  var jdn = _gregorianToJDN(f.getFullYear(), f.getMonth() + 1, f.getDate());
+  var cal = _jdnToCalendar(_almSystem, jdn);
+  if (jdn === _almSelectedJDN && cal.year === _almYear && cal.month === _almMonth) return;
+  _almSelectedJDN = jdn;
   _almYear = cal.year;
   _almMonth = cal.month;
   _drawAlmanacGrid();
@@ -689,12 +1121,22 @@ function _almSyncSelectedToFocus() {
 // "zap" (shake + vibration) — used for deliberate arrivals (lever release, a
 // chosen destination), not for discrete wheel/key steps.
 function _almScrubSettle(target, opts) {
+  // Motion is over: release the height pins before the exact repaint below so
+  // the landed layout is the true one, and reset the DOM-tier throttle so the
+  // next gesture's first frame updates the text immediately.
+  _almTravelUnfreeze();
+  _almTravelThrottleAt = {};
   if (_almIsLiveNow(target)) {
     _almBackToToday();
   } else {
     _almFocus = _almClampInstant(target);
     _almSyncSelectedToFocus();
     _almRepaintFocus();
+    // Landing always returns the dock to the three-row circuit. The motion
+    // face used to stay up until tapped, which read as the instrument still
+    // "Traveling" after the lever had already been released.
+    var tm = document.getElementById('alm-tm');
+    if (tm && tm.getAttribute('data-mode') === 'motion') _almTmMode('rest');
     _almTmSync();
   }
   if (opts && opts.land) _almTmLand();
@@ -702,8 +1144,8 @@ function _almScrubSettle(target, opts) {
 
 // -- Visibility -----------------------------------------------------------
 // The instrument is hidden until summoned, so the almanac opens on the sky, not
-// a control panel. It appears when the user taps the hero clock (the
-// discoverable entry), picks a different calendar day, or engages the lever;
+// a control panel. It appears when the user taps the header date or time (the
+// discoverable entries), picks a different calendar day, or engages the lever;
 // the × closes it, snapping back to now via the existing back-to-now path so
 // the almanac is left reading the present.
 function _almTmShow() {
@@ -718,7 +1160,7 @@ function _almTmHide() {
   var el = document.getElementById('alm-tm');
   if (el) el.classList.remove('alm-tm-open');
 }
-function _almTmClose() { _almBackToToday(); _almTmHide(); }
+function _almTmClose() { _almTmEditCancel(); _almBackToToday(); _almTmHide(); }
 
 // -- Panel faces & readouts --
 function _almTmMode(mode) {
@@ -728,26 +1170,40 @@ function _almTmMode(mode) {
 // Tapping the collapsed readout returns to the three-row circuit.
 function _almTmToRest() { _almTmMode('rest'); _almTmSync(); }
 
-// Refresh the three-row circuit. DESTINATION mirrors DISPLAYED at rest; the
-// return-to-now control shows only while parked away from live.
+// Refresh the three-row circuit. DESTINATION mirrors DISPLAYED at rest (and
+// is left alone mid-edit — the user's keystrokes own it); the ACTUAL reading
+// is live as a return-to-now control only while parked away from the present.
 function _almTmSync() {
   var f = _almFocusInstant();
   var traveling = _almFocus != null && !_almIsLiveNow(_almFocus);
-  var disp = document.getElementById('alm-tm-displayed-val');
-  if (disp) disp.textContent = _almTmFmt(f);
-  var dest = document.getElementById('alm-tm-dest-val');
-  if (dest) dest.textContent = _almTmFmt(f);
-  var nowEl = document.getElementById('alm-tm-now-val');
-  if (nowEl) nowEl.textContent = _almTmFmt(new Date());
-  var ret = document.getElementById('alm-tm-return');
-  if (ret) ret.hidden = !traveling;
+  var pf = _almTmSetCells('alm-tm-disp', f);
+  if (!_almTmEditing) _almTmSetCells('alm-tm-dest', f);
+  var pn = _almTmSetCells('alm-tm-now', new Date());
   var root = document.getElementById('alm-tm');
-  if (root) root.classList.toggle('alm-tm-away', traveling);
+  if (root) {
+    // Shared segment widths (CSS vars, in ch) so the three rows stay one
+    // aligned fixed grid even when a BCE year sits above a 4-digit one. The
+    // month column is sized to the LONGEST localized abbreviation so arrow-
+    // stepping through months mid-edit can never clip or jitter a cell.
+    var monCh = 3;
+    var abbrs = _almTmMonAbbrs();
+    for (var i = 0; i < abbrs.length; i++) monCh = Math.max(monCh, _almTmChLen(abbrs[i]));
+    root.style.setProperty('--tm-mon-ch', monCh);
+    root.style.setProperty('--tm-year-ch', Math.max(4, pf.year.length, pn.year.length));
+    root.classList.toggle('alm-tm-away', traveling);
+  }
+  _almTmSetDelta('alm-tm-delta', f);
+  // The ACTUAL engraving is the way back to the present, so it is only a
+  // control while there is somewhere to come back from. `disabled` (not a
+  // class) is what drops the pointer cursor, the hover lamp-up and the tab
+  // stop in one move, and keeps assistive tech from offering a dead action.
+  var ret = document.getElementById('alm-tm-return');
+  if (ret) ret.disabled = !traveling;
 }
 
 function _almTmSoloUpdate(d) {
-  var el = document.getElementById('alm-tm-solo-val');
-  if (el) el.textContent = _almTmFmt(d);
+  _almTmSetCells('alm-tm-solo', d);
+  _almTmSetDelta('alm-tm-solo-delta', d);
 }
 
 // -- Landing ("zap to it"): brief shake + a short haptic pulse on arrival. --
@@ -762,50 +1218,253 @@ function _almTmLand() {
   setTimeout(function () { el.classList.remove('alm-tm-zap'); }, 480);
 }
 
-// -- Destination chooser — arbitrary date+time, any year including BCE. --
-function _almTmChooserSet(f) {
-  var vals = {
-    'alm-tm-cy': f.getFullYear(), 'alm-tm-cmo': f.getMonth() + 1, 'alm-tm-cd': f.getDate(),
-    'alm-tm-ch': f.getHours(), 'alm-tm-cmi': f.getMinutes()
+// -- Destination edit — in place, in the same cells. -------------------------
+// The DESTINATION row IS the editor. Clicking a segment swaps each value for
+// an input in the same cell: same order, same geometry, no pencil, no format
+// flip. Arrows step a field (months, hours and minutes wrap), typing replaces
+// it, Enter or the GO key commits and travels, Esc or the X key reverts. The
+// keypad strip carries GO/X while editing (mobile numeric keyboards have no
+// Enter) and is absent otherwise.
+var _almTmEditing = false;
+var _almTmEditPrev = null;              // instant to revert to on cancel
+var _almTmMonCache = null;              // localized month abbreviations, by lang
+
+function _almTmMonAbbrs() {
+  var lang = (typeof _currentLang !== 'undefined') ? _currentLang : 'en';
+  if (_almTmMonCache && _almTmMonCache.lang === lang) return _almTmMonCache.list;
+  var out = [];
+  for (var m = 0; m < 12; m++) out.push(_almTmParts(new Date(2024, m, 15)).mon);
+  _almTmMonCache = { lang: lang, list: out };
+  return out;
+}
+
+// Month field accepts the localized abbreviation (as shown), a typed prefix of
+// one, or a plain 1-12.
+function _almTmMonParse(v, dflt) {
+  v = (v == null ? '' : String(v)).trim();
+  if (!v) return dflt;
+  var n = parseInt(v, 10);
+  if (!isNaN(n)) return Math.min(12, Math.max(1, n));
+  var abbrs = _almTmMonAbbrs();
+  var up = v.toUpperCase();
+  for (var i = 0; i < 12; i++) {
+    if (abbrs[i].indexOf(up) === 0 || up.indexOf(abbrs[i]) === 0) return i + 1;
+  }
+  return dflt;
+}
+
+// -- Dismissal, shared by the almanac's two pop-over grids -------------------
+// Outside pointerdown or Escape closes the pop, and the handlers detach
+// themselves the moment it is gone, however it went (picked, redrawn, tapped
+// away). Used by the calendar's month grid and by the dock's month plate; they
+// differ only in the options, which is the whole reason this is one function.
+//   keep       selector for the control that opened the pop — a tap there
+//              belongs to that control's own handler, which toggles.
+//   swallowEsc the pop is open over a live field: the Escape that shuts the
+//              pop must not reach the field and cancel the edit behind it.
+//              (A second Escape finds no pop, so it does reach the field.)
+//   alsoClose  extra keys that end the pop's usefulness — for the dock, Enter
+//              (commits and travels) and Tab (moves to another field). These
+//              are NOT swallowed: the key still does its job.
+function _almPopDismissOn(id, opts) {
+  opts = opts || {};
+  var detach = function () {
+    document.removeEventListener('pointerdown', dismiss, true);
+    document.removeEventListener('keydown', dismiss, true);
   };
-  for (var id in vals) { var el = document.getElementById(id); if (el) el.value = vals[id]; }
+  var dismiss = function (ev) {
+    var p = document.getElementById(id);
+    if (!p) { detach(); return; }
+    if (ev.type === 'keydown') {
+      if (ev.key === 'Escape') {
+        if (opts.swallowEsc) { ev.preventDefault(); ev.stopPropagation(); }
+      } else if (!opts.alsoClose || opts.alsoClose.indexOf(ev.key) < 0) return;
+    } else if (ev.target && ev.target.closest &&
+               (p.contains(ev.target) || (opts.keep && ev.target.closest(opts.keep)))) return;
+    p.remove();
+    detach();
+  };
+  document.addEventListener('pointerdown', dismiss, true);
+  document.addEventListener('keydown', dismiss, true);
 }
 
-function _almTmOpenChooser() {
-  _almTmChooserSet(_almFocusInstant());
-  _almTmMode('chooser');
-  var y = document.getElementById('alm-tm-cy');
-  if (y) { y.focus(); if (y.select) y.select(); }
+// -- The month plate ---------------------------------------------------------
+// MONTH is the one destination field that takes a word rather than digits, so
+// it gets the same treatment the calendar's month name already has: a compact
+// grid of the twelve months. The abbreviations come from _almTmMonAbbrs, the
+// same list the readout itself shows, so the plate and the window can never
+// disagree and every locale is free.
+// The plate does not replace the field, it sits over it: the input stays
+// focused underneath, so typing and the arrow keys work exactly as before, and
+// picking a month only WRITES the abbreviation into the field. GO still
+// commits. One commit path, unchanged.
+var _ALM_TM_MONPOP = 'alm-tm-monpop';
+
+function _almTmMonPopMark() {
+  var pop = document.getElementById(_ALM_TM_MONPOP);
+  var input = document.getElementById('alm-tm-in-mon');
+  if (!pop || !input) return;
+  // 0 for an unreadable field: nothing lit is truer than lighting January.
+  var cur = _almTmMonParse(input.value, 0);
+  for (var i = 0; i < pop.children.length; i++) {
+    pop.children[i].classList.toggle('alm-tm-mon-cur', i + 1 === cur);
+  }
 }
 
-function _almTmChooserVal(id, dflt, lo, hi) {
+// Toggles, like the calendar's month name does — a second tap on MONTH puts
+// the plate away.
+function _almTmMonPop() {
+  if (document.getElementById(_ALM_TM_MONPOP)) { _almTmMonPopClose(); return; }
+  var panel = document.querySelector('#alm-tm .alm-tm-panel');
+  var input = document.getElementById('alm-tm-in-mon');
+  if (!panel || !input) return;
+  var abbrs = _almTmMonAbbrs();
+  var pop = document.createElement('div');
+  pop.id = _ALM_TM_MONPOP;
+  pop.className = 'alm-tm-monpop';
+  pop.setAttribute('role', 'menu');
+  pop.setAttribute('aria-label', _tLookup('alm_month_pick', 'Choose month'));
+  for (var m = 0; m < 12; m++) {
+    var b = document.createElement('button');
+    b.type = 'button';
+    // The cells ARE the plate's keys — same class, so the brass, the lit top
+    // edge and the press come from one place (see .alm-tm-moncell).
+    b.className = 'alm-tm-key alm-tm-moncell';
+    b.setAttribute('role', 'menuitem');
+    b.textContent = abbrs[m];
+    // Pressing a cell must not take the caret: the field behind the plate stays
+    // focused, so the arrows keep stepping and Enter still commits from it.
+    b.addEventListener('mousedown', _almTmMonPopHold);
+    b.onclick = (function (mm) {
+      return function () {
+        input.value = abbrs[mm];
+        _almTmMonPopClose();
+        input.focus();
+      };
+    })(m);
+    pop.appendChild(b);
+  }
+  panel.appendChild(pop);
+  _almTmMonPopMark();
+  _almPopDismissOn(_ALM_TM_MONPOP, { keep: '.alm-tm-cell-mon', swallowEsc: true, alsoClose: ['Enter', 'Tab'] });
+}
+
+function _almTmMonPopHold(ev) { ev.preventDefault(); }
+
+function _almTmMonPopClose() {
+  var pop = document.getElementById(_ALM_TM_MONPOP);
+  if (pop) pop.remove();
+}
+
+function _almTmEditStart(ev) {
+  // Which segment was tapped, decided before the early return: MONTH drops its
+  // plate whether the edit is starting now or already under way.
+  var cell = ev && ev.target && ev.target.closest ? ev.target.closest('.alm-tm-cell') : null;
+  var onMon = !!(cell && cell.classList.contains('alm-tm-cell-mon'));
+  if (_almTmEditing) { if (onMon) _almTmMonPop(); return; }
+  var root = document.getElementById('alm-tm');
+  if (!root) return;
+  _almTmEditing = true;
+  _almTmEditPrev = _almFocusInstant();
+  root.classList.add('alm-tm-editing');
+  var p = _almTmParts(_almTmEditPrev);
+  for (var i = 0; i < _ALM_TM_FIELDS.length; i++) {
+    var el = document.getElementById('alm-tm-in-' + _ALM_TM_FIELDS[i]);
+    if (el) el.value = p[_ALM_TM_FIELDS[i]];
+  }
+  // Focus the segment that was tapped; the month cell otherwise.
+  var input = (cell && cell.querySelector('.alm-tm-cin')) || document.getElementById('alm-tm-in-mon');
+  if (input) input.focus();
+  if (onMon) _almTmMonPop();
+}
+
+// Keyboard path onto the row itself (role=button). Keystrokes inside the
+// field inputs bubble up here too — those belong to _almTmEditKey (a commit's
+// Enter must not bounce straight back into a fresh edit).
+function _almTmDestKey(e) {
+  if (_almTmEditing || (e.target && e.target.tagName === 'INPUT')) return;
+  if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); _almTmEditStart(e); }
+}
+
+// Arrow stepping per field. Month/day/hour/minute wrap; the year clamps to
+// the instrument's travel range.
+var _ALM_TM_FIELD_RANGE = { day: [1, 31], hh: [0, 23], mi: [0, 59] };
+function _almTmEditStep(part, dir) {
+  var el = document.getElementById('alm-tm-in-' + part);
+  if (!el) return;
+  var prev = _almTmEditPrev || new Date();
+  if (part === 'mon') {
+    var m = _almTmMonParse(el.value, prev.getMonth() + 1) - 1 + dir;
+    el.value = _almTmMonAbbrs()[((m % 12) + 12) % 12];
+    _almTmMonPopMark();   // the plate follows the field it is stepping
+    return;
+  }
+  var n = parseInt(el.value, 10);
+  if (part === 'year') {
+    if (isNaN(n)) n = prev.getFullYear();
+    el.value = String(Math.max(_ALM_YEAR_MIN, Math.min(_ALM_YEAR_MAX, n + dir)));
+    return;
+  }
+  var r = _ALM_TM_FIELD_RANGE[part];
+  if (isNaN(n)) n = r[0];
+  var span = r[1] - r[0] + 1;
+  n = (((n - r[0] + dir) % span) + span) % span + r[0];
+  el.value = ('0' + n).slice(-2);
+}
+
+function _almTmEditKey(e, part) {
+  if (e.key === 'Enter') { e.preventDefault(); e.stopPropagation(); _almTmEditCommit(); }
+  else if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); _almTmEditCancel(); }
+  else if (e.key === 'ArrowUp') { e.preventDefault(); _almTmEditStep(part, 1); }
+  else if (e.key === 'ArrowDown') { e.preventDefault(); _almTmEditStep(part, -1); }
+}
+
+// A long typed year (5+ digits, BCE sign) widens the shared year column so
+// the digits never clip; _almTmSync trues it back up after the trip.
+function _almTmYearGrew(el) {
+  var root = document.getElementById('alm-tm');
+  if (root) {
+    var cur = parseInt(root.style.getPropertyValue('--tm-year-ch'), 10) || 4;
+    var len = Math.max(4, (el.value || '').length);
+    if (len > cur) root.style.setProperty('--tm-year-ch', len);
+  }
+}
+
+function _almTmEditInt(id, dflt, lo, hi) {
   var el = document.getElementById(id);
   var n = el ? parseInt(el.value, 10) : NaN;
   if (isNaN(n)) n = dflt;
-  if (lo != null) n = Math.max(lo, n);
-  if (hi != null) n = Math.min(hi, n);
-  return n;
+  return Math.max(lo, Math.min(hi, n));
 }
 
-function _almTmChooserGo() {
-  var now = new Date();
-  var y = _almTmChooserVal('alm-tm-cy', now.getFullYear(), _ALM_YEAR_MIN, _ALM_YEAR_MAX);
-  var mo = _almTmChooserVal('alm-tm-cmo', 1, 1, 12);
-  var d = _almTmChooserVal('alm-tm-cd', 1, 1, 31);
-  var h = _almTmChooserVal('alm-tm-ch', 0, 0, 23);
-  var mi = _almTmChooserVal('alm-tm-cmi', 0, 0, 59);
-  _almTmMode('rest');
+function _almTmEditStop() {
+  _almTmEditing = false;
+  _almTmEditPrev = null;
+  var root = document.getElementById('alm-tm');
+  if (root) root.classList.remove('alm-tm-editing');
+}
+
+function _almTmEditCommit() {
+  if (!_almTmEditing) return;
+  var prev = _almTmEditPrev || _almFocusInstant();
+  var monEl = document.getElementById('alm-tm-in-mon');
+  var mo = _almTmMonParse(monEl ? monEl.value : '', prev.getMonth() + 1);
+  var y = _almTmEditInt('alm-tm-in-year', prev.getFullYear(), _ALM_YEAR_MIN, _ALM_YEAR_MAX);
+  var d = _almTmEditInt('alm-tm-in-day', prev.getDate(), 1, 31);
+  var h = _almTmEditInt('alm-tm-in-hh', prev.getHours(), 0, 23);
+  var mi = _almTmEditInt('alm-tm-in-mi', prev.getMinutes(), 0, 59);
+  _almTmEditStop();
   _almScrubSettle(_almClampInstant(_almMakeInstant(y, mo, d, h, mi)), { land: true });
 }
 
-function _almTmChooserCancel() { _almTmMode('rest'); _almTmSync(); }
-
-function _almTmChooserKey(e) {
-  if (e.key === 'Enter') { e.preventDefault(); _almTmChooserGo(); }
-  else if (e.key === 'Escape') { e.preventDefault(); _almTmChooserCancel(); }
+function _almTmEditCancel() {
+  if (!_almTmEditing) return;
+  _almTmMonPopClose();
+  _almTmEditStop();
+  _almTmSync();
 }
 
-// Return-to-now, with the landing zap (button + Home key).
+// Return-to-now, with the landing zap (the ACTUAL engraving + the Home key).
 function _almTmReturnNow() { _almBackToToday(); _almTmLand(); }
 
 // -- Lever: displacement -> directional speed, spring back on release. --
@@ -861,6 +1520,7 @@ function _almTravelFrame(ts) {
     var next = _almClampInstant(new Date(base.getTime() + rate * dtReal));
     _almFocus = next;
     _almTmSoloUpdate(next);
+    _almTravelLive(next);
     if (!_almReduceMotion() && typeof _skySetInstant === 'function') _skySetInstant(next);
   }
 
@@ -874,6 +1534,7 @@ function _almTravelFrame(ts) {
 
 function _almTravelStart() {
   if (_almTravelRAF) return;
+  _almTravelFreeze();
   _almTravelLastTs = 0;
   _almTravelRAF = requestAnimationFrame(_almTravelFrame);
 }
@@ -888,6 +1549,7 @@ function _almLeverStart(e) {
   _almTmHalf = Math.max(1, tr.height / 2 - knob.offsetHeight / 2);
   _almLeverActive = true;
   _almLeverDecel = false;
+  _almTmEditCancel();                    // a thrown lever outranks a half-typed destination
   _almTmShow();                          // engaging the lever reveals the instrument
   knob.classList.remove('alm-tm-lever-spring');
   if (knob.setPointerCapture && e.pointerId != null) { try { knob.setPointerCapture(e.pointerId); } catch (err) {} }
@@ -935,7 +1597,8 @@ function _almLeverEnd(e) {
 function _almScrubStep(deltaMs) {
   var next = _almClampInstant(new Date(_almFocusInstant().getTime() + deltaMs));
   _almFocus = next;
-  _almScrubClock(next);
+  _almTravelFreeze();                    // released by the debounced settle
+  _almTravelLive(next);
   if (!_almReduceMotion() && typeof _skySetInstant === 'function') _skySetInstant(next);
   _almTmSync();
   clearTimeout(_almScrubWheelTimer);
@@ -988,73 +1651,6 @@ function _renderAlmanacContent() {
   var m = _moonPhase(now);
 
   var html = '<div class="almanac-inner">';
-
-  // The time machine — the almanac's skeuomorphic time-travel instrument.
-  // Sticky so it stays reachable while the panels below scroll. Three faces
-  // (rest / motion / chooser) toggled by its data-mode; see the engine above.
-  html += '<div id="alm-tm" class="alm-tm" data-mode="rest">';
-  html +=   '<div class="alm-tm-panel">';
-  // Rest face — the three-row time circuit.
-  html +=     '<div class="alm-tm-rows">';
-  html +=       '<div class="alm-tm-row alm-tm-displayed">';
-  html +=         '<span class="alm-tm-label">' + t('alm_tm_displayed') + '</span>';
-  html +=         '<span class="alm-tm-time" id="alm-tm-displayed-val"></span>';
-  html +=       '</div>';
-  html +=       '<button type="button" class="alm-tm-row alm-tm-dest" onclick="_almTmOpenChooser()" title="' + _almEsc(t('alm_tm_set_dest')) + '" aria-label="' + _almEsc(t('alm_tm_set_dest')) + '">';
-  html +=         '<span class="alm-tm-label">' + t('alm_tm_destination') + '</span>';
-  html +=         '<span class="alm-tm-time" id="alm-tm-dest-val"></span>';
-  html +=         '<span class="alm-tm-dest-ic" aria-hidden="true">✎</span>';
-  html +=       '</button>';
-  html +=       '<div class="alm-tm-row alm-tm-now">';
-  html +=         '<span class="alm-tm-label">' + t('alm_tm_actual') + '</span>';
-  html +=         '<span class="alm-tm-time" id="alm-tm-now-val"></span>';
-  html +=         '<button type="button" class="alm-tm-return" id="alm-tm-return" onclick="_almTmReturnNow()" title="' + _almEsc(t('alm_back_to_now')) + '" hidden>↺ ' + t('alm_now') + '</button>';
-  html +=       '</div>';
-  html +=     '</div>';
-  // Motion face — one readout of the moving position; tap to return to rest.
-  html +=     '<button type="button" class="alm-tm-solo" onclick="_almTmToRest()" aria-label="' + _almEsc(t('alm_tm_traveling')) + '">';
-  html +=       '<span class="alm-tm-solo-lbl">' + t('alm_tm_traveling') + '</span>';
-  html +=       '<span class="alm-tm-solo-time" id="alm-tm-solo-val"></span>';
-  html +=     '</button>';
-  // Chooser face — pick any date+time; the year field accepts arbitrary and BCE.
-  var _tmFields = [
-    ['alm-tm-cy', t('alm_tm_year'), t('alm_tm_year_hint'), 'alm-tm-field-year'],
-    ['alm-tm-cmo', t('alm_tm_month'), '', ''],
-    ['alm-tm-cd', t('alm_tm_day'), '', ''],
-    ['alm-tm-ch', t('alm_tm_hour'), '', ''],
-    ['alm-tm-cmi', t('alm_tm_min'), '', '']
-  ];
-  html +=     '<div class="alm-tm-chooser">';
-  html +=       '<div class="alm-tm-fields">';
-  for (var _fi = 0; _fi < _tmFields.length; _fi++) {
-    var _f = _tmFields[_fi];
-    html +=       '<label class="alm-tm-field ' + _f[3] + '"><span class="alm-tm-field-lbl">' + _f[1] + '</span>' +
-                    '<input type="number" step="1" id="' + _f[0] + '" class="alm-tm-input" inputmode="numeric"' +
-                    ' aria-label="' + _almEsc(_f[1]) + '"' + (_f[2] ? ' title="' + _almEsc(_f[2]) + '"' : '') +
-                    ' onkeydown="_almTmChooserKey(event)"></label>';
-  }
-  html +=       '</div>';
-  html +=       '<div class="alm-tm-chooser-btns">';
-  html +=         '<button type="button" class="alm-tm-cancel" onclick="_almTmChooserCancel()">' + t('alm_tm_cancel') + '</button>';
-  html +=         '<button type="button" class="alm-tm-go" onclick="_almTmChooserGo()">' + t('alm_tw_go') + '</button>';
-  html +=       '</div>';
-  html +=     '</div>';
-  html +=   '</div>';
-  // Side-mounted lever — throw up for the future, down for the past.
-  html +=   '<div class="alm-tm-lever-col">';
-  html +=     '<div class="alm-tm-track" id="alm-tm-track">';
-  html +=       '<span class="alm-tm-endstop alm-tm-endstop-fwd" aria-hidden="true"></span>';
-  html +=       '<div class="alm-tm-lever alm-tm-lever-spring" id="alm-tm-lever" role="slider" tabindex="0"' +
-                  ' aria-label="' + _almEsc(t('alm_tm_lever_label')) + '" aria-orientation="vertical"' +
-                  ' aria-valuemin="-100" aria-valuemax="100" aria-valuenow="0">' +
-                  '<span class="alm-tm-lever-grip" aria-hidden="true"></span>' +
-                '</div>';
-  html +=       '<span class="alm-tm-endstop alm-tm-endstop-back" aria-hidden="true"></span>';
-  html +=     '</div>';
-  html +=   '</div>';
-  // Close — returns the almanac to now and hides the instrument again.
-  html +=   '<button type="button" class="alm-tm-close" onclick="_almTmClose()" title="' + _almEsc(t('alm_tm_close')) + '" aria-label="' + _almEsc(t('alm_tm_close')) + '">×</button>';
-  html += '</div>';
 
   html += '<div id="almanac-head">' + _almHeadHtml(now) + '</div>';
   _almPrevFocusTime = now.getTime();   // seed the hero-moon sweep's start
@@ -1155,6 +1751,92 @@ function _renderAlmanacContent() {
   html += '</div>';
 
 
+  // The time machine — the almanac's skeuomorphic time-travel instrument.
+  // Docked at the BOTTOM of the layout and sticky to the viewport's bottom edge,
+  // so summoning it (hero-clock tap, calendar pick, lever) grows the page only
+  // below everything the reader is looking at — no scroll bump — while still
+  // riding into view as a dock. Two faces (rest / motion) toggled by its
+  // data-mode, plus an in-place destination edit on the rest face; see the
+  // engine above.
+  html += '<div id="alm-tm" class="alm-tm" data-mode="rest">';
+  html +=   '<div class="alm-tm-panel">';
+  // Rest face — one lit glass window over two fine engravings, not three equal
+  // rows. DESTINATION is the window and the control: its fields carry hidden
+  // in-place inputs. The offset-from-now lamp rides the legend line's right
+  // half, which was dead space, so all three readings plus the delta fit in
+  // roughly two thirds of the height the stacked rows needed.
+  html +=     '<div class="alm-tm-rows">';
+  html +=       '<div class="alm-tm-caps">';
+  html +=         '<span class="alm-tm-cap">' + t('alm_tm_destination') + '</span>';
+  html +=         '<span class="alm-tm-delta" id="alm-tm-delta" title="' + _almEsc(t('alm_tm_offset')) + '"></span>';
+  html +=       '</div>';
+  html +=       _almTmColsHtml();
+  html +=       '<div class="alm-tm-glass alm-tm-dest" role="button" tabindex="0" onclick="_almTmEditStart(event)" onkeydown="_almTmDestKey(event)" title="' + _almEsc(t('alm_tm_set_dest')) + '">' + _almTmCellsHtml('alm-tm-dest', true) + '</div>';
+  html +=       '<div class="alm-tm-rail" aria-hidden="true"></div>';
+  html +=       '<div class="alm-tm-sec">';
+  html +=         '<div class="alm-tm-secrow alm-tm-displayed">';
+  html +=           '<span class="alm-tm-seccap">' + t('alm_tm_displayed') + '</span>' + _almTmCellsHtml('alm-tm-disp');
+  html +=         '</div>';
+  // ACTUAL is both the reading of the present AND the way back to it: the
+  // engraving itself is the control, so the plate needs no return key. It is a
+  // real <button> (keyboard-focusable, Enter/Space) and carries `disabled`
+  // whenever the almanac already reads the present — there is nothing to
+  // return to then, so it must not take a tab stop or a hover.
+  html +=         '<button type="button" class="alm-tm-secrow alm-tm-now" id="alm-tm-return"' +
+                    ' onclick="_almTmReturnNow()" title="' + _almEsc(t('alm_back_to_now')) + '"' +
+                    ' aria-label="' + _almEsc(t('alm_back_to_now')) + '" disabled>';
+  html +=           '<span class="alm-tm-seccap">' + t('alm_tm_actual') + '</span>' + _almTmCellsHtml('alm-tm-now');
+  html +=         '</button>';
+  // Keypad strip — GO/X only, and only during a destination edit (tap targets
+  // for mobile, where numeric keyboards have no Enter key). It lives INSIDE the
+  // secondary block and is absolutely positioned over it; the two engravings go
+  // visibility:hidden for the duration of the edit. So the keys cost the plate
+  // no height of their own, the dock measures the same in rest, edit and
+  // motion, and removing the old NOW key made the whole instrument shorter.
+  html +=         '<div class="alm-tm-keys">';
+  html +=           '<button type="button" class="alm-tm-key alm-tm-key-cancel" onclick="_almTmEditCancel()" title="' + _almEsc(t('alm_tm_cancel')) + '" aria-label="' + _almEsc(t('alm_tm_cancel')) + '">&#10005;</button>';
+  html +=           '<button type="button" class="alm-tm-key alm-tm-key-go" onclick="_almTmEditCommit()">' + t('alm_tw_go') + '</button>';
+  html +=         '</div>';
+  html +=       '</div>';
+  html +=     '</div>';
+  // Motion face — the same legend line and the same glass window, one size up,
+  // overlaid on the (hidden but still laid out) rest face so the dock's size
+  // never changes when the lever is grabbed; tap to return to rest. The offset
+  // lamp keeps its exact position, so it reads as one instrument counting off
+  // the distance travelled rather than a second screen.
+  html +=     '<button type="button" class="alm-tm-solo" onclick="_almTmToRest()" aria-label="' + _almEsc(t('alm_tm_traveling')) + '">';
+  html +=       '<span class="alm-tm-caps">';
+  html +=         '<span class="alm-tm-cap">' + t('alm_tm_traveling') + '</span>';
+  html +=         '<span class="alm-tm-delta" id="alm-tm-solo-delta"></span>';
+  html +=       '</span>';
+  html +=       '<span class="alm-tm-glass">' + _almTmCellsHtml('alm-tm-solo') + '</span>';
+  html +=     '</button>';
+  html +=   '</div>';
+  // Side-mounted lever — a faceted crystal disc on a brass shaft (the 1960 Time
+  // Machine's spinning crystal). Throw up for the future, down for the past; the
+  // disc is the drag target, mechanics unchanged. The shaft is a static rod the
+  // disc rides along.
+  html +=   '<div class="alm-tm-lever-col">';
+  html +=     '<div class="alm-tm-track" id="alm-tm-track">';
+  html +=       '<span class="alm-tm-shaft" aria-hidden="true"></span>';
+  html +=       '<span class="alm-tm-endstop alm-tm-endstop-fwd" aria-hidden="true"></span>';
+  html +=       '<div class="alm-tm-lever alm-tm-lever-spring" id="alm-tm-lever" role="slider" tabindex="0"' +
+                  ' aria-label="' + _almEsc(t('alm_tm_lever_label')) + '" aria-orientation="vertical"' +
+                  ' aria-valuemin="-100" aria-valuemax="100" aria-valuenow="0">' +
+                  '<span class="alm-tm-crystal" aria-hidden="true"><span class="alm-tm-crystal-facets"></span></span>' +
+                '</div>';
+  html +=       '<span class="alm-tm-endstop alm-tm-endstop-back" aria-hidden="true"></span>';
+  html +=     '</div>';
+  html +=   '</div>';
+  // Close — returns the almanac to now and hides the instrument again. A small
+  // brass-ringed stud on the dock's corner (same material language as the
+  // lever shaft); the thin stroked cross scales cleanly where a text × cannot.
+  // Its CSS ::after pad extends the 22px stud to a 44px touch target.
+  html +=   '<button type="button" class="alm-tm-close" onclick="_almTmClose()" title="' + _almEsc(t('alm_tm_close')) + '" aria-label="' + _almEsc(t('alm_tm_close')) + '">' +
+              '<svg viewBox="0 0 10 10" aria-hidden="true"><path d="M2 2 L8 8 M8 2 L2 8" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>' +
+            '</button>';
+  html += '</div>';
+
   // Footer
   html += '<div style="margin-top:40px;text-align:center;font-size:11px;color:var(--text3)">' +
     t('alm_footer') +
@@ -1235,13 +1917,11 @@ function _cacheAlmanacHighlights(now, moon) {
 // ── Moon rendering ──
 
 // Screen tilt (degrees) of the hero disc at a given instant: the bright limb
-// faces the Sun as the observer sees it. brightLimb (chi - q) is the physical
-// quantity; the base art has its lit limb at 3 o'clock and CSS rotation runs
-// opposite to the position-angle sense, so the screen tilt is -(chi-q) - 90.
+// faces the Sun as the observer sees it. Delegates to the canonical
+// _moonScreenTiltDeg in app.js — the ONE derivation the hero, the sky-scene
+// moon and the Today discover card all share.
 function _heroMoonTiltDeg(date, loc) {
-  var mp = _moonPosition(date, loc.lat, loc.lon);
-  var limb = (mp.brightLimb != null ? mp.brightLimb : mp.parallactic) || 0;
-  return -limb - 90;
+  return _moonScreenTiltDeg(date, loc.lat, loc.lon);
 }
 
 // ── Hero moon time-travel sweep ──
@@ -1255,7 +1935,18 @@ function _heroMoonTiltDeg(date, loc) {
 // that img is revealed with no visible seam. Reduced motion snaps (caller +
 // CSS guard). Position never changes -- the hero is centred -- so only phase
 // and tilt animate.
-var _HERO_MOON_ANIM_SIZE = 128;   // sprite gen size while moving (cheap; scaled to fill)
+var _HERO_MOON_ANIM_SIZE = 256;   // sprite pixels while moving (device px, dpr included)
+// Motion sprites are capped at 256 real pixels: _moonSpriteCanvas multiplies
+// its size argument by devicePixelRatio, and a cold cache shades ~50 phase
+// buckets across the first fast throw. 256 was unaffordable when every bucket
+// paid a drawImage + getImageData GPU readback (~6.6ms/bucket at 128 in
+// WebKit); with the base pixels cached once per size (_moonTexBaseData) a
+// bucket is just the shading loop, so motion quality rises from the old chunky
+// 128 while the throw stays cheaper than it was. The resting <img> still
+// renders at full 200px x dpr; only frames in motion use this.
+function _heroMoonAnimGenSize() {
+  return _HERO_MOON_ANIM_SIZE / (window.devicePixelRatio || 1);
+}
 var _HERO_MOON_PHASE_STEP = 0.02; // quantise illum to ~50 buckets so re-shades stay cached
 var _HERO_MOON_MIN_SPAN_MS = 1000;// jumps under this (e.g. a location refresh) just snap
 var _heroMoonAnim = null;         // active discrete-jump descriptor, or null
@@ -1266,14 +1957,15 @@ function _moonEaseInOut(p) {
 }
 
 // The overlay canvas laid over the current hero moon (created lazily, reused).
+// Backing store is the motion sprite size — the sprite blits 1:1 and CSS
+// scales the element to the 200px disc; rotation is a compositor transform.
 function _heroMoonEnsureOverlay(hero) {
   if (_heroMoonOverlay && _heroMoonOverlay.isConnected) return _heroMoonOverlay;
-  var dpr = window.devicePixelRatio || 1;
   var cv = document.createElement('canvas');
   cv.className = 'almanac-moon-anim';
   cv.setAttribute('aria-hidden', 'true');
-  cv.width = Math.round(200 * dpr);
-  cv.height = Math.round(200 * dpr);
+  cv.width = _HERO_MOON_ANIM_SIZE;
+  cv.height = _HERO_MOON_ANIM_SIZE;
   hero.appendChild(cv);
   _heroMoonOverlay = cv;
   return cv;
@@ -1286,20 +1978,23 @@ function _heroMoonRemoveOverlay() {
   _heroMoonOverlay = null;
 }
 
-// Draw the moon into the overlay: cached shaded sprite (drawImage is ~free once
-// the 1% bucket exists) rotated by the interpolated tilt. genSize controls the
-// sprite resolution -- small while moving, full on the landing frame so the
-// hand-off to the resting img is seamless.
-function _heroMoonDrawCanvas(cv, illumFrac, waxing, tiltDeg, genSize) {
-  var ctx = cv.getContext('2d');
-  var W = cv.width, c = W / 2;
-  ctx.clearRect(0, 0, W, W);
-  var spr = _moonSpriteCanvas(illumFrac, waxing, genSize);
-  ctx.save();
-  ctx.translate(c, c);
-  ctx.rotate(tiltDeg * Math.PI / 180);
-  ctx.drawImage(spr, -c, -c, W, W);
-  ctx.restore();
+// Draw the moon into the overlay. The canvas repaints only when the phase
+// BUCKET changes (a few times a second at travel speed); the per-frame tilt is
+// a CSS transform on the element, which the compositor rotates without
+// touching a pixel. The old version cleared + rotated + drawImage'd the full
+// 200px x dpr backing every frame — ~4.3ms/frame in WebKit even with a warm
+// sprite cache, a quarter of the whole frame budget.
+function _heroMoonDrawCanvas(cv, illumFrac, waxing, tiltDeg) {
+  var key = Math.round(illumFrac * 100) + (waxing ? 'w' : 'a') + (_moonTexReady ? 't' : '');
+  if (cv._moonBucket !== key) {
+    cv._moonBucket = key;
+    var ctx = cv.getContext('2d');
+    var W = cv.width;
+    ctx.clearRect(0, 0, W, W);
+    ctx.drawImage(_moonSpriteCanvas(illumFrac, waxing, _heroMoonAnimGenSize()), 0, 0, W, W);
+  }
+  // Compose with the stylesheet's translateX(-50%) centring (.almanac-moon-anim).
+  cv.style.transform = 'translateX(-50%) rotate(' + tiltDeg.toFixed(2) + 'deg)';
 }
 
 // Begin a hero sweep from fromTime to toTime (focus instants, ms). Called right
@@ -1318,17 +2013,45 @@ function _almHeroMoonSweep(head, fromTime, toTime, loc) {
   };
 }
 
-// Per-frame hook, called from the sky rAF. Advances a discrete jump sweep and,
-// failing that, keeps the hero flowing while the time lever is engaged.
+// ── Hero moon during live travel ──
+// The disc is drawn from the SAME _moonPhase result the readout cards are
+// written from, in the same call, so it cannot show a crescent while the
+// illumination beside it reads 94% — which is what happened while this hung off
+// the sky loop's own rAF: that branch only ran for the lever (never for wheel
+// or arrow-key steps) and only while a sky canvas happened to be alive.
+// Illumination is quantised to _HERO_MOON_PHASE_STEP so every frame hits the
+// sprite cache; a full-resolution re-shade per frame is what makes this
+// expensive, and 2% of a disc is far below what an eye resolves.
+var _heroMoonTravelOn = false;
+
+function _heroMoonTravelDraw(focus, m) {
+  var heroEl = document.querySelector('#almanac-head .almanac-hero');
+  if (!heroEl || !heroEl.querySelector('.almanac-moon')) return;
+  _heroMoonAnim = null;              // a live scrub supersedes any settle sweep
+  _heroMoonTravelOn = true;
+  var illumFrac = Math.round(m.illumination / 100 / _HERO_MOON_PHASE_STEP) * _HERO_MOON_PHASE_STEP;
+  var tilt = _heroMoonTiltDeg(focus, _getLocation());
+  _heroMoonDrawCanvas(_heroMoonEnsureOverlay(heroEl), illumFrac, _moonIsWaxing(m), tilt);
+}
+
+// End travel and drop the overlay, revealing the resting <img> beneath.
+function _heroMoonTravelEnd() {
+  _heroMoonTravelOn = false;
+  if (_heroMoonOverlay) _heroMoonRemoveOverlay();
+}
+
+// Per-frame hook, called from the sky rAF, for the discrete settle sweep only.
+// Live travel draws itself (above) rather than waiting on this loop.
 function _heroMoonTick(ts) {
   if (_heroMoonAnim) {
     var a = _heroMoonAnim, cv = _heroMoonOverlay;
     if (!cv || !cv.isConnected) { _heroMoonAnim = null; return; }
     var p = (ts - a.start) / a.dur;
     if (p >= 1) {
-      // Land at full resolution so removing the overlay reveals an identical img.
-      var end = _moonPhase(new Date(a.toTime));
-      _heroMoonDrawCanvas(cv, end.illumination / 100, end.phase < 0.5, a.toTilt, 200);
+      // Removing the overlay reveals the resting <img>, which the header
+      // rebuild already rendered at the destination phase and full resolution.
+      // (A final full-res canvas draw here was never composited — the removal
+      // lands in the same tick — so it was pure waste.)
       _heroMoonRemoveOverlay();
       _heroMoonAnim = null;
       return;
@@ -1337,22 +2060,11 @@ function _heroMoonTick(ts) {
     var ph = _moonAnimPhaseAt(a.fromTime, a.toTime, e);
     var illumFrac = Math.round(ph.illumination / 100 / _HERO_MOON_PHASE_STEP) * _HERO_MOON_PHASE_STEP;
     var tilt = a.fromTilt + _angleDelta(a.fromTilt, a.toTilt) * e;
-    _heroMoonDrawCanvas(cv, illumFrac, ph.phase < 0.5, tilt, _HERO_MOON_ANIM_SIZE);
+    _heroMoonDrawCanvas(cv, illumFrac, _moonIsWaxing(ph), tilt);
     return;
   }
-  // Live lever travel: the header isn't rebuilt per frame, so drive the disc
-  // straight from the current focus. Real tilt at a single instant is stable
-  // (no daily-parallactic strobe, which only shows when sampling ACROSS days).
-  var travel = (typeof _almLeverActive !== 'undefined') && (_almLeverActive || _almLeverDecel);
-  if (travel) {
-    var heroEl = document.querySelector('#almanac-head .almanac-hero');
-    if (!heroEl || !heroEl.querySelector('.almanac-moon')) return;
-    var cv2 = _heroMoonEnsureOverlay(heroEl);
-    var f = _almFocusInstant(), loc2 = _getLocation(), m = _moonPhase(f);
-    _heroMoonDrawCanvas(cv2, m.illumination / 100, m.phase < 0.5, _heroMoonTiltDeg(f, loc2), _HERO_MOON_ANIM_SIZE);
-    return;
-  }
-  if (_heroMoonOverlay) _heroMoonRemoveOverlay();   // travel ended: reveal the img
+  // Not sweeping and not travelling: reveal the resting img.
+  if (!_heroMoonTravelOn && _heroMoonOverlay) _heroMoonRemoveOverlay();
 }
 
 // Almanac hero moon — delegates to _renderMoonHTML (defined in app.js)
@@ -1361,7 +2073,7 @@ function _renderAlmanacMoon(m, tiltDeg) {
   var illumFrac = m.illumination / 100;
   var glowOpacity = (illumFrac * 0.15 + 0.02).toFixed(2);
   return '<div class="almanac-moon-glow" style="background:radial-gradient(circle, rgba(232,224,208,' + glowOpacity + ') 0%, transparent 65%)"></div>' +
-    _renderMoonHTML(m, 'almanac-moon', tiltDeg, 1.0);
+    _renderMoonHTML(m, 'almanac-moon', tiltDeg);
 }
 
 // Next full moon after fromDate, with its distance and whether it's a
@@ -1895,6 +2607,410 @@ var _sunMapCanvas = null;
 var _sunMapCycle = { x: -999, y: -999, list: '', idx: 0 }; // click-cycle overlaps
 var _sunMapFlashTimer = 0;
 
+// Equirectangular projection helpers — the map spans the full -180..180 by
+// -90..90 rectangle, so both are straight linear maps. Every point plotted on
+// the map (cities, the picked location, the subsolar point, the time zone
+// borders) goes through these two rather than repeating the arithmetic.
+function _sunMapLonToX(lon, W) { return (lon + 180) / 360 * W; }
+function _sunMapLatToY(lat, H) { return (90 - lat) / 180 * H; }
+
+// ── Real time zone boundaries ──
+// The actual, irregular civil zone borders — China spanning one zone, India's
+// half-hour band, Australia's three-way split, the jagged date line — not the
+// clean 15-degree solar meridians an almanac prints. Polylines and per-zone
+// polygons come from /static/tz-borders.json (built by
+// scripts/build-tz-borders.py from Natural Earth's public-domain 10m Time
+// Zones; at sea the borders are the straight nautical meridians by
+// definition, on land they follow the politics).
+//
+// The asset is fetched lazily the first time the map draws — never on app
+// boot — and a miss is tolerated silently: the map simply has no borders
+// until the network returns (the service worker's stale-while-revalidate
+// /static/ route caches it after the first successful load, so offline
+// visits after that get it from cache).
+var _SM_TZ_STEP_HOURS = 3;      // label every N hours, widened when it gets tight
+var _SM_TZ_LABEL_PITCH = 40;    // min CSS px between labels before widening
+
+// Height of the strip along the bottom edge that carries the UTC labels. Sized
+// off the map so it stays proportional, floored so the type never collides.
+function _sunMapGutter(H, dpr) { return Math.max(12 * dpr, H * 0.07); }
+
+// How many hours between labels at this width — 3, then 6, then 12, so the
+// labels stay a readable distance apart down to phone widths.
+function _sunMapLabelStep(W, dpr) {
+  var pxPerHour = W / dpr / 24;
+  var step = _SM_TZ_STEP_HOURS;
+  while (step < 12 && pxPerHour * step < _SM_TZ_LABEL_PITCH) step += _SM_TZ_STEP_HOURS;
+  return step;
+}
+
+// The map's unchanging layer: background, world image and the zone borders.
+// None of it moves as time travels, so it is rendered once per size into an
+// offscreen canvas and blitted each frame — which costs less than the old code
+// paid to re-rasterise the SVG on every redraw, borders or not. The key
+// carries the border-data flag so the layer rebuilds once when the lazy
+// fetch lands.
+var _sunMapBase = null;
+var _sunMapBaseKey = '';
+
+function _sunMapBaseLayer(W, H, dpr) {
+  var key = W + 'x' + H + ':' + dpr + ':' + (_sunMapLoaded ? '1' : '0') + ':' + (_tzBorders ? '1' : '0');
+  if (_sunMapBase && _sunMapBaseKey === key) return _sunMapBase;
+  var cv = _sunMapBase || document.createElement('canvas');
+  cv.width = W; cv.height = H;
+  var c = cv.getContext('2d');
+  c.fillStyle = '#0d1117';
+  c.fillRect(0, 0, W, H);
+  if (_sunMapLoaded) {
+    // 0.45, up from the 0.40 the map launched with: the hairline zone borders
+    // added a competing texture over the land, and at 0.40 the continents read
+    // washed out underneath them. One step brighter keeps the muted night-map
+    // voice while letting the coastlines win back the mid-ground.
+    c.globalAlpha = 0.45;
+    c.drawImage(_sunMapImg, 0, 0, W, H);
+    c.globalAlpha = 1;
+  }
+  _sunMapDrawTzBorders(c, W, H, dpr);
+  _sunMapBase = cv;
+  _sunMapBaseKey = key;
+  return cv;
+}
+
+// Lazy-loaded border polylines: each entry is a flat [lon, lat, lon, lat, ...]
+// array, pre-split in the build script so no segment crosses the antimeridian
+// (a crossing would stroke a streak across the whole map).
+var _tzBorders = null;
+var _tzBordersFetched = false;
+var _tzBordersPath = null;
+var _tzBordersPathKey = '';
+
+function _tzBordersEnsure() {
+  if (_tzBordersFetched) return;
+  _tzBordersFetched = true;
+  // ?v= matches the world-map.svg convention: /static/ is served immutable
+  // for a year, so a regenerated asset must bump the version to bust caches.
+  fetch('/static/tz-borders.json?v=2')
+    .then(function (r) { return r.ok ? r.json() : null; })
+    .then(function (data) {
+      if (!data || !data.lines || !data.lines.length) return;
+      _tzBorders = data.lines;
+      _tzZones = (data.zones && data.zones.length) ? data.zones : null;
+      _tzZonesByOffset = _tzZones ? _tzGroupByOffset(_tzZones) : null;
+      _tzZoneKey = '';       // re-resolve the highlight for the current pick
+      _tzZonePathKey = '';
+      _sunMapBaseKey = '';   // stale key → base layer rebuilds with borders
+      _drawSunMap();
+    })
+    .catch(function () { /* offline before first cache fill — no borders */ });
+}
+
+// One Path2D per map size, projected through the shared lon/lat helpers so
+// the borders stay registered with the terminator. Built only when the cached
+// base layer rebuilds, then stamped with a single stroke — zero per-frame
+// geometry cost.
+function _tzBordersPathFor(W, H) {
+  var key = W + 'x' + H;
+  if (_tzBordersPath && _tzBordersPathKey === key) return _tzBordersPath;
+  var p = new Path2D();
+  for (var i = 0; i < _tzBorders.length; i++) {
+    var line = _tzBorders[i];
+    p.moveTo(_sunMapLonToX(line[0], W), _sunMapLatToY(line[1], H));
+    for (var j = 2; j < line.length; j += 2) {
+      p.lineTo(_sunMapLonToX(line[j], W), _sunMapLatToY(line[j + 1], H));
+    }
+  }
+  _tzBordersPath = p;
+  _tzBordersPathKey = key;
+  return p;
+}
+
+// The real zone borders plus the label gutter under them. Hairline and
+// low-contrast so the irregular shapes read as texture under the terminator,
+// which stays the brightest line on the map.
+function _sunMapDrawTzBorders(c, W, H, dpr) {
+  var gutter = _sunMapGutter(H, dpr);
+  var top = H - gutter;
+
+  if (_tzBorders) {
+    c.save();
+    c.beginPath();
+    c.rect(0, 0, W, top);    // keep strokes out of the label gutter
+    c.clip();
+    // A single device pixel (0.5 CSS px on 2x backing) at reduced alpha —
+    // heavier reads as a grid fighting the terminator for attention.
+    c.strokeStyle = 'rgba(210,180,120,0.13)';
+    c.lineWidth = Math.max(0.5, 0.5 * dpr);
+    c.lineJoin = 'round';
+    c.stroke(_tzBordersPathFor(W, H));
+    c.restore();
+  }
+
+  // Label gutter — a faint dark strip so the offsets read against the map.
+  c.fillStyle = 'rgba(4,7,12,0.45)';
+  c.fillRect(0, top, W, gutter);
+  c.fillStyle = 'rgba(210,180,120,0.10)';
+  c.fillRect(0, Math.round(top), W, Math.max(1, Math.round(dpr)));
+}
+
+// The UTC offsets. They belong on top of the night shading — sunk underneath it
+// the labels on the dark half come out half as bright as the lit half — but
+// they never move, so they are cached too. The strip is only as tall as the
+// gutter, so this costs a few hundred KB less than a second full-size layer.
+var _sunMapLabels = null;
+var _sunMapLabelsKey = '';
+
+// An offset's nominal meridian, wrapped into the map's -180..180 span: the
+// +13/+14 zones (Tonga, Samoa, the Line Islands) physically sit WEST of the
+// date line, so their strip position is the wrapped -165/-150, not an
+// off-canvas 195/210. Shared by the minor ticks and the selected-zone label.
+function _sunMapOffsetLon(offMin) {
+  var lon = offMin / 4;                    // 60 min of offset = 15 deg of lon
+  return ((lon + 180) % 360 + 360) % 360 - 180;
+}
+
+// "UTC" at zero, otherwise a signed hour with minutes only when fractional:
+// +5:30, -9:30, +14. Same voice as the integer strip labels.
+function _sunMapOffsetLabel(offMin) {
+  if (!offMin) return 'UTC';
+  var a = Math.abs(offMin);
+  var mm = a % 60;
+  return (offMin < 0 ? '-' : '+') + Math.floor(a / 60) + (mm ? ':' + ('0' + mm).slice(-2) : '');
+}
+
+function _sunMapLabelStrip(W, H, dpr) {
+  var gutter = Math.round(_sunMapGutter(H, dpr));
+  // The zones flag mirrors the base layer's key: the minor ticks come from the
+  // lazily fetched zone list, so the cached strip rebuilds once when it lands.
+  var key = W + 'x' + gutter + ':' + dpr + ':' + (_tzZones ? '1' : '0');
+  if (_sunMapLabels && _sunMapLabelsKey === key) return _sunMapLabels;
+  var cv = _sunMapLabels || document.createElement('canvas');
+  cv.width = W; cv.height = gutter;
+  var c = cv.getContext('2d');
+  c.clearRect(0, 0, W, gutter);
+  c.font = Math.round(8.5 * dpr) + 'px ui-monospace, SFMono-Regular, Menlo, monospace';
+  c.textBaseline = 'middle';
+  var step = _sunMapLabelStep(W, dpr);
+  for (var off = -12; off <= 12; off += step) {
+    var x = _sunMapLonToX(off * 15, W);
+    // The outermost labels straddle the canvas edge; anchor them inward.
+    if (off <= -12) { c.textAlign = 'left'; x += 3 * dpr; }
+    else if (off >= 12) { c.textAlign = 'right'; x -= 3 * dpr; }
+    else c.textAlign = 'center';
+    c.fillStyle = off === 0 ? 'rgba(245,158,11,0.80)' : 'rgba(210,180,120,0.45)';
+    c.fillText(off === 0 ? 'UTC' : (off > 0 ? '+' + off : String(off)), x, gutter / 2);
+  }
+  // Minor ticks — one per real zone offset that has no integer label of its
+  // own: the fractional zones (+5:30, +5:45, +9:30, -3:30 ...) and the +13/+14
+  // extensions at their wrapped date-line positions. Forty labels can't fit as
+  // text; a quiet tick marks that a zone lives between the printed hours, and
+  // picking one lights its exact offset in amber (see
+  // _sunMapDrawSelectedOffset).
+  if (_tzZonesByOffset) {
+    c.strokeStyle = 'rgba(210,180,120,0.38)';
+    c.lineWidth = Math.max(1, dpr);
+    // The grouping map's keys ARE the distinct offsets, so no dedupe pass.
+    var zoneOffsets = Object.keys(_tzZonesByOffset);
+    for (var zi = 0; zi < zoneOffsets.length; zi++) {
+      var zo = Number(zoneOffsets[zi]);
+      if (zo % 60 === 0 && zo >= -720 && zo <= 720) continue;
+      var tx = Math.round(_sunMapLonToX(_sunMapOffsetLon(zo), W)) + 0.5;
+      c.beginPath();
+      c.moveTo(tx, 0);
+      c.lineTo(tx, gutter * 0.3);
+      c.stroke();
+    }
+  }
+  _sunMapLabels = cv;
+  _sunMapLabelsKey = key;
+  return cv;
+}
+
+function _sunMapDrawTzLabels(c, W, H, dpr) {
+  var strip = _sunMapLabelStrip(W, H, dpr);
+  c.drawImage(strip, 0, H - strip.height);
+}
+
+// The picked location's exact offset, amber on the strip: an integer-hour pick
+// re-inks its label; a fractional pick gets the small amber "+5:30"-style
+// label at its tick, where no text normally fits. The number shown is the LIVE
+// offset of the resolved IANA zone (DST included) — the same figure the world
+// clock prints for the place — not the polygon's nominal stamp, which for the
+// stale-politics shapes (2010s Russia) can be an hour off today's truth.
+function _sunMapDrawSelectedOffset(c, W, H, dpr) {
+  if (!_sunMapHasLocation || !_sunMapNow) return;
+  var off;
+  try { off = _tzUtcOffsetMin(_almTzForLocation(_sunMapLat, _sunMapLon), _sunMapNow); }
+  catch (e) { return; }
+  if (off == null || isNaN(off)) return;
+  var gutter = Math.round(_sunMapGutter(H, dpr));
+  var top = H - gutter;
+  var x = _sunMapLonToX(_sunMapOffsetLon(off), W);
+  var label = _sunMapOffsetLabel(off);
+  c.save();
+  c.font = Math.round(8.5 * dpr) + 'px ui-monospace, SFMono-Regular, Menlo, monospace';
+  c.textAlign = 'center';
+  c.textBaseline = 'middle';
+  var pad = 3 * dpr;
+  var tw = c.measureText(label).width;
+  // The tick stands at the exact meridian; the label pill clamps inward so it
+  // never leaves the canvas at the date-line edges.
+  var lx = Math.max(tw / 2 + pad, Math.min(W - tw / 2 - pad, x));
+  c.fillStyle = 'rgba(4,7,12,0.85)';
+  c.fillRect(lx - tw / 2 - pad, top, tw + pad * 2, gutter);
+  c.strokeStyle = 'rgba(245,158,11,0.95)';
+  c.lineWidth = Math.max(1, dpr);
+  c.beginPath();
+  c.moveTo(Math.round(x) + 0.5, top);
+  c.lineTo(Math.round(x) + 0.5, top + gutter * 0.3);
+  c.stroke();
+  c.fillStyle = 'rgba(245,158,11,0.95)';
+  c.fillText(label, lx, top + gutter / 2 + gutter * 0.08);
+  c.restore();
+}
+
+// The picked location's time zone, lit up as its TRUE shape — the polygon
+// that CONTAINS the point, found by ray cast. Matching on the live UTC offset
+// (the old band) can never be right year-round: in August Los Angeles runs
+// UTC-7 under DST while its geographic zone is the standard-time -8 shape, so
+// an offset-centred band misses the city for half the year. Containment is
+// DST-proof. Natural Earth's zones cover the whole globe — nominal zones at
+// sea, both poles — so every pick resolves; the nearest-vertex pass below
+// only mops up hairline slivers between independently simplified neighbours.
+//
+// A zone is identified by its UTC OFFSET, not by one polygon. The asset stores
+// 117 entries over only 40 distinct offsets, because the build dissolved by
+// offset and then emitted one entry per polygon part: India's +5:30 is three
+// entries (mainland, Lakshadweep, the Andamans), +6 is seven. Lighting the one
+// entry that contains the pick lit one landmass and left the rest of the same
+// zone dark — Kavaratti and Port Blair sat outside the shape their own country
+// was lit in. The highlight therefore covers EVERY entry sharing the resolved
+// offset, drawn as one path.
+var _tzZones = null;         // [[offsetMinutes, [flat unclosed ring, ...]], ...]
+var _tzZonesByOffset = null; // offsetMinutes -> [entry, ...]; built once on load
+var _tzZoneOff = null;       // offset of the pick's zone; null = no zone
+var _tzZoneKey = '';         // "lat,lon" _tzZoneOff was resolved for; '' = unresolved
+var _tzZonePath = null;      // cached Path2D of every entry at one offset
+var _tzZonePathKey = '';
+
+// Offset -> its entries, computed once when the asset lands. The highlight
+// needs the whole group on every location change, and rescanning all 117
+// entries for each one is work the data shape already answers.
+function _tzGroupByOffset(zones) {
+  var by = {};
+  for (var i = 0; i < zones.length; i++) {
+    var off = zones[i][0];
+    if (!by[off]) by[off] = [];
+    by[off].push(zones[i]);
+  }
+  return by;
+}
+
+// Even-odd ray cast over one zone's rings (flat [lon,lat,...], unclosed — the
+// j-wraps-to-last-point seam supplies the closing edge). Holes and multi-part
+// zones fall out of the even-odd rule for free.
+function _tzZoneContains(rings, lon, lat) {
+  var inside = false;
+  for (var r = 0; r < rings.length; r++) {
+    var ring = rings[r];
+    for (var i = 0, j = ring.length - 2; i < ring.length; j = i, i += 2) {
+      var yi = ring[i + 1], yj = ring[j + 1];
+      if ((yi > lat) !== (yj > lat) &&
+          lon < (ring[j] - ring[i]) * (lat - yi) / (yj - yi) + ring[i]) inside = !inside;
+    }
+  }
+  return inside;
+}
+
+// Which OFFSET the pick sits in — the offset stamped on the entry containing
+// it. Runs at location-change time ONLY (the result is cached on the lat,lon
+// key), never per frame: a full scan is ~5k vertices and the answer is stored
+// until the pick moves. When no polygon contains the point (a sliver between
+// independently simplified neighbours), the nearest ring vertex within 2
+// degrees decides; vertex pitch is ~0.25 deg, plenty for a sliver. Returns
+// null only when the point is farther than that from every zone on Earth.
+function _tzZoneOffsetFor(lat, lon) {
+  var key = lat.toFixed(4) + ',' + lon.toFixed(4);
+  if (_tzZoneKey === key) return _tzZoneOff;
+  var off = null, i, r, ring, j;
+  for (i = 0; i < _tzZones.length; i++) {
+    if (_tzZoneContains(_tzZones[i][1], lon, lat)) { off = _tzZones[i][0]; break; }
+  }
+  if (off === null) {
+    var best = 4;   // 2 deg squared — beyond that it is a data gap, not a sliver
+    var cosLat = Math.cos(lat * DEG_TO_RAD);
+    for (i = 0; i < _tzZones.length; i++) {
+      var rings = _tzZones[i][1];
+      for (r = 0; r < rings.length; r++) {
+        ring = rings[r];
+        for (j = 0; j < ring.length; j += 2) {
+          var dlon = (ring[j] - lon) * cosLat, dlat = ring[j + 1] - lat;
+          var dd = dlon * dlon + dlat * dlat;
+          if (dd < best) { best = dd; off = _tzZones[i][0]; }
+        }
+      }
+    }
+  }
+  _tzZoneOff = off;
+  _tzZoneKey = key;
+  return off;
+}
+
+// One Path2D per OFFSET per map size — every entry at that offset, all its
+// rings, in a single path — through the shared projection helpers so the
+// highlight stays registered with the borders and terminator. Rings never span
+// the antimeridian (the build source keeps every ring inside -180..180), so
+// closePath draws real zone edges, never a wrap streak.
+function _tzZonePathFor(off, W, H) {
+  var key = off + ':' + W + 'x' + H;
+  if (_tzZonePath && _tzZonePathKey === key) return _tzZonePath;
+  var group = (_tzZonesByOffset && _tzZonesByOffset[off]) || [];
+  var p = new Path2D();
+  for (var e = 0; e < group.length; e++) {
+    var rings = group[e][1];
+    for (var r = 0; r < rings.length; r++) {
+      var ring = rings[r];
+      p.moveTo(_sunMapLonToX(ring[0], W), _sunMapLatToY(ring[1], H));
+      for (var j = 2; j < ring.length; j += 2) {
+        p.lineTo(_sunMapLonToX(ring[j], W), _sunMapLatToY(ring[j + 1], H));
+      }
+      p.closePath();
+    }
+  }
+  _tzZonePath = p;
+  _tzZonePathKey = key;
+  return p;
+}
+
+// A faint amber wash over the containing zone's shape with a slightly firmer
+// outline — same voice the old band spoke in. Drawn over the night shading —
+// under it the wash all but disappears on the dark half and the shape looks
+// broken at the terminator.
+function _sunMapDrawZoneHighlight(c, W, H, dpr) {
+  if (!_sunMapHasLocation || !_tzZones) return;
+  var off = _tzZoneOffsetFor(_sunMapLat, _sunMapLon);
+  if (off === null) return;
+  var p = _tzZonePathFor(off, W, H);
+  c.save();
+  c.beginPath();
+  c.rect(0, 0, W, H - _sunMapGutter(H, dpr));  // keep out of the label gutter
+  c.clip();
+  c.fillStyle = 'rgba(245,158,11,0.09)';
+  // NONZERO, not even-odd. Even-odd gives enclave holes for free, but it also
+  // turns any OVERLAP into a hole — and same-offset entries do overlap: in
+  // Antarctica, Natural Earth's nominal hour wedges overlap the coastal zone
+  // shapes in 20 same-offset pairs, so an even-odd union punched a hole
+  // through the continent at exactly the spot Antarctic picks light up.
+  // Nonzero unions instead, and still cuts the enclave holes correctly because
+  // every inner ring in the asset winds against its outer ring
+  // (tests/test_tz_zone_grouping.cjs gates both facts).
+  c.fill(p);
+  c.strokeStyle = 'rgba(245,158,11,0.30)';
+  c.lineWidth = Math.max(0.75, 0.75 * dpr);
+  c.lineJoin = 'round';
+  c.stroke(p);
+  c.restore();
+}
+
 // Brief label over the map naming the city just picked (and the cycle hint when
 // several cities overlap). Recreated each time — the map re-renders on a pick.
 function _sunMapFlash(text) {
@@ -1923,7 +3039,12 @@ function _renderSunMap(now) {
   var smLoc = _getLocation();
   _sunMapLat = smLoc.lat; _sunMapLon = smLoc.lon;
   _sunMapLocName = smLoc.name;
-  _sunMapHasLocation = !!smLoc.name;
+  // A free click on open map (or a manual lat/lon entry) stores coordinates
+  // with no city name — that pick is every bit as real as a snapped city, so
+  // the marker, the zone highlight and the coordinate line key off STORED,
+  // not off having a name. Keying off the name left arbitrary-point picks
+  // invisible: the location changed but no marker or highlight ever drew.
+  _sunMapHasLocation = smLoc.stored;
 
   // Compute sun info in the CLICKED location's timezone, not the device's
   // (F6) — resolve the point's zone the same way the world clock does.
@@ -2116,64 +3237,138 @@ var _TZ_CITIES = [
 ];
 
 function _tzUtcOffsetMin(tz, now) {
+  // Cached formatters (_tzFmt, en-US so the output stays Date-parseable):
+  // this runs per travel frame via the head cards, and building two fresh
+  // Intl.DateTimeFormat objects per call dominated that path.
   var fmtOpts = { year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric', second: 'numeric', hour12: false };
-  var enFmt = function(z) { return new Intl.DateTimeFormat('en-US', Object.assign({ timeZone: z }, fmtOpts)).format(now); };
+  var enFmt = function(z) { return _tzFmt(z, fmtOpts, 'en-US').format(now); };
   return Math.round((new Date(enFmt(tz)) - new Date(enFmt('UTC'))) / 60000);
 }
 
-// Best _TZ_CITIES match for an arbitrary lat/lon. No offline tz database, so
-// approximate: geographic distance dominates (same-region cities usually
-// share a zone, DST included), with the gap between the city's civil offset
-// and the location's solar offset (lon/15 h) as a mild tie-break — 1 h of
-// offset mismatch costs the same as 1° of distance.
-// Denser anchor set for mapping a clicked location to its timezone. The
-// world-clock GRID stays one-city-per-offset (_TZ_CITIES); resolution needs
-// more points or wide political zones misroute — Central European Time
-// spans Madrid to Warsaw, so with Paris as the only CET anchor, Germany
-// landed on London (#28). Pure nearest-distance over real IANA zones — no
-// solar-time term (that was what tipped eastern-CET onto UK time).
+// Anchor set for mapping an arbitrary lat/lon to a timezone. There is no
+// offline tz database to consult, so resolution is nearest-anchor over real
+// IANA zones. The world-clock GRID stays one-city-per-offset (_TZ_CITIES);
+// resolution needs many more points, because a wide political zone with only a
+// far anchor misroutes everything at its edges — Central European Time spans
+// Madrid to Warsaw, and with Paris as the only CET anchor Germany landed on
+// London (#28). Several zones therefore carry more than one anchor.
+//
+// Anchors are chosen so that a change is only ever additive: adding one can
+// only alter results near itself, so each is validated against a fixed city
+// list (tests/test_almanac_tz_resolution.cjs) that requires the resolved zone
+// to match the true zone's UTC offset in BOTH January and July. Checking both
+// is what catches a same-offset/different-DST mismatch, e.g. Phoenix standing
+// in for Denver.
 var _TZ_ANCHORS = [
   // Americas
   [21.31, -157.86, 'Pacific/Honolulu'], [61.22, -149.90, 'America/Anchorage'],
   [34.05, -118.24, 'America/Los_Angeles'], [49.28, -123.12, 'America/Vancouver'],
-  [39.74, -104.99, 'America/Denver'], [33.45, -112.07, 'America/Phoenix'],
-  [41.88, -87.63, 'America/Chicago'], [19.43, -99.13, 'America/Mexico_City'],
-  [40.71, -74.01, 'America/New_York'], [43.65, -79.38, 'America/Toronto'],
-  [4.71, -74.07, 'America/Bogota'], [-12.05, -77.04, 'America/Lima'],
+  [39.74, -104.99, 'America/Denver'], [35.08, -106.65, 'America/Denver'],
+  [33.45, -112.07, 'America/Phoenix'], [53.55, -113.49, 'America/Edmonton'],
+  [41.88, -87.63, 'America/Chicago'], [32.78, -96.80, 'America/Chicago'],
+  [19.43, -99.13, 'America/Mexico_City'],
+  [40.71, -74.01, 'America/New_York'], [35.78, -78.64, 'America/New_York'],
+  [43.65, -79.38, 'America/Toronto'],
+  [4.71, -74.07, 'America/Bogota'], [10.48, -66.90, 'America/Caracas'],
+  [-12.05, -77.04, 'America/Lima'], [-16.50, -68.15, 'America/La_Paz'],
   [-33.45, -70.67, 'America/Santiago'], [-23.55, -46.63, 'America/Sao_Paulo'],
   [-34.60, -58.38, 'America/Argentina/Buenos_Aires'],
+  [47.56, -52.71, 'America/St_Johns'], [-54.28, -36.51, 'Atlantic/South_Georgia'],
+  [37.74, -25.67, 'Atlantic/Azores'],
   // Europe / Africa
   [64.15, -21.94, 'Atlantic/Reykjavik'], [51.51, -0.13, 'Europe/London'],
   [53.35, -6.26, 'Europe/Dublin'], [38.72, -9.14, 'Europe/Lisbon'],
-  [40.42, -3.70, 'Europe/Madrid'], [48.86, 2.35, 'Europe/Paris'],
+  [40.42, -3.70, 'Europe/Madrid'], [41.39, 2.17, 'Europe/Madrid'],
+  [36.72, -4.42, 'Europe/Madrid'], [48.86, 2.35, 'Europe/Paris'],
   [52.52, 13.40, 'Europe/Berlin'], [52.37, 4.90, 'Europe/Amsterdam'],
   [41.90, 12.50, 'Europe/Rome'], [47.37, 8.54, 'Europe/Zurich'],
   [52.23, 21.01, 'Europe/Warsaw'], [59.33, 18.06, 'Europe/Stockholm'],
+  [59.91, 10.75, 'Europe/Oslo'], [44.79, 20.45, 'Europe/Belgrade'],
   [37.98, 23.73, 'Europe/Athens'], [60.17, 24.94, 'Europe/Helsinki'],
   [44.43, 26.10, 'Europe/Bucharest'], [50.45, 30.52, 'Europe/Kyiv'],
   [41.01, 28.98, 'Europe/Istanbul'], [55.76, 37.62, 'Europe/Moscow'],
-  [6.52, 3.38, 'Africa/Lagos'], [30.04, 31.24, 'Africa/Cairo'],
+  [59.93, 30.34, 'Europe/Moscow'],
+  [6.52, 3.38, 'Africa/Lagos'], [5.60, -0.19, 'Africa/Accra'],
+  [30.04, 31.24, 'Africa/Cairo'], [36.75, 3.06, 'Africa/Algiers'],
+  [36.81, 10.18, 'Africa/Tunis'],
   [-1.29, 36.82, 'Africa/Nairobi'], [-26.20, 28.05, 'Africa/Johannesburg'],
   [33.57, -7.59, 'Africa/Casablanca'],
   // Asia / Middle East / Oceania
   [35.69, 51.39, 'Asia/Tehran'], [24.71, 46.68, 'Asia/Riyadh'],
-  [25.20, 55.27, 'Asia/Dubai'], [24.86, 67.01, 'Asia/Karachi'],
-  [19.08, 72.88, 'Asia/Kolkata'], [27.72, 85.32, 'Asia/Kathmandu'],
+  [33.31, 44.36, 'Asia/Baghdad'], [25.29, 51.53, 'Asia/Qatar'],
+  [25.20, 55.27, 'Asia/Dubai'], [34.56, 69.21, 'Asia/Kabul'],
+  [41.30, 69.24, 'Asia/Tashkent'],
+  // The Caucasus (+4, no DST) had no anchor of its own, so Tbilisi fell to
+  // Baghdad (+3) and Baku to Tehran (+3:30) — both map dots printed a clock an
+  // hour or more off, and both sit inside the asset's +4 polygon, which was
+  // right all along.
+  [41.69, 44.80, 'Asia/Tbilisi'], [40.41, 49.87, 'Asia/Baku'],
+  [24.86, 67.01, 'Asia/Karachi'], [33.68, 73.05, 'Asia/Karachi'],
+  [19.08, 72.88, 'Asia/Kolkata'], [28.61, 77.21, 'Asia/Kolkata'],
+  // Kolkata sits ~2 deg of longitude from Dhaka across an international border
+  // and used to fall to it, a half hour off inside India's own zone.
+  [22.57, 88.36, 'Asia/Kolkata'],
+  [27.72, 85.32, 'Asia/Kathmandu'],
   [23.81, 90.41, 'Asia/Dhaka'], [13.76, 100.50, 'Asia/Bangkok'],
-  [-6.21, 106.85, 'Asia/Jakarta'], [1.35, 103.82, 'Asia/Singapore'],
+  [21.03, 105.85, 'Asia/Ho_Chi_Minh'],
+  [-6.21, 106.85, 'Asia/Jakarta'], [-5.13, 119.42, 'Asia/Makassar'],
+  [1.35, 103.82, 'Asia/Singapore'],
   [22.32, 114.17, 'Asia/Hong_Kong'], [31.23, 121.47, 'Asia/Shanghai'],
+  [29.56, 106.55, 'Asia/Shanghai'], [41.80, 123.43, 'Asia/Shanghai'],
   [14.60, 120.98, 'Asia/Manila'], [-31.95, 115.86, 'Australia/Perth'],
   [37.57, 126.98, 'Asia/Seoul'], [35.68, 139.69, 'Asia/Tokyo'],
+  [-12.46, 130.85, 'Australia/Darwin'],
   [-34.93, 138.60, 'Australia/Adelaide'], [-27.47, 153.03, 'Australia/Brisbane'],
-  [-33.87, 151.21, 'Australia/Sydney'], [-36.85, 174.76, 'Pacific/Auckland']
+  [-37.81, 144.96, 'Australia/Melbourne'],
+  [-33.87, 151.21, 'Australia/Sydney'], [-36.85, 174.76, 'Pacific/Auckland'],
+  // Remote and fractional island zones, matching the map's remote-zone city
+  // dots. Fiji and Apia carry anchors of their own even without dots: without
+  // them Suva would fall to the new Noumea anchor (+11, an hour off) and
+  // Samoa to Pago Pago (across a full-day offset gap).
+  [-14.28, -170.70, 'Pacific/Pago_Pago'], [-13.83, -171.77, 'Pacific/Apia'],
+  [-8.91, -140.10, 'Pacific/Marquesas'], [-31.68, 128.89, 'Australia/Eucla'],
+  [-31.55, 159.08, 'Australia/Lord_Howe'], [-22.28, 166.46, 'Pacific/Noumea'],
+  [-29.06, 167.96, 'Pacific/Norfolk'], [-17.77, 177.97, 'Pacific/Fiji'],
+  [-43.95, -176.56, 'Pacific/Chatham'], [-21.14, -175.20, 'Pacific/Tongatapu'],
+  [1.87, -157.43, 'Pacific/Kiritimati'],
+  // Per-polygon map dots (Siberian belts, Greenland outposts, Indian Ocean
+  // territories, Antarctic stations). Each dot whose nearest pre-existing
+  // anchor lands on the wrong offset carries its own anchor here; the Gdansk
+  // guard exists because the Kaliningrad anchor would otherwise capture it
+  // (same shadow class as Suva/Apia above). Yangon's anchor also fixes a
+  // pre-existing miss: without it Myanmar's +6:30 resolved to Bangkok's +7.
+  [53.90, 27.56, 'Europe/Minsk'], [54.71, 20.51, 'Europe/Kaliningrad'],
+  [54.35, 18.65, 'Europe/Warsaw'],
+  [55.03, 82.92, 'Asia/Novosibirsk'], [52.29, 104.28, 'Asia/Irkutsk'],
+  [62.03, 129.73, 'Asia/Yakutsk'], [67.55, 133.39, 'Asia/Vladivostok'],
+  [43.12, 131.89, 'Asia/Vladivostok'], [53.02, 158.65, 'Asia/Kamchatka'],
+  [64.42, -173.23, 'Asia/Anadyr'],
+  [70.49, -21.97, 'America/Scoresbysund'], [76.77, -18.67, 'America/Danmarkshavn'],
+  [46.78, -56.17, 'America/Miquelon'],
+  [11.62, 92.73, 'Asia/Kolkata'], [16.87, 96.20, 'Asia/Yangon'],
+  [-7.31, 72.41, 'Indian/Chagos'], [-12.19, 96.83, 'Indian/Cocos'],
+  [-13.28, -176.17, 'Pacific/Wallis'], [28.21, -177.38, 'Pacific/Midway'],
+  [-77.85, 166.67, 'Antarctica/McMurdo'], [-72.01, 2.53, 'Antarctica/Troll'],
+  [-69.00, 39.58, 'Antarctica/Syowa'], [-67.60, 62.87, 'Antarctica/Mawson'],
+  [-68.60, 78.20, 'Antarctica/Davis'], [-78.46, 106.84, 'Antarctica/Vostok'],
+  [-66.28, 110.53, 'Antarctica/Casey'], [-66.66, 140.00, 'Antarctica/DumontDUrville'],
+  [-67.57, -68.13, 'Antarctica/Rothera'], [-64.77, -64.05, 'Antarctica/Palmer']
 ];
 
+// Longitude is compared in RAW degrees, deliberately not scaled by cos(lat).
+// Scaling it is what a true surface distance wants, and it is wrong here:
+// timezones are longitude bands, so shrinking the longitude term makes the one
+// axis that actually determines the answer count for less, and the shrink grows
+// without bound toward the poles. At Tromso's 69.7°N cos(lat) is 0.35, so being
+// 6° of longitude adrift — a whole zone and a half — scored as 2°, and pure
+// latitude proximity handed northern Norway to Helsinki, an hour east. Removing
+// the factor also fixed Kiruna, Beijing and Tashkent, and regressed nothing.
 function _almTzForLocation(lat, lon) {
   var best = null, bestD = Infinity;
   for (var i = 0; i < _TZ_ANCHORS.length; i++) {
     var a = _TZ_ANCHORS[i];
     var dlat = lat - a[0];
-    var dlon = (lon - a[1]) * Math.cos(lat * DEG_TO_RAD);
+    var dlon = lon - a[1];
     var d = dlat * dlat + dlon * dlon;
     if (d < bestD) { bestD = d; best = a[2]; }
   }
@@ -2498,12 +3693,24 @@ function _tickDigit(colEl, ch) {
 }
 
 
-// Cached Intl.DateTimeFormat objects — avoid 180+ allocations/sec in the RAF loop
+// Cached Intl.DateTimeFormat objects — avoid 180+ allocations/sec in the RAF
+// loop. Constructing a formatter costs ~1ms; .format() on a cached one is
+// microseconds, so every per-frame path (travel clock, head cards, the dock's
+// readouts) must come through here rather than calling toLocale*String, each
+// of which builds a fresh formatter internally. tz may be null/undefined for
+// the device zone; lang overrides the UI language (e.g. the offset math needs
+// 'en-US' for a parseable date string).
 var _tzFmtCache = {};
-function _tzFmt(tz, opts) {
-  var lang = (typeof _currentLang !== 'undefined') ? _currentLang : 'en';
-  var key = lang + '|' + tz + '|' + Object.values(opts).join(',');
-  if (!_tzFmtCache[key]) _tzFmtCache[key] = new Intl.DateTimeFormat(lang, Object.assign({ timeZone: tz }, opts));
+function _tzFmt(tz, opts, lang) {
+  lang = lang || ((typeof _currentLang !== 'undefined') ? _currentLang : 'en');
+  // JSON key, not Object.values().join: two option sets with different keys
+  // but the same values ("numeric,2-digit") must not share a formatter.
+  var key = lang + '|' + (tz || '') + '|' + JSON.stringify(opts);
+  if (!_tzFmtCache[key]) {
+    var o = Object.assign({}, opts);
+    if (tz) o.timeZone = tz;
+    _tzFmtCache[key] = new Intl.DateTimeFormat(lang, o);
+  }
   return _tzFmtCache[key];
 }
 
@@ -2522,10 +3729,11 @@ function _startTzClock() {
     if (now.getMinutes() !== _tzGridMinute) {
       _tzGridMinute = now.getMinutes();
       _initTzClock(now);
-      // Keep the time machine's NOW row ticking (HH:MM resolution, so a
-      // once-per-minute refresh is enough) while parked in the past/future.
-      var _nowRow = document.getElementById('alm-tm-now-val');
-      if (_nowRow) _nowRow.textContent = _almTmFmt(now);
+      // Keep the time machine's ACTUAL row ticking (HH:MM resolution, so a
+      // once-per-minute refresh is enough) while parked in the past/future —
+      // and with it the offset lamp, which is measured against that row.
+      _almTmSetCells('alm-tm-now', now);
+      _almTmSetDelta('alm-tm-delta', _almFocusInstant());
     }
     _tzClockRAF = requestAnimationFrame(tick);
   }
@@ -2578,17 +3786,20 @@ function _drawSunMap() {
   var ctx = _sunMapCanvas.getContext('2d');
   var W = _sunMapCanvas.width, H = _sunMapCanvas.height;
   var dpr = window.devicePixelRatio || 1;
+  // The panel can be rendered before it has been laid out (a hidden ancestor
+  // leaves clientWidth at 0), and a zero-area cache layer is an illegal
+  // drawImage source — it throws where drawing the map image straight to the
+  // context used to be a silent no-op. Bail out instead: there is nothing to
+  // paint, and throwing here would abort _renderSunMap before it binds the
+  // click-to-set-location handler.
+  if (!W || !H) return;
 
-  // Background
-  ctx.fillStyle = '#0d1117';
-  ctx.fillRect(0, 0, W, H);
+  // First draw kicks off the border fetch; when it lands the base layer is
+  // invalidated and this repaints with the borders in place.
+  _tzBordersEnsure();
 
-  // Draw map image if loaded
-  if (_sunMapLoaded) {
-    ctx.globalAlpha = 0.4;
-    ctx.drawImage(_sunMapImg, 0, 0, W, H);
-    ctx.globalAlpha = 1;
-  }
+  // Background, world image and the real time zone borders, all cached
+  ctx.drawImage(_sunMapBaseLayer(W, H, dpr), 0, 0);
 
   // Compute sun subsolar point
   var now = _sunMapNow;
@@ -2605,8 +3816,7 @@ function _drawSunMap() {
     var lon = (px / W) * 360 - 180;
     var dlon = (lon - sunLon) * DEG_TO_RAD;
     var termLat = Math.atan(-Math.cos(dlon) / Math.tan(decl)) * 180 / Math.PI;
-    var termY = (90 - termLat) / 180 * H;
-    termPoints.push({ x: px, y: termY });
+    termPoints.push({ x: px, y: _sunMapLatToY(termLat, H) });
   }
 
   // Fill night side
@@ -2632,9 +3842,16 @@ function _drawSunMap() {
   ctx.lineWidth = 1.5 * dpr;
   ctx.stroke();
 
+  // Time zone reference — the picked zone's true shape, then the UTC offsets,
+  // then the picked zone's exact offset lit amber over the strip. All sit
+  // above the night shading so none is swallowed by it.
+  _sunMapDrawZoneHighlight(ctx, W, H, dpr);
+  _sunMapDrawTzLabels(ctx, W, H, dpr);
+  _sunMapDrawSelectedOffset(ctx, W, H, dpr);
+
   // Sub-solar point — where the sun is directly overhead right now
-  var sunX = ((sunLon + 180 + 360) % 360) / 360 * W;
-  var sunY = (90 - declDeg) / 180 * H;
+  var sunX = _sunMapLonToX(((sunLon + 180 + 360) % 360) - 180, W);
+  var sunY = _sunMapLatToY(declDeg, H);
   // Sun rays
   ctx.strokeStyle = 'rgba(251,191,36,0.25)';
   ctx.lineWidth = 1 * dpr;
@@ -2653,8 +3870,8 @@ function _drawSunMap() {
   // City dots
   for (var ci = 0; ci < _MAP_CITIES.length; ci++) {
     var c = _MAP_CITIES[ci];
-    var cx = (c.lon + 180) / 360 * W;
-    var cy = (90 - c.lat) / 180 * H;
+    var cx = _sunMapLonToX(c.lon, W);
+    var cy = _sunMapLatToY(c.lat, H);
     ctx.beginPath();
     ctx.arc(cx, cy, 2 * dpr, 0, Math.PI * 2);
     ctx.fillStyle = 'rgba(210,180,120,0.5)';
@@ -2663,8 +3880,8 @@ function _drawSunMap() {
 
   // Current location marker — only if explicitly set
   if (_sunMapHasLocation) {
-    var locX = (_sunMapLon + 180) / 360 * W;
-    var locY = (90 - _sunMapLat) / 180 * H;
+    var locX = _sunMapLonToX(_sunMapLon, W);
+    var locY = _sunMapLatToY(_sunMapLat, H);
     ctx.beginPath();
     ctx.arc(locX, locY, 5 * dpr, 0, Math.PI * 2);
     ctx.strokeStyle = 'rgba(245,158,11,0.8)';
@@ -2751,6 +3968,7 @@ var _MAP_CITIES = [
   { name: 'Guadalajara, Jalisco, Mexico', lat: 20.67, lon: -103.35 },
   { name: 'Havana, Cuba', lat: 23.11, lon: -82.37 },
   { name: 'San Juan, Puerto Rico', lat: 18.47, lon: -66.11 },
+  { name: 'St. John’s, Newfoundland, Canada', lat: 47.56, lon: -52.71 },
   // South America
   { name: 'S\u00e3o Paulo, Brazil', lat: -23.55, lon: -46.63 },
   { name: 'Rio de Janeiro, Brazil', lat: -22.91, lon: -43.17 },
@@ -2849,6 +4067,7 @@ var _MAP_CITIES = [
   { name: 'Yangon, Myanmar', lat: 16.87, lon: 96.20 },
   { name: 'Phnom Penh, Cambodia', lat: 11.56, lon: 104.93 },
   // Central Asia
+  { name: 'Kabul, Afghanistan', lat: 34.56, lon: 69.21 },
   { name: 'Tashkent, Uzbekistan', lat: 41.30, lon: 69.28 },
   { name: 'Almaty, Kazakhstan', lat: 43.24, lon: 76.95 },
   { name: 'Tbilisi, Georgia', lat: 41.69, lon: 44.80 },
@@ -2861,7 +4080,60 @@ var _MAP_CITIES = [
   { name: 'Adelaide, South Australia, Australia', lat: -34.93, lon: 138.60 },
   { name: 'Auckland, New Zealand', lat: -36.85, lon: 174.76 },
   { name: 'Wellington, New Zealand', lat: -41.29, lon: 174.78 },
-  { name: 'Suva, Fiji', lat: -17.77, lon: 177.97 }
+  { name: 'Suva, Fiji', lat: -17.77, lon: 177.97 },
+  // Remote-zone representatives: with these, every UTC offset the real zone
+  // map carries (fractional and island zones included) has at least one
+  // clickable dot, except uninhabited UTC-12 open ocean. Each is gated by the
+  // per-offset coverage check in tests/test_tz_borders.cjs.
+  { name: 'Pago Pago, American Samoa', lat: -14.28, lon: -170.70 },
+  { name: 'Taiohae, Marquesas Islands, French Polynesia', lat: -8.91, lon: -140.10 },
+  { name: 'Grytviken, South Georgia', lat: -54.28, lon: -36.51 },
+  { name: 'Ponta Delgada, Azores, Portugal', lat: 37.74, lon: -25.67 },
+  { name: 'Eucla, Western Australia, Australia', lat: -31.68, lon: 128.89 },
+  { name: 'Lord Howe Island, New South Wales, Australia', lat: -31.55, lon: 159.08 },
+  { name: 'Nouméa, New Caledonia', lat: -22.28, lon: 166.46 },
+  { name: 'Kingston, Norfolk Island', lat: -29.06, lon: 167.96 },
+  { name: 'Waitangi, Chatham Islands, New Zealand', lat: -43.95, lon: -176.56 },
+  { name: 'Nukuʻalofa, Tonga', lat: -21.14, lon: -175.20 },
+  { name: 'Kiritimati, Line Islands, Kiribati', lat: 1.87, lon: -157.43 },
+  // Per-POLYGON representatives: the offset coverage above still left whole
+  // zone polygons with no dot inside them (Siberia's belts, Belarus, the
+  // Indian Ocean territories, Greenland's outposts, the Antarctic stations).
+  // One settlement per tappable polygon; tests/test_tz_borders.cjs enumerates
+  // every polygon and holds the documented exemption list to uninhabited
+  // ocean/ice sectors and sub-tap-size slivers.
+  { name: 'Minsk, Belarus', lat: 53.90, lon: 27.56 },
+  { name: 'Kaliningrad, Russia', lat: 54.71, lon: 20.51 },
+  { name: 'Novosibirsk, Russia', lat: 55.03, lon: 82.92 },
+  { name: 'Irkutsk, Russia', lat: 52.29, lon: 104.28 },
+  { name: 'Yakutsk, Sakha Republic, Russia', lat: 62.03, lon: 129.73 },
+  { name: 'Verkhoyansk, Sakha Republic, Russia', lat: 67.55, lon: 133.39 },
+  { name: 'Vladivostok, Russia', lat: 43.12, lon: 131.89 },
+  { name: 'Petropavlovsk-Kamchatsky, Russia', lat: 53.02, lon: 158.65 },
+  { name: 'Provideniya, Chukotka, Russia', lat: 64.42, lon: -173.23 },
+  { name: 'Ittoqqortoormiit, Greenland', lat: 70.49, lon: -21.97 },
+  { name: 'Danmarkshavn, Greenland', lat: 76.77, lon: -18.67 },
+  { name: 'Saint-Pierre, Saint Pierre and Miquelon', lat: 46.78, lon: -56.17 },
+  { name: 'Port Blair, Andaman and Nicobar Islands, India', lat: 11.62, lon: 92.73 },
+  { name: 'Kavaratti, Lakshadweep, India', lat: 10.57, lon: 72.64 },
+  { name: 'Diego Garcia, Chagos Archipelago', lat: -7.31, lon: 72.41 },
+  { name: 'Thimphu, Bhutan', lat: 27.47, lon: 89.64 },
+  { name: 'West Island, Cocos (Keeling) Islands', lat: -12.19, lon: 96.83 },
+  { name: 'Mata-Utu, Wallis and Futuna', lat: -13.28, lon: -176.17 },
+  { name: 'Midway Atoll, United States Minor Outlying Islands', lat: 28.21, lon: -177.38 },
+  // Antarctic research stations — the year-round settlements of their sectors.
+  // Davis is plotted ~0.1° off the station so its dot sits inside the
+  // station's own +7 polygon rather than the +5 ocean zone overlapping it.
+  { name: 'McMurdo Station, Antarctica', lat: -77.85, lon: 166.67 },
+  { name: 'Troll Station, Antarctica', lat: -72.01, lon: 2.53 },
+  { name: 'Syowa Station, Antarctica', lat: -69.00, lon: 39.58 },
+  { name: 'Mawson Station, Antarctica', lat: -67.60, lon: 62.87 },
+  { name: 'Davis Station, Antarctica', lat: -68.60, lon: 78.20 },
+  { name: 'Vostok Station, Antarctica', lat: -78.46, lon: 106.84 },
+  { name: 'Casey Station, Antarctica', lat: -66.28, lon: 110.53 },
+  { name: 'Dumont d’Urville Station, Antarctica', lat: -66.66, lon: 140.00 },
+  { name: 'Rothera Station, Antarctica', lat: -67.57, lon: -68.13 },
+  { name: 'Palmer Station, Antarctica', lat: -64.77, lon: -64.05 }
 ];
 
 // Extra cities the location SEARCH can resolve (no map dots — the map plots
@@ -3393,8 +4665,8 @@ function _promptAlmanacLocation() {
 function _fmtMinutes(m) {
   m = ((m % 1440) + 1440) % 1440;
   var d = new Date(2023, 0, 1, Math.floor(m / 60), Math.round(m % 60));
-  var lang = (typeof _currentLang !== 'undefined') ? _currentLang : 'en';
-  return d.toLocaleTimeString(lang, { hour: 'numeric', minute: '2-digit' });
+  // Cached formatter: sunrise/sunset/golden-hour readouts run per travel frame.
+  return _tzFmt(null, { hour: 'numeric', minute: '2-digit' }).format(d);
 }
 
 // ── Live Sky Scene ──
@@ -3426,44 +4698,17 @@ function _sunPosition(date, lat, lon) {
 }
 
 // ── Moon position — simplified lunar alt/az ──
-// Uses mean orbital elements to estimate the Moon's equatorial position,
-// then converts to horizontal coordinates (same pipeline as the sun).
+// Equatorial coordinates come from the canonical _moonEqCoords in app.js (the
+// same evaluation every moon renderer derives from); this converts them to
+// horizontal coordinates (same pipeline as the sun). The disc's screen tilt is
+// NOT here — that is _moonScreenTiltDeg (app.js), shared by the hero, the
+// sky-scene moon and the Today card.
 function _moonPosition(date, lat, lon) {
-  var JD = _dateToJD(date.getTime());
-  var T = _jdToJulianCentury(JD);
-
-  // Mean orbital elements (degrees)
-  var L0 = (218.3165 + 481267.8813 * T) % 360;         // mean longitude
-  var M  = (134.9634 + 477198.8676 * T) % 360;          // mean anomaly
-  var Ms = (357.5291 +  35999.0503 * T) % 360;          // sun mean anomaly
-  var F  = (93.2720  + 483202.0175 * T) % 360;          // argument of latitude
-  var D  = (297.8502 + 445267.1115 * T) % 360;          // mean elongation
-
-  // Ecliptic longitude (principal terms only)
-  var lng = L0
-    + 6.289 * Math.sin(M * DEG_TO_RAD)
-    - 1.274 * Math.sin((2*D - M) * DEG_TO_RAD)
-    - 0.658 * Math.sin(2*D * DEG_TO_RAD)
-    - 0.214 * Math.sin(2*M * DEG_TO_RAD)
-    - 0.186 * Math.sin(Ms * DEG_TO_RAD);
-
-  // Ecliptic latitude
-  var lat_ec = 5.128 * Math.sin(F * DEG_TO_RAD)
-    + 0.281 * Math.sin((M + F) * DEG_TO_RAD)
-    + 0.278 * Math.sin((F - M) * DEG_TO_RAD);
-
-  // Ecliptic to equatorial (obliquity ≈ 23.44°)
-  var eps = 23.44 * DEG_TO_RAD;
-  var lngR = lng * DEG_TO_RAD, latR = lat_ec * DEG_TO_RAD;
-  var sinDec = Math.sin(latR) * Math.cos(eps) + Math.cos(latR) * Math.sin(eps) * Math.sin(lngR);
-  var dec = Math.asin(sinDec);
-  var ra = Math.atan2(
-    Math.sin(lngR) * Math.cos(eps) - Math.tan(latR) * Math.sin(eps),
-    Math.cos(lngR)
-  );
+  var eq = _moonEqCoords(date);
+  var dec = eq.dec, ra = eq.ra;
 
   // Local sidereal time
-  var GMST = (280.46061837 + 360.98564736629 * (JD - JD_J2000)) % 360;
+  var GMST = (280.46061837 + 360.98564736629 * (eq.JD - JD_J2000)) % 360;
   var LST = (GMST + lon) * DEG_TO_RAD;
   var HA = LST - ra;
   HA = ((HA % (2 * Math.PI)) + 3 * Math.PI) % (2 * Math.PI) - Math.PI; // normalize to [-pi, pi]
@@ -3482,25 +4727,7 @@ function _moonPosition(date, lat, lon) {
   var hp = Math.asin(6378.14 / _moonDistance(date)) * 180 / Math.PI; // horizontal parallax
   altitude = altitude - hp * Math.cos(altitude * DEG_TO_RAD);
   if (altitude > -1) altitude += (1 / Math.tan((altitude + 7.31 / (altitude + 4.4)) * DEG_TO_RAD)) / 60; // Bennett refraction, deg
-  // Parallactic angle q: rotation from celestial north to the observer's
-  // local vertical. q = atan2(sin HA, tan(lat)·cos dec − sin dec·cos HA)
-  var parallactic = Math.atan2(Math.sin(HA), Math.tan(latR2) * Math.cos(dec) - Math.sin(dec) * Math.cos(HA));
-  // Bright-limb position angle chi (Meeus 48.5): direction of the Sun from the
-  // Moon's disc, measured from celestial north. Needs the Sun's equatorial
-  // position. The terminator's tilt as the observer SEES it is chi − q — the
-  // old code used q alone, tilting the crescent's horns 10-25° off.
-  var Lsun = 280.4665 + 36000.7698 * T;
-  var lamSun = (Lsun + 1.915 * Math.sin(Ms * DEG_TO_RAD) + 0.020 * Math.sin(2 * Ms * DEG_TO_RAD)) * DEG_TO_RAD;
-  var raSun = Math.atan2(Math.cos(eps) * Math.sin(lamSun), Math.cos(lamSun));
-  var decSun = Math.asin(Math.sin(eps) * Math.sin(lamSun));
-  var dA = raSun - ra;
-  var chi = Math.atan2(Math.cos(decSun) * Math.sin(dA),
-    Math.sin(decSun) * Math.cos(dec) - Math.cos(decSun) * Math.sin(dec) * Math.cos(dA));
-  return {
-    altitude: altitude, azimuth: azimuth,
-    parallactic: parallactic * 180 / Math.PI,
-    brightLimb: (chi - parallactic) * 180 / Math.PI
-  };
+  return { altitude: altitude, azimuth: azimuth };
 }
 
 // ── Star catalog — bright stars with real RA/Dec coordinates ──
@@ -4186,9 +5413,11 @@ function _applyRegionHolidays(region, year, month, add, worldwide) {
   var pack = _REGION_HOLIDAYS[region];
   if (!pack) return;
   // Region-scoped: the caption already names the country, so each entry's tag is
-  // just its colour. Worldwide: 18 packs at once, so every entry carries a
-  // compact country code ("Bastille Day · FR") to say whose day it is.
-  var src = worldwide ? region : _almRegionName(region);
+  // just its colour. Worldwide: 18 packs at once, so every entry carries the
+  // full country name ("Bastille Day · France") to say whose day it is — the
+  // same ISO→name map the cell tooltip uses, falling back to the ISO code if
+  // Intl.DisplayNames is unavailable.
+  var src = _almRegionName(region) || region;
   var i;
   for (i = 0; i < (pack.fixed || []).length; i++) {
     var fx = pack.fixed[i];
@@ -4218,8 +5447,9 @@ function _applyRegionHolidays(region, year, month, add, worldwide) {
 }
 
 // Worldwide scope: layer every national pack (skipping the EU pseudo-region,
-// which carries no national days of its own — only a DST rule). Each entry is
-// tagged with its ISO country code via the worldwide path of _applyRegionHolidays.
+// which carries no national days of its own, only a DST rule). Each entry is
+// tagged with its full country name (ISO code as fallback) via the worldwide
+// path of _applyRegionHolidays.
 function _applyAllRegionHolidays(year, month, add) {
   for (var iso in _REGION_HOLIDAYS) {
     if (iso === 'EU') continue;
@@ -4528,7 +5758,8 @@ function _drawAlmanacGrid() {
   // including 0, five-figure years, or a negative year for BCE.
   html += '<div class="alm-nav">';
   html += '<button class="alm-arrow" onclick="_almPrev()">\u25C0</button>';
-  html += '<div class="alm-title">' + monthName + ' ' +
+  html += '<div class="alm-title">' +
+    '<span class="alm-month" tabindex="0" role="button" aria-haspopup="menu" onclick="_almMonthPick(event)" onkeydown="_almMonthTitleKey(event)" title="' + _almEsc(_tLookup('alm_month_pick', 'Choose month')) + '">' + monthName + '</span> ' +
     '<span class="alm-year" tabindex="0" role="button" onclick="_almYearEdit(event)" onkeydown="_almYearTitleKey(event)" title="' + _almEsc(t('alm_tm_year_hint')) + '">' +
     _almYear + '</span>' + _calYearSuffix(_almSystem) + '</div>';
   html += '<button class="alm-arrow" onclick="_almNext()">\u25B6</button>';
@@ -4667,6 +5898,22 @@ function _almSelectDay(jdn) {
   _drawAlmanacGrid();
 }
 
+// Is a _jdnToCalendar result a date a human could actually read? Non-finite is
+// the obvious failure, but the interesting one is finite garbage: the Meeus
+// series the Chinese calendar is built on are truncated fits, and three million
+// lunations out from J2000 they stop describing the Moon — month lengths spread
+// from 24 to 38 days, so a day can fall outside every month of the year it was
+// looked up in and come back as "day 93 of month 12". Finite, plausible-looking,
+// and meaningless. Any month past 13 or day past 31 means the conversion has
+// left the span where it means anything.
+var _CAL_MAX_MONTHS = 13;              // lunisolar leap years reach 13
+var _CAL_MAX_DAY = 31;
+function _calResultUsable(cal) {
+  return !!cal && isFinite(cal.year) && isFinite(cal.month) && isFinite(cal.day) &&
+    cal.month >= 1 && cal.month <= _CAL_MAX_MONTHS &&
+    cal.day >= 1 && cal.day <= _CAL_MAX_DAY;
+}
+
 function _almRenderCrossRef(jdn) {
   var greg = _jdnToGregorian(jdn);
   var html = '<div class="alm-crossref">';
@@ -4678,7 +5925,7 @@ function _almRenderCrossRef(jdn) {
     var dateStr;
     try {
       var cal = _jdnToCalendar(sys, jdn);
-      if (!isFinite(cal.year) || !isFinite(cal.month) || !isFinite(cal.day)) throw 0;
+      if (!_calResultUsable(cal)) throw 0;
       var monthName = _calMonthName(sys, cal.year, cal.month);
       var yearStr = cal.year + _calYearSuffix(sys);
       dateStr = monthName + ' ' + cal.day + ', ' + yearStr;
@@ -4753,6 +6000,49 @@ function _almYearEdit(e) {
 
 function _almYearTitleKey(e) {
   if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); _almYearEdit(e); }
+}
+
+// The month name in the calendar title opens a compact month grid — the month
+// counterpart of the typable year beside it. Built from _calMonthName each
+// time, so a 13-month lunisolar year simply shows 13 cells and localized
+// names come for free. Picking a month redraws the grid (which also removes
+// the pop, since it lives inside the calendar container).
+function _almMonthPick(e) {
+  if (e) e.stopPropagation();
+  var old = document.getElementById('alm-month-pop');
+  if (old) { old.remove(); return; }
+  var nav = document.querySelector('#almanac-calendar .alm-nav');
+  if (!nav) return;
+  var count = _calMonthCount(_almSystem, _almYear);
+  var pop = document.createElement('div');
+  pop.id = 'alm-month-pop';
+  pop.className = 'alm-month-pop';
+  pop.setAttribute('role', 'menu');
+  pop.setAttribute('aria-label', _tLookup('alm_month_pick', 'Choose month'));
+  for (var m = 1; m <= count; m++) {
+    var b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'alm-month-cell' + (m === _almMonth ? ' alm-month-cur' : '');
+    b.setAttribute('role', 'menuitem');
+    b.textContent = _calMonthName(_almSystem, _almYear, m);
+    b.onclick = (function (mm) { return function () { _almMonth = mm; _drawAlmanacGrid(); }; })(m);
+    pop.appendChild(b);
+  }
+  nav.appendChild(pop);
+  var cur = pop.querySelector('.alm-month-cur');
+  if (cur) cur.focus();
+  // Outside tap or Escape puts it away — the same dismissal the dock's month
+  // plate uses (_almPopDismissOn). A tap on the month name itself is left to
+  // the name's own click handler, which toggles.
+  // swallowEsc for the same reason the app's own key handler puts "topmost
+  // popovers first": the Escape that shuts this grid must not carry on to the
+  // document handler, which would close the whole almanac out from under a
+  // keyboard user who only meant to put the month list away.
+  _almPopDismissOn('alm-month-pop', { keep: '.alm-month', swallowEsc: true });
+}
+
+function _almMonthTitleKey(e) {
+  if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); _almMonthPick(e); }
 }
 
 // Jump the browsed calendar to an arbitrary year in the current system. Clamp
@@ -4831,6 +6121,13 @@ function _hebrewLeapYear(yr) { return ((7 * yr + 1) % 19) < 7; }
 
 // Hebrew calendar (Maimonides algorithm)
 // Persian (Solar Hijri) Calendar — algorithmic
+// Floored modulo. JS `%` truncates toward zero, so `-5 % 3` is -2, not 1 — but
+// the cycle arithmetic below pairs every remainder with a `Math.floor` quotient,
+// which floors. The two only agree while the dividend is positive, i.e. for
+// Gregorian years after roughly -974. Travel further back (the time machine
+// reaches -270000) and the mismatch surfaces as negative months and days.
+function _floorMod(a, n) { return ((a % n) + n) % n; }
+
 function _gregorianToPersian(gy, gm, gd) {
   // 33-year subcycle algorithm (jalaali-js, well-tested)
   var gdm = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
@@ -4839,9 +6136,9 @@ function _gregorianToPersian(gy, gm, gd) {
     Math.floor((gy2 + 99) / 100) + Math.floor((gy2 + 399) / 400) + gd + gdm[gm - 1];
 
   var jy = -1595 + 33 * Math.floor(days / 12053);
-  days = days % 12053;
+  days = _floorMod(days, 12053);
   jy += 4 * Math.floor(days / 1461);
-  days = days % 1461;
+  days = _floorMod(days, 1461);
   if (days > 365) {
     jy += Math.floor((days - 1) / 365);
     days = (days - 1) % 365;
@@ -4934,10 +6231,14 @@ function _jdnToHijri(jdn) {
 // Persian → Gregorian (reverse of 33-year subcycle)
 function _persianToGregorian(jy, jm, jd) {
   var jy2 = jy + 1595;
-  var days = -355668 + (365 * jy2) + Math.floor(jy2 / 33) * 8 + Math.floor((jy2 % 33 + 3) / 4) + jd;
+  // _floorMod for the same reason as the forward direction: these remainders
+  // are paired with Math.floor quotients, and both dividends go negative for
+  // Persian years before its epoch. Left truncated, the round-trip through
+  // _persianToJDN drifted ~404 years for any BCE date.
+  var days = -355668 + (365 * jy2) + Math.floor(jy2 / 33) * 8 + Math.floor((_floorMod(jy2, 33) + 3) / 4) + jd;
   days += (jm < 7) ? (jm - 1) * 31 : ((jm - 7) * 30 + 186);
   var gy = 400 * Math.floor(days / 146097);
-  days = days % 146097;
+  days = _floorMod(days, 146097);
   if (days > 36524) {
     gy += 100 * Math.floor(--days / 36524);
     days = days % 36524;
@@ -5081,13 +6382,24 @@ var _CN_SYN = 29.530588861;
 var _CN_TZ = 8 / 24;   // China Standard Time offset (days)
 
 // ΔT (TT−UT) in days, Espenak–Meeus piecewise — good for 1900–2150.
+//
+// Each piece is only valid inside its own window, and OUTSIDE 1900–2150 the
+// answer is the Espenak–Meeus long-term parabola, not a continuation of the
+// nearest piece. That distinction is load-bearing, not pedantry: the 1900–1920
+// quartic's -0.000197·w⁴ term reaches -1.2e13 DAYS at year -270000, which makes
+// _cnChinaDay(k) *rise* as k falls. _cnNm11 searches for a lunation by walking
+// k against that comparison, so a diverging ΔT turns its scan into an infinite
+// loop and locks the tab. The parabola stays inside ±2800 days across the whole
+// travel range and keeps _cnChinaDay strictly increasing in k, so the scan
+// always terminates. Behaviour for 1900–2150 is unchanged.
 function _cnDeltaTdays(jde) {
   var y = _jdnToGregorian(Math.floor(jde + 0.5)).year;
   var t = y - 2000, s;
   if (y >= 2005 && y <= 2050) s = 62.92 + 0.32217 * t + 0.005589 * t * t;
   else if (y >= 1986 && y < 2005) s = 63.86 + 0.3345 * t - 0.060374 * t * t + 0.0017275 * Math.pow(t, 3) + 0.000651814 * Math.pow(t, 4) + 0.00002373599 * Math.pow(t, 5);
-  else if (y > 2050) { var u = (y - 1820) / 100; s = -20 + 32 * u * u - 0.5628 * (2150 - y); }
-  else { var w = y - 1900; s = -2.79 + 1.494119 * w - 0.0598939 * w * w + 0.0061966 * Math.pow(w, 3) - 0.000197 * Math.pow(w, 4); }
+  else if (y > 2050 && y <= 2150) { var u2 = (y - 1820) / 100; s = -20 + 32 * u2 * u2 - 0.5628 * (2150 - y); }
+  else if (y >= 1900 && y < 1986) { var w = y - 1900; s = -2.79 + 1.494119 * w - 0.0598939 * w * w + 0.0061966 * Math.pow(w, 3) - 0.000197 * Math.pow(w, 4); }
+  else { var u = (y - 1820) / 100; s = -20 + 32 * u * u; }
   return s / 86400;
 }
 
@@ -5156,21 +6468,70 @@ function _cnMonthHasZhongqi(k) {
 }
 
 // Lunation index k of the month-11 new moon whose December solstice it contains.
-function _cnNm11(gy) {
-  var ws = _cnSolarTermJDE(_gregorianToJDN(gy, 12, 21) + 0.5, 270);
+//
+// The seed inverts _cnNewMoonJDE by fixed-point iteration rather than dividing
+// the solstice by the mean synodic month: dividing ignores the series' T³/T⁴
+// terms, which reach ~4e4 days (≈1400 lunations) at the ends of the travel
+// range, so the scans below would have to walk that whole distance one lunation
+// at a time. Inverting lands within a lunation everywhere, so the scans are the
+// ±1 correction they were meant to be. dJDE/dk ≈ _CN_SYN, so the iteration is a
+// contraction and four passes are ample.
+//
+// The scans are then hard-bounded. They are one-directional walks over a
+// _cnNewMoonDay that is strictly increasing in k, so the bound is unreachable
+// unless that monotonicity is broken (which is exactly the class of bug that
+// hung the tab). Stopping one lunation off beats never returning.
+var _CN_NM11_SEED_PASSES = 4;
+var _CN_NM11_MAX_STEPS = 64;
+var _CN_TROPICAL_YEAR = 365.2422;      // days between December solstices
+function _cnNm11FromSolstice(ws) {
   var wsD = _cnChinaDay(ws);
-  var k = Math.floor((ws - 2451550.09766) / _CN_SYN);
-  while (_cnNewMoonDay(k) > wsD) k--;
-  while (_cnNewMoonDay(k + 1) <= wsD) k++;
+  var k = Math.round((ws - 2451550.09766) / _CN_SYN), i;
+  for (i = 0; i < _CN_NM11_SEED_PASSES; i++) k = Math.round(k + (ws - _cnNewMoonJDE(k)) / _CN_SYN);
+  for (i = 0; i < _CN_NM11_MAX_STEPS && _cnNewMoonDay(k) > wsD; i++) k--;
+  for (i = 0; i < _CN_NM11_MAX_STEPS && _cnNewMoonDay(k + 1) <= wsD; i++) k++;
   return k;
 }
 
+// The December solstice as a TT instant. Seeded in TT, not civil time:
+// everything downstream of _cnSolarTermJDE is TT, so handing it a raw civil JDN
+// silently assumes ΔT ≈ 0. That holds to five minutes for 1900–2150 (the search
+// converges to the same root either way, so nothing moves there), but ΔT reaches
+// ~2700 days at the ends of the travel range — enough to settle on the solstice
+// of a different year entirely.
+function _cnSolsticeTT(gy) {
+  var civil = _gregorianToJDN(gy, 12, 21);
+  return _cnSolarTermJDE(civil + 0.5 + _cnDeltaTdays(civil), 270);
+}
+function _cnNm11(gy) { return _cnNm11FromSolstice(_cnSolsticeTT(gy)); }
+
 // Build the suì starting at month-11 lunation k11: [{k,num,leap,start,end}].
+// Bounded so a long scrub — the lever reaches ~300 simulated years per second,
+// and every calendar day it crosses asks for a suì — cannot grow this without
+// limit. The cache is a scrubbing optimisation, not state, so dropping it
+// wholesale is free.
+var _CN_SUI_CACHE_MAX = 4096;
 var _cnSuiCache = {};
+var _cnSuiCacheCount = 0;
 function _cnBuildSui(k11) {
   if (_cnSuiCache[k11]) return _cnSuiCache[k11];
-  var k11n = _cnNm11(_jdnToGregorian(_cnNewMoonDay(k11)).year + 1);
-  var n = k11n - k11, leap = (n === 13), leapK = -1, i;
+  // Chain to the next suì through the SOLSTICE, not through a Gregorian year
+  // label. Labelling used the year of this suì's month-11 new moon and added
+  // one — which assumes that new moon shares a year with the solstice it
+  // contains. Near the ends of the travel range the Gregorian year has slipped
+  // weeks against the tropical year, that assumption breaks, and the chain
+  // skipped a whole suì: _cnYearMonths then stitched two non-adjacent halves
+  // together and _jdnToChineseLunar reported days like "day 93 of month 12".
+  // This suì's solstice lives inside month 11 by definition, so start there and
+  // step one tropical year.
+  var ws = _cnSolarTermJDE(_cnNewMoonJDE(k11) + 15, 270);
+  var k11n = _cnNm11FromSolstice(_cnSolarTermJDE(ws + _CN_TROPICAL_YEAR, 270));
+  var n = k11n - k11, leapK = -1, i;
+  // A suì is 12 or 13 lunations by construction. Anything else means the
+  // solstice search drifted, and n feeds a push loop below — clamp it so a bad
+  // n can never turn that loop into an allocation bomb. (NaN clamps to 12.)
+  if (!(n >= 12 && n <= 13)) n = (n > 13) ? 13 : 12;
+  var leap = (n === 13);
   if (leap) {
     for (i = 0; i < n; i++) {
       if (!_cnMonthHasZhongqi(k11 + i)) { leapK = k11 + i; break; }
@@ -5185,7 +6546,9 @@ function _cnBuildSui(k11) {
     months.push({ k: k, num: thisNum, leap: isLeap, start: _cnNewMoonDay(k), end: _cnNewMoonDay(k + 1) });
     if (!isLeap) { prevNum = num; num = (num % 12) + 1; }
   }
+  if (_cnSuiCacheCount >= _CN_SUI_CACHE_MAX) { _cnSuiCache = {}; _cnSuiCacheCount = 0; }
   _cnSuiCache[k11] = months;
+  _cnSuiCacheCount++;
   return months;
 }
 
@@ -5473,16 +6836,21 @@ async function _renderRosettaStone(now) {
   var _cl = (typeof _currentLang !== 'undefined') ? _currentLang : 'en';
   function _rf(e, f) { return (e.i18n && e.i18n[_cl] && e.i18n[_cl][f]) || e[f]; }
 
-  // Inscription pills (top row)
+  // Inscription pills (top row). The active pill doubles as the encyclopedia
+  // link: a second tap on it opens the article (same closed-set Q-ID open the
+  // old in-body title link used). The underline + tooltip affordance appears
+  // only when the curated Q-ID actually resolved to an installed article.
   var html = '<div class="rosetta-pills">';
   for (var si = 0; si < manifest.length; si++) {
-    var cls = si === _rosettaTextIdx ? 'pill active' : 'pill';
-    html += '<button class="' + cls + '" onclick="_selectRosettaText(' + si + ')">' + _rf(manifest[si], 'title') + '</button>';
+    var isSel = si === _rosettaTextIdx;
+    var linkable = isSel && window.AlmanacLinks && AlmanacLinks.linkFor('rosetta:' + manifest[si].id);
+    var cls = 'pill' + (isSel ? ' active' : '') + (linkable ? ' rosetta-pill-link' : '');
+    var hint = linkable
+      ? ' title="' + _almEsc(t('alm_open_article')) + '" aria-label="' + _almEsc(_rf(manifest[si], 'title') + '. ' + t('alm_open_article')) + '"'
+      : '';
+    html += '<button class="' + cls + '" aria-pressed="' + (isSel ? 'true' : 'false') + '"' + hint + ' onclick="_selectRosettaText(' + si + ')">' + _rf(manifest[si], 'title') + '</button>';
   }
   html += '</div>';
-
-  // Title (linked to the encyclopedia article when the curated Q-ID resolves)
-  html += '<div class="rosetta-title-link">' + _lrosetta(entry.id, _almEsc(_rf(entry, 'title'))) + '</div>';
 
   // Metadata
   html += '<div class="rosetta-meta">' + _rf(entry, 'date') + ' \u00b7 ' + _rf(entry, 'place') + ' \u00b7 ' + _rf(entry, 'medium') + '</div>';
@@ -5628,8 +6996,24 @@ function _renderGrLightbox() {
     '<button class="gr-lb-arrow gr-lb-next" onclick="event.stopPropagation();_grNav(1)"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6,2 12,8 6,14"/></svg></button>';
 }
 
+// Timestamp of the last selection change: a ghost/double tap landing right
+// after a pill becomes active must not immediately fire the article open.
+var _rosettaSelectedAt = 0;
+var _ROSETTA_NAV_GUARD_MS = 350;
+
 function _selectRosettaText(idx) {
+  if (idx === _rosettaTextIdx) {
+    // Second tap on the already-active pill opens the encyclopedia article,
+    // through the same closed-set resolution the in-body title link used.
+    // AlmanacLinks.open() is a no-op when the Q-ID did not resolve.
+    if (Date.now() - _rosettaSelectedAt < _ROSETTA_NAV_GUARD_MS) return;
+    var manifest = _rosettaManifest || [];
+    var entry = manifest[idx];
+    if (entry && window.AlmanacLinks) AlmanacLinks.open('rosetta:' + entry.id);
+    return;
+  }
   _rosettaTextIdx = idx;
+  _rosettaSelectedAt = Date.now();
   _renderRosettaStone(new Date());
 }
 
@@ -5651,6 +7035,7 @@ async function _scrollToGoldenRecord() {
   for (var i = 0; i < manifest.length; i++) {
     if (manifest[i].id === 'golden-record') { _rosettaTextIdx = i; break; }
   }
+  _rosettaSelectedAt = Date.now();  // programmatic selection: same nav guard as a pill tap
   await _renderRosettaStone(new Date());
   var el = document.getElementById('almanac-rosetta');
   if (el) el.scrollIntoView({behavior:'smooth',block:'start'});

@@ -5,6 +5,54 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.8.2] - 2026-08-07
+
+Bookmarks v2 is the centerpiece: nested folders, drag and drop, context menus, rename everywhere, and export to a named ZIM with sections (#45). Zimi also becomes a markedly politer member of the Kiwix ecosystem, with idle instances making zero catalog requests and active ones revalidating conditionally with gzip, and downloads and seeding get bulk controls and honest copy about what removing a seed actually does.
+
+### Added
+
+- **Bookmark folders.** Nested folders with inline create, collapse, drag and drop (bookmarks and folders), and right-click or long-press menus: Open, Move to, Rename, Remove. Individual bookmarks can be renamed, with empty rename reverting to the article title. Deleting a folder asks what happens to its contents.
+- **Export bookmarks to ZIM (#45).** Tree selection across any mix of top-level and sub-folders, a user-chosen sanitized name, folders as sections inside one ZIM, empty folders kept as labeled sections instead of silently dropped, proper localized plurals, and creation dates shown on generated ZIMs.
+- **Activity feed depth.** Bookmark exports and health checks appear in the activity badge and downloads panel with live progress.
+- **Seed controls.** Pause all and Resume all for downloads and seeds, per-seed age from the seeding ledger, and Remove semantics with honest copy: sharing stops, files stay.
+- **Offline honesty.** A cached app shell with an unreachable server shows a connection banner instead of an empty library.
+- **Catalog backup timestamp.** The Mirror row shows when the offline catalog copy last updated.
+- **Health report** flags zero-byte and missing media entries.
+- **Almanac.** A time machine docked at the bottom of the page: tap the date heading to summon it, scrub the lever to travel, or type a destination into its readout. Travel stays live at 60fps. The world map gains real timezone geometry (Natural Earth, public domain) with true-shape zone highlighting, click-anywhere location, and 173 clickable cities. Moon phase, tilt and orientation now come from one shared computation everywhere they are drawn. Messages Across Time pills are themselves the article link.
+
+### Changed
+
+- **Kiwix ecosystem politeness.** Idle instances make zero kiwix.org requests; the background catalog refresh only runs when Mirror mode, auto-update, or recent catalog use needs it. Conditional requests with ETag revalidation, gzip transfer, longer server cache headers honored, a proper Zimi User-Agent with version and contact URL, jittered boot checks, and cooldown after failures.
+- **Almanac chrome.** The header is unconditionally dark inside the Almanac, and reloading on the Almanac boots straight into it with no library flash.
+- **Catalog multi-select.** Checkmarks render in light theme (a specificity bug hid them), boxes are smaller with unchanged 40px touch targets, and card text never overlaps the checkbox.
+- **Users tab** organized into Your account, Public access, and Users sections.
+- **Settings consistency.** All numeric inputs share the port box width; toggle rows get consistent vertical rhythm.
+- **Bookmark iconography.** Thin-stroke folder and page icons matching the app's icon family replace OS-style glyphs.
+- **Export terminology.** "Export" everywhere, matching the community request wording.
+
+### Fixed
+
+- Settings gear now works during the initial library scan (#44).
+- Downloads panel buttons share one size system and no longer overflow (#46).
+- Broken video articles show a clear "not included in this ZIM" message instead of a dead player (#43).
+- Travelling to a distant enough year could hang the page: an unbounded delta-T term inverted the Chinese calendar's day ordering and left its new-moon search running forever. The astronomy is now bounded on both ends, deep-time conversions say "beyond this calendar's range" instead of printing dates that do not exist, and BCE Persian dates round-trip correctly. Nothing changes for 1900-2150.
+- Timezone anchors for Tbilisi and Baku fell through to Baghdad and Tehran, and Kolkata to Dhaka, so those cities showed a clock up to an hour wrong.
+- Escape inside a month grid closed the whole Almanac instead of the grid.
+- "Delete folder, keep bookmarks" orphaned the bookmarks invisibly; never shipped, caught in QA.
+- "Remove all from seeding" could cancel in-flight downloads and delete their partial files.
+- Bookmark rename input no longer exits edit mode on arrow keys or spacebar.
+- Exports no longer silently drop empty selected folders, and an all-empty selection disables the button with an explanation.
+- Export progress reports the final article count before the closing phase instead of appearing to stall.
+- Math formulas in dark reading mode and image captions in light theme are legible.
+- Context submenus fit the viewport on mobile, dismiss on tap-away, and stack above their trigger.
+- Free clicks on the world map now draw the marker and zone highlight.
+- Almanac scrub performance: moon sprite generation no longer does per-frame GPU readbacks, and travel no longer says Traveling after release.
+- The sky scene no longer shifts into the hero cards during travel (the layout freeze was absorbing collapsed margins).
+- Changing a checked catalog item's flavor updates the selection total and the queued URL; batch download would previously have fetched the originally selected flavor.
+- The My Data card explains where data lives and what saving to your account does, branched by sign-in state.
+- Myanmar resolves to +6:30 instead of Bangkok's +7.
+- Holidays show full country names in Worldwide scope.
+
 ## [1.8.1] - 2026-07-28
 
 A polish-and-hardening release on top of the Community Edition. The headline is
