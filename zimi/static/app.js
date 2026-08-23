@@ -15920,15 +15920,19 @@ window._nudgeActivityPoll = _nudgeActivityPoll;
 // confirms the endpoint works; subsequent calls follow active/idle cadence.
 window.addEventListener('load', _startActivityPolling);
 
+// ============================================================================
 // Scraper Studio & Scheduler UI
+// ============================================================================
 
 let _activeScraperLogId = null;
 let _scraperLogTimer = null;
+let _scraperTabPollTimer = null;
 
 async function renderScrapersTab() {
   const el = document.getElementById('manage-scrapers');
   if (!el) return;
-  el.innerHTML = _loadingHtml();
+
+  if (_scraperTabPollTimer) { clearTimeout(_scraperTabPollTimer); _scraperTabPollTimer = null; }
 
   try {
     const res = await manageFetch('/manage/scrapers/status');
@@ -15946,11 +15950,11 @@ async function renderScrapersTab() {
       h += '<h2>Active Scraping Jobs</h2>';
       for (const run of activeRuns) {
         const elapsed = Math.round((Date.now() / 1000) - run.started_at);
-        h += '<div class="mc-row" style="align-items: center; justify-content: space-between;">' +
+        h += '<div class="mc-row" style="align-items: center; justify-content: space-between; padding: 8px 0;">' +
           '<div>' +
             '<strong>' + esc(run.label || run.type) + '</strong> ' +
-            '<span style="font-size:12px; color:var(--amber);">Running (' + elapsed + 's)</span>' +
-            '<div style="font-size:11px; color:var(--text2); font-family:monospace; margin-top:2px;">' + esc(run.command) + '</div>' +
+            '<span style="font-size:12px; color:var(--amber); margin-left:6px;">Running (' + elapsed + 's)</span>' +
+            '<div style="font-size:11px; color:var(--text2); font-family:monospace; margin-top:2px; max-width:400px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">' + esc(run.command) + '</div>' +
           '</div>' +
           '<div style="display:flex; gap:8px;">' +
             '<button class="ms-btn" onclick="openScraperLogs(\'' + escAttr(run.run_id) + '\')">Logs</button>' +
@@ -15959,11 +15963,12 @@ async function renderScrapersTab() {
         '</div>';
       }
       h += '</div>';
+      _scraperTabPollTimer = setTimeout(() => { if (mode === 'manage' && manageTab === 'scrapers') renderScrapersTab(); }, 3000);
     }
 
     // Installed Tools Check
     h += '<div class="manage-card">';
-    h += '<h2>Offliner Environment</h2><div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:6px;">';
+    h += '<h2>Python Offliner Environment</h2><div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:6px;">';
     for (const [tool, installed] of Object.entries(tools)) {
       const color = installed ? 'var(--text1)' : 'var(--text2)';
       const status = installed ? '✓ Ready' : '✗ Missing';
@@ -15973,35 +15978,12 @@ async function renderScrapersTab() {
     }
     h += '</div></div>';
 
-    // Forms Container
-    h += '<div class="manage-card">';
-    h += '<h2>MediaWiki Offliner (mwoffliner)</h2>';
-    h += '<div style="display:flex; flex-direction:column; gap:8px; margin-top:8px;">' +
-      '<input id="mw-url" type="text" placeholder="MediaWiki URL (e.g. https://en.wikipedia.org or https://www.wikihow.com)" style="padding:8px 12px; background:var(--surface2); border:1px solid var(--border); border-radius:var(--radius); color:var(--text1);" />' +
-      '<div style="display:grid; grid-template-columns: 1fr 1fr; gap:8px;">' +
-        '<input id="mw-email" type="email" placeholder="Admin Email (e.g. you@example.com)" style="padding:8px 12px; background:var(--surface2); border:1px solid var(--border); border-radius:var(--radius); color:var(--text1);" />' +
-        '<select id="mw-format" style="padding:8px 12px; background:var(--surface2); border:1px solid var(--border); border-radius:var(--radius); color:var(--text1);">' +
-          '<option value="full">Full (Text, Images, Video, Audio)</option>' +
-          '<option value="novid">No Video/Audio (Text & Images)</option>' +
-          '<option value="nopic">No Pictures (Text Only / Fast)</option>' +
-          '<option value="mini">Mini (Lead Paragraphs Only)</option>' +
-        '</select>' +
-      '</div>' +
-      '<input id="mw-article-list" type="text" placeholder="Article List URL/Path (Optional)" style="padding:8px 12px; background:var(--surface2); border:1px solid var(--border); border-radius:var(--radius); color:var(--text1);" />' +
-      '<input id="mw-custom-args" type="text" placeholder="Extra Flags (e.g. --keepEmptyParagraphs)" style="padding:8px 12px; background:var(--surface2); border:1px solid var(--border); border-radius:var(--radius); color:var(--text1);" />' +
-      '<div style="display:flex; gap:8px; margin-top:6px;">' +
-        '<button class="manage-btn-action" onclick="submitMwoffliner(false)">Run Now</button>' +
-        '<button class="ms-btn" onclick="submitMwoffliner(true)">Schedule Task…</button>' +
-      '</div>' +
-    '</div>';
-    h += '</div>';
-
     // YouTube Offliner Card
     h += '<div class="manage-card">';
     h += '<h2>YouTube Offliner (youtube2zim)</h2>';
     h += '<div style="display:flex; flex-direction:column; gap:8px; margin-top:8px;">' +
       '<div style="display:grid; grid-template-columns: 1fr 1fr; gap:8px;">' +
-        '<input id="yt-id" type="text" placeholder="Target ID (e.g. UCX6b17PVsYBQ0ip5gyeme-Q)" style="padding:8px 12px; background:var(--surface2); border:1px solid var(--border); border-radius:var(--radius); color:var(--text1);" />' +
+        '<input id="yt-id" type="text" placeholder="Target ID (e.g. UCX6b1...)" style="padding:8px 12px; background:var(--surface2); border:1px solid var(--border); border-radius:var(--radius); color:var(--text1);" />' +
         '<input id="yt-name" type="text" placeholder="ZIM File Name (e.g. my_channel)" style="padding:8px 12px; background:var(--surface2); border:1px solid var(--border); border-radius:var(--radius); color:var(--text1);" />' +
       '</div>' +
       '<input id="yt-apikey" type="password" placeholder="YouTube Data API v3 Key (Required)" style="padding:8px 12px; background:var(--surface2); border:1px solid var(--border); border-radius:var(--radius); color:var(--text1);" />' +
@@ -16022,18 +16004,110 @@ async function renderScrapersTab() {
       '</div>' +
     '</div></div>';
 
-    // Zimit Web Scraper Card
+    // Wget to ZIM (Unix native)
     h += '<div class="manage-card">';
-    h += '<h2>Zimit Web Crawler (Docker)</h2>';
+    h += '<h2>Static Site Archiver (wget + warc2zim)</h2>';
     h += '<div style="display:flex; flex-direction:column; gap:8px; margin-top:8px;">' +
-      '<input id="zimit-url" type="url" placeholder="Target URL (e.g. https://example.com)" style="padding:8px 12px; background:var(--surface2); border:1px solid var(--border); border-radius:var(--radius); color:var(--text1);" />' +
-      '<input id="zimit-name" type="text" placeholder="ZIM File Name (e.g. example_site)" style="padding:8px 12px; background:var(--surface2); border:1px solid var(--border); border-radius:var(--radius); color:var(--text1);" />' +
-      '<input id="zimit-custom-args" type="text" placeholder="Extra Flags (e.g. --depth 2)" style="padding:8px 12px; background:var(--surface2); border:1px solid var(--border); border-radius:var(--radius); color:var(--text1);" />' +
+      '<input id="wget-url" type="url" placeholder="Target URL (e.g. https://example.com)" style="padding:8px 12px; background:var(--surface2); border:1px solid var(--border); border-radius:var(--radius); color:var(--text1);" />' +
+      '<input id="wget-name" type="text" placeholder="ZIM File Name (e.g. example_site)" style="padding:8px 12px; background:var(--surface2); border:1px solid var(--border); border-radius:var(--radius); color:var(--text1);" />' +
       '<div style="display:flex; gap:8px; margin-top:6px;">' +
-        '<button class="manage-btn-action" onclick="submitZimit(false)">Run Now</button>' +
-        '<button class="ms-btn" onclick="submitZimit(true)">Schedule Task…</button>' +
+        '<button class="manage-btn-action" onclick="submitWget(false)">Run Now</button>' +
+        '<button class="ms-btn" onclick="submitWget(true)">Schedule Task…</button>' +
       '</div>' +
     '</div></div>';
+
+    // Stack Exchange (sotoki)
+    h += '<div class="manage-card">';
+    h += '<h2>Stack Exchange (sotoki)</h2>';
+    h += '<div style="display:flex; flex-direction:column; gap:8px; margin-top:8px;">' +
+      '<input id="sotoki-domain" type="text" placeholder="Domain (e.g. arduino.stackexchange.com)" style="padding:8px 12px; background:var(--surface2); border:1px solid var(--border); border-radius:var(--radius); color:var(--text1);" />' +
+      '<div style="display:flex; gap:8px; margin-top:6px;">' +
+        '<button class="manage-btn-action" onclick="submitSotoki(false)">Run Now</button>' +
+        '<button class="ms-btn" onclick="submitSotoki(true)">Schedule Task…</button>' +
+      '</div>' +
+    '</div></div>';
+
+    // Project Gutenberg (gutenberg2zim)
+    h += '<div class="manage-card">';
+    h += '<h2>Project Gutenberg (gutenberg2zim)</h2>';
+    h += '<div style="display:flex; flex-direction:column; gap:8px; margin-top:8px;">' +
+      '<input id="guten-lang" type="text" placeholder="Language (e.g. en)" value="en" style="padding:8px 12px; background:var(--surface2); border:1px solid var(--border); border-radius:var(--radius); color:var(--text1);" />' +
+      '<div style="display:flex; gap:8px; margin-top:6px;">' +
+        '<button class="manage-btn-action" onclick="submitLangScraper(\'gutenberg2zim\', \'guten-lang\', \'Gutenberg\', false)">Run Now</button>' +
+        '<button class="ms-btn" onclick="submitLangScraper(\'gutenberg2zim\', \'guten-lang\', \'Gutenberg\', true)">Schedule Task…</button>' +
+      '</div>' +
+    '</div></div>';
+    
+    // TED Talks (ted2zim)
+    h += '<div class="manage-card">';
+    h += '<h2>TED Talks (ted2zim)</h2>';
+    h += '<div style="display:flex; flex-direction:column; gap:8px; margin-top:8px;">' +
+      '<input id="ted-lang" type="text" placeholder="Language (e.g. en)" value="en" style="padding:8px 12px; background:var(--surface2); border:1px solid var(--border); border-radius:var(--radius); color:var(--text1);" />' +
+      '<div style="display:flex; gap:8px; margin-top:6px;">' +
+        '<button class="manage-btn-action" onclick="submitLangScraper(\'ted2zim\', \'ted-lang\', \'TED\', false)">Run Now</button>' +
+        '<button class="ms-btn" onclick="submitLangScraper(\'ted2zim\', \'ted-lang\', \'TED\', true)">Schedule Task…</button>' +
+      '</div>' +
+    '</div></div>';
+
+    // WikiHow (wikihow2zim)
+    h += '<div class="manage-card">';
+    h += '<h2>WikiHow (wikihow2zim)</h2>';
+    h += '<div style="display:flex; flex-direction:column; gap:8px; margin-top:8px;">' +
+      '<input id="wikihow-lang" type="text" placeholder="Language (e.g. en)" value="en" style="padding:8px 12px; background:var(--surface2); border:1px solid var(--border); border-radius:var(--radius); color:var(--text1);" />' +
+      '<div style="display:flex; gap:8px; margin-top:6px;">' +
+        '<button class="manage-btn-action" onclick="submitLangScraper(\'wikihow2zim\', \'wikihow-lang\', \'WikiHow\', false)">Run Now</button>' +
+        '<button class="ms-btn" onclick="submitLangScraper(\'wikihow2zim\', \'wikihow-lang\', \'WikiHow\', true)">Schedule Task…</button>' +
+      '</div>' +
+    '</div></div>';
+
+    // iFixit (ifixit2zim)
+    h += '<div class="manage-card">';
+    h += '<h2>iFixit (ifixit2zim)</h2>';
+    h += '<div style="display:flex; flex-direction:column; gap:8px; margin-top:8px;">' +
+      '<input id="ifixit-lang" type="text" placeholder="Language (e.g. en)" value="en" style="padding:8px 12px; background:var(--surface2); border:1px solid var(--border); border-radius:var(--radius); color:var(--text1);" />' +
+      '<div style="display:flex; gap:8px; margin-top:6px;">' +
+        '<button class="manage-btn-action" onclick="submitLangScraper(\'ifixit2zim\', \'ifixit-lang\', \'iFixit\', false)">Run Now</button>' +
+        '<button class="ms-btn" onclick="submitLangScraper(\'ifixit2zim\', \'ifixit-lang\', \'iFixit\', true)">Schedule Task…</button>' +
+      '</div>' +
+    '</div></div>';
+
+    // FreeCodeCamp (freecodecamp2zim)
+    h += '<div class="manage-card">';
+    h += '<h2>FreeCodeCamp (freecodecamp2zim)</h2>';
+    h += '<div style="display:flex; flex-direction:column; gap:8px; margin-top:8px;">' +
+      '<input id="fcc-lang" type="text" placeholder="Language (e.g. english)" value="english" style="padding:8px 12px; background:var(--surface2); border:1px solid var(--border); border-radius:var(--radius); color:var(--text1);" />' +
+      '<div style="display:flex; gap:8px; margin-top:6px;">' +
+        '<button class="manage-btn-action" onclick="submitLangScraper(\'freecodecamp2zim\', \'fcc-lang\', \'FreeCodeCamp\', false)">Run Now</button>' +
+        '<button class="ms-btn" onclick="submitLangScraper(\'freecodecamp2zim\', \'fcc-lang\', \'FreeCodeCamp\', true)">Schedule Task…</button>' +
+      '</div>' +
+    '</div></div>';
+
+    // DevDocs (devdocs2zim)
+    h += '<div class="manage-card">';
+    h += '<h2>Developer Documentation (devdocs2zim)</h2>';
+    h += '<div style="display:flex; flex-direction:column; gap:8px; margin-top:8px;">' +
+      '<div style="display:flex; gap:8px; margin-top:6px;">' +
+        '<button class="manage-btn-action" onclick="submitDevdocs(false)">Run Now</button>' +
+        '<button class="ms-btn" onclick="submitDevdocs(true)">Schedule Task…</button>' +
+      '</div>' +
+    '</div></div>';
+
+    // Recent Completed Runs
+    if (recentRuns.length > 0) {
+      h += '<div class="manage-card">';
+      h += '<h2>Recent History</h2>';
+      for (const r of recentRuns.slice(0, 10)) {
+        const statusColor = r.status === 'completed' ? 'var(--text1)' : 'var(--error)';
+        h += '<div class="mc-row" style="align-items:center; justify-content:space-between; padding: 6px 0;">' +
+          '<div>' +
+            '<strong>' + esc(r.label || r.type) + '</strong> ' +
+            '<span style="font-size:12px; color:' + statusColor + '; margin-left:6px;">' + esc(r.status) + ' (exit ' + r.exit_code + ')</span>' +
+          '</div>' +
+          '<button class="ms-btn" onclick="openScraperLogs(\'' + escAttr(r.run_id) + '\')">View Logs</button>' +
+        '</div>';
+      }
+      h += '</div>';
+    }
 
     // Scheduled Tasks List
     h += '<div class="manage-card">';
@@ -16043,7 +16117,7 @@ async function renderScrapersTab() {
     } else {
       for (const s of schedules) {
         const lastRun = s.last_run ? new Date(s.last_run * 1000).toLocaleString() : 'Never';
-        h += '<div class="mc-row" style="align-items:center; justify-content:space-between;">' +
+        h += '<div class="mc-row" style="align-items:center; justify-content:space-between; padding: 6px 0;">' +
           '<div>' +
             '<strong>' + esc(s.label) + '</strong> ' +
             '<span class="ms-role-badge" style="margin-left:6px;">' + esc(s.frequency) + '</span>' +
@@ -16070,6 +16144,26 @@ async function renderScrapersTab() {
   }
 }
 
+async function _submitJob(type, params, label, isSchedule) {
+  if (isSchedule) {
+    const freq = prompt("Enter recurrence frequency: hourly, daily, weekly, or monthly", "weekly");
+    if (!freq) return;
+    await manageFetch('/manage/scrapers/schedule', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ job: { type, label, frequency: freq, params } })
+    });
+    renderScrapersTab();
+  } else {
+    const res = await manageFetch('/manage/scrapers/run', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type, params, label })
+    });
+    const d = await res.json();
+    if (d.run) { renderScrapersTab(); openScraperLogs(d.run.run_id); } 
+    else { alert(d.error || "Failed to start scraper."); }
+  }
+}
+
 async function submitYoutube2zim(isSchedule) {
   const params = {
     target_id: (document.getElementById('yt-id').value || '').trim(),
@@ -16085,67 +16179,34 @@ async function submitYoutube2zim(isSchedule) {
     alert("Target ID, Name, and API Key are all required.");
     return;
   }
-
-  const label = "YT: " + params.name;
-  if (isSchedule) {
-    const freq = prompt("Enter recurrence frequency: hourly, daily, weekly, or monthly", "weekly");
-    if (!freq) return;
-    await manageFetch('/manage/scrapers/schedule', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ job: { type: 'youtube2zim', label, frequency: freq, params } })
-    });
-    renderScrapersTab();
-  } else {
-    const res = await manageFetch('/manage/scrapers/run', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ type: 'youtube2zim', params, label })
-    });
-    const d = await res.json();
-    if (d.run) { renderScrapersTab(); openScraperLogs(d.run.run_id); } 
-    else { alert(d.error || "Failed to start scraper."); }
-  }
+  _submitJob('youtube2zim', params, "YT: " + params.name, isSchedule);
 }
 
-async function submitZimit(isSchedule) {
-  const params = {
-    url: (document.getElementById('zimit-url').value || '').trim(),
-    name: (document.getElementById('zimit-name').value || '').trim(),
-    custom_args: (document.getElementById('zimit-custom-args').value || '').trim()
-  };
+function submitSotoki(isSchedule) {
+  const domain = (document.getElementById('sotoki-domain').value || '').trim();
+  if (!domain) { alert("Domain is required."); return; }
+  _submitJob('sotoki', { domain }, "Sotoki: " + domain, isSchedule);
+}
 
-  if (!params.url || !params.name) {
-    alert("URL and Name are required.");
-    return;
-  }
+function submitLangScraper(type, inputId, labelPrefix, isSchedule) {
+  const lang = (document.getElementById(inputId).value || 'en').trim();
+  _submitJob(type, { lang }, labelPrefix + " (" + lang + ")", isSchedule);
+}
 
-  const label = "Zimit: " + params.name;
-  if (isSchedule) {
-    const freq = prompt("Enter recurrence frequency: hourly, daily, weekly, or monthly", "weekly");
-    if (!freq) return;
-    await manageFetch('/manage/scrapers/schedule', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ job: { type: 'zimit', label, frequency: freq, params } })
-    });
-    renderScrapersTab();
-  } else {
-    const res = await manageFetch('/manage/scrapers/run', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ type: 'zimit', params, label })
-    });
-    const d = await res.json();
-    if (d.run) { renderScrapersTab(); openScraperLogs(d.run.run_id); } 
-    else { alert(d.error || "Failed to start scraper."); }
-  }
+function submitDevdocs(isSchedule) {
+  _submitJob('devdocs2zim', {}, "DevDocs Archive", isSchedule);
+}
+
+function submitWget(isSchedule) {
+  const url = (document.getElementById('wget-url').value || '').trim();
+  const name = (document.getElementById('wget-name').value || '').trim();
+  if (!url || !name) { alert("URL and ZIM Name are required."); return; }
+  _submitJob('wget2zim', { url, name }, "Wget: " + name, isSchedule);
 }
 
 async function cancelScraperRun(runId) {
   await manageFetch('/manage/scrapers/cancel', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ run_id: runId })
   });
   renderScrapersTab();
@@ -16154,8 +16215,7 @@ async function cancelScraperRun(runId) {
 async function deleteScraperSchedule(id) {
   if (!confirm("Remove this scheduled job?")) return;
   await manageFetch('/manage/scrapers/delete-schedule', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ id })
   });
   renderScrapersTab();
@@ -16170,7 +16230,7 @@ function openScraperLogs(runId) {
 
 function closeScraperLogs() {
   _activeScraperLogId = null;
-  clearTimeout(_scraperLogTimer);
+  if (_scraperLogTimer) { clearTimeout(_scraperLogTimer); _scraperLogTimer = null; }
   const modal = document.getElementById('scraper-log-modal');
   if (modal) modal.style.display = 'none';
 }
@@ -16182,13 +16242,13 @@ async function _pollScraperLogs() {
     if (res.ok) {
       const data = await res.json();
       const box = document.getElementById('scraper-log-box');
+      const title = document.getElementById('scraper-log-title');
+      if (title && data.run) title.textContent = `${data.run.label} (${data.run.status})`;
       if (box && data.logs) {
         box.textContent = data.logs.join('\n');
         box.scrollTop = box.scrollHeight;
       }
-      if (data.run && data.run.status === 'running') {
-        _scraperLogTimer = setTimeout(_pollScraperLogs, 2000);
-      }
+      if (data.run && data.run.status === 'running') _scraperLogTimer = setTimeout(_pollScraperLogs, 1500);
     }
   } catch(e) {}
 }
