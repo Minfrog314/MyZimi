@@ -16000,33 +16000,40 @@ async function renderScrapersTab() {
     h += '<div class="manage-card">';
     h += '<h2>YouTube Offliner (youtube2zim)</h2>';
     h += '<div style="display:flex; flex-direction:column; gap:8px; margin-top:8px;">' +
-      '<div style="display:grid; grid-template-columns: 140px 1fr; gap:8px;">' +
-        '<select id="yt-type" style="padding:8px 12px; background:var(--surface2); border:1px solid var(--border); border-radius:var(--radius); color:var(--text1);">' +
-          '<option value="video">Single Video</option>' +
-          '<option value="playlist">Playlist</option>' +
-          '<option value="channel">Channel</option>' +
-          '<option value="user">User</option>' +
-        '</select>' +
-        '<input id="yt-url" type="text" placeholder="Target URL or ID (e.g. https://www.youtube.com/playlist?list=...)" style="padding:8px 12px; background:var(--surface2); border:1px solid var(--border); border-radius:var(--radius); color:var(--text1);" />' +
+      '<div style="display:grid; grid-template-columns: 1fr 1fr; gap:8px;">' +
+        '<input id="yt-id" type="text" placeholder="Target ID (e.g. UCX6b17PVsYBQ0ip5gyeme-Q)" style="padding:8px 12px; background:var(--surface2); border:1px solid var(--border); border-radius:var(--radius); color:var(--text1);" />' +
+        '<input id="yt-name" type="text" placeholder="ZIM File Name (e.g. my_channel)" style="padding:8px 12px; background:var(--surface2); border:1px solid var(--border); border-radius:var(--radius); color:var(--text1);" />' +
       '</div>' +
+      '<input id="yt-apikey" type="password" placeholder="YouTube Data API v3 Key (Required)" style="padding:8px 12px; background:var(--surface2); border:1px solid var(--border); border-radius:var(--radius); color:var(--text1);" />' +
       '<div style="display:grid; grid-template-columns: 1fr 1fr 1fr; gap:8px;">' +
         '<select id="yt-format" style="padding:8px 12px; background:var(--surface2); border:1px solid var(--border); border-radius:var(--radius); color:var(--text1);">' +
           '<option value="webm">WebM Format</option>' +
           '<option value="mp4">MP4 Format</option>' +
         '</select>' +
         '<input id="yt-lang" type="text" placeholder="Language (e.g. eng)" value="eng" style="padding:8px 12px; background:var(--surface2); border:1px solid var(--border); border-radius:var(--radius); color:var(--text1);" />' +
-        '<input id="yt-max-videos" type="number" placeholder="Max Videos (Optional)" style="padding:8px 12px; background:var(--surface2); border:1px solid var(--border); border-radius:var(--radius); color:var(--text1);" />' +
+        '<input id="yt-max-videos" type="number" placeholder="Max Videos" style="padding:8px 12px; background:var(--surface2); border:1px solid var(--border); border-radius:var(--radius); color:var(--text1);" />' +
       '</div>' +
       '<label style="display:flex; align-items:center; gap:8px; font-size:13px; color:var(--text1); cursor:pointer;">' +
-        '<input type="checkbox" id="yt-lowqual"> Aggressive Compression (--lower-quality)' +
+        '<input type="checkbox" id="yt-lowqual"> Aggressive Compression (--low-quality)' +
       '</label>' +
-      '<input id="yt-custom-args" type="text" placeholder="Extra Flags (e.g. --video-format=240p)" style="padding:8px 12px; background:var(--surface2); border:1px solid var(--border); border-radius:var(--radius); color:var(--text1);" />' +
       '<div style="display:flex; gap:8px; margin-top:6px;">' +
         '<button class="manage-btn-action" onclick="submitYoutube2zim(false)">Run Now</button>' +
         '<button class="ms-btn" onclick="submitYoutube2zim(true)">Schedule Task…</button>' +
       '</div>' +
-    '</div>';
-    h += '</div>';
+    '</div></div>';
+
+    // Zimit Web Scraper Card
+    h += '<div class="manage-card">';
+    h += '<h2>Zimit Web Crawler (Docker)</h2>';
+    h += '<div style="display:flex; flex-direction:column; gap:8px; margin-top:8px;">' +
+      '<input id="zimit-url" type="url" placeholder="Target URL (e.g. https://example.com)" style="padding:8px 12px; background:var(--surface2); border:1px solid var(--border); border-radius:var(--radius); color:var(--text1);" />' +
+      '<input id="zimit-name" type="text" placeholder="ZIM File Name (e.g. example_site)" style="padding:8px 12px; background:var(--surface2); border:1px solid var(--border); border-radius:var(--radius); color:var(--text1);" />' +
+      '<input id="zimit-custom-args" type="text" placeholder="Extra Flags (e.g. --depth 2)" style="padding:8px 12px; background:var(--surface2); border:1px solid var(--border); border-radius:var(--radius); color:var(--text1);" />' +
+      '<div style="display:flex; gap:8px; margin-top:6px;">' +
+        '<button class="manage-btn-action" onclick="submitZimit(false)">Run Now</button>' +
+        '<button class="ms-btn" onclick="submitZimit(true)">Schedule Task…</button>' +
+      '</div>' +
+    '</div></div>';
 
     // Scheduled Tasks List
     h += '<div class="manage-card">';
@@ -16063,63 +16070,23 @@ async function renderScrapersTab() {
   }
 }
 
-async function submitMwoffliner(isSchedule) {
-  const params = {
-    mw_url: (document.getElementById('mw-url').value || '').trim(),
-    admin_email: (document.getElementById('mw-email').value || '').trim(),
-    format: document.getElementById('mw-format').value,
-    article_list: (document.getElementById('mw-article-list').value || '').trim(),
-    custom_args: (document.getElementById('mw-custom-args').value || '').trim()
-  };
-
-  if (!params.mw_url) {
-    alert("MediaWiki URL is required.");
-    return;
-  }
-
-  const label = "MW: " + params.mw_url;
-  if (isSchedule) {
-    const freq = prompt("Enter recurrence frequency: hourly, daily, weekly, or monthly", "weekly");
-    if (!freq) return;
-    await manageFetch('/manage/scrapers/schedule', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ job: { type: 'mwoffliner', label, frequency: freq, params } })
-    });
-    renderScrapersTab();
-  } else {
-    const res = await manageFetch('/manage/scrapers/run', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ type: 'mwoffliner', params, label })
-    });
-    const d = await res.json();
-    if (d.run) {
-      renderScrapersTab();
-      openScraperLogs(d.run.run_id);
-    } else {
-      alert(d.error || "Failed to start scraper.");
-    }
-  }
-}
-
 async function submitYoutube2zim(isSchedule) {
   const params = {
-    target_type: document.getElementById('yt-type').value,
-    target_url: (document.getElementById('yt-url').value || '').trim(),
+    target_id: (document.getElementById('yt-id').value || '').trim(),
+    api_key: (document.getElementById('yt-apikey').value || '').trim(),
+    name: (document.getElementById('yt-name').value || '').trim(),
     format: document.getElementById('yt-format').value,
     language: (document.getElementById('yt-lang').value || 'eng').trim(),
     max_videos: document.getElementById('yt-max-videos').value || null,
-    lower_quality: document.getElementById('yt-lowqual').checked,
-    custom_args: (document.getElementById('yt-custom-args').value || '').trim()
+    lower_quality: document.getElementById('yt-lowqual').checked
   };
 
-  if (!params.target_url) {
-    alert("YouTube URL or ID is required.");
+  if (!params.target_id || !params.api_key || !params.name) {
+    alert("Target ID, Name, and API Key are all required.");
     return;
   }
 
-  const label = "YT (" + params.target_type + "): " + params.target_url;
+  const label = "YT: " + params.name;
   if (isSchedule) {
     const freq = prompt("Enter recurrence frequency: hourly, daily, weekly, or monthly", "weekly");
     if (!freq) return;
@@ -16136,12 +16103,42 @@ async function submitYoutube2zim(isSchedule) {
       body: JSON.stringify({ type: 'youtube2zim', params, label })
     });
     const d = await res.json();
-    if (d.run) {
-      renderScrapersTab();
-      openScraperLogs(d.run.run_id);
-    } else {
-      alert(d.error || "Failed to start scraper.");
-    }
+    if (d.run) { renderScrapersTab(); openScraperLogs(d.run.run_id); } 
+    else { alert(d.error || "Failed to start scraper."); }
+  }
+}
+
+async function submitZimit(isSchedule) {
+  const params = {
+    url: (document.getElementById('zimit-url').value || '').trim(),
+    name: (document.getElementById('zimit-name').value || '').trim(),
+    custom_args: (document.getElementById('zimit-custom-args').value || '').trim()
+  };
+
+  if (!params.url || !params.name) {
+    alert("URL and Name are required.");
+    return;
+  }
+
+  const label = "Zimit: " + params.name;
+  if (isSchedule) {
+    const freq = prompt("Enter recurrence frequency: hourly, daily, weekly, or monthly", "weekly");
+    if (!freq) return;
+    await manageFetch('/manage/scrapers/schedule', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ job: { type: 'zimit', label, frequency: freq, params } })
+    });
+    renderScrapersTab();
+  } else {
+    const res = await manageFetch('/manage/scrapers/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type: 'zimit', params, label })
+    });
+    const d = await res.json();
+    if (d.run) { renderScrapersTab(); openScraperLogs(d.run.run_id); } 
+    else { alert(d.error || "Failed to start scraper."); }
   }
 }
 

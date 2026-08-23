@@ -66,10 +66,10 @@ def get_available_tools():
         "aria2c": shutil.which("aria2c") is not None,
     }
 
-
 def build_command(scraper_type, params):
     """Build command argument list based on user parameters."""
     output_dir = _srv.ZIM_DIR
+    os.makedirs(output_dir, exist_ok=True)
 
     if scraper_type == "mwoffliner":
         cmd = ["mwoffliner", "--output", output_dir]
@@ -99,16 +99,18 @@ def build_command(scraper_type, params):
         return cmd
 
     elif scraper_type == "youtube2zim":
-        target_type = params.get("target_type", "video")  # video, playlist, channel, user
-        target_url = params.get("target_url", "").strip()
-        cmd = ["youtube2zim", f"--{target_type}", target_url, "--output", output_dir]
+        target_id = params.get("target_id", "").strip()
+        api_key = params.get("api_key", "").strip()
+        name = params.get("name", "").strip()
+        
+        cmd = ["youtube2zim", "--id", target_id, "--api-key", api_key, "--name", name, "--output", output_dir]
 
         fmt = params.get("format", "webm")
         if fmt:
             cmd.extend(["--format", fmt])
 
         if params.get("lower_quality"):
-            cmd.append("--lower-quality")
+            cmd.append("--low-quality")
 
         lang = params.get("language", "").strip()
         if lang:
@@ -125,19 +127,17 @@ def build_command(scraper_type, params):
 
     elif scraper_type == "zimit":
         url = params.get("url", "").strip()
-        cmd = ["zimit", "--url", url, "--output", output_dir]
-
         name = params.get("name", "").strip()
-        if name:
-            cmd.extend(["--name", name])
-
-        title = params.get("title", "").strip()
-        if title:
-            cmd.extend(["--title", title])
-
-        desc = params.get("description", "").strip()
-        if desc:
-            cmd.extend(["--description", desc])
+        
+        # Execute zimit via Docker, mounting the output directory
+        cmd = [
+            "docker", "run", "--rm", 
+            "-v", f"{output_dir}:/output", 
+            "ghcr.io/openzim/zimit", 
+            "--url", url, 
+            "--name", name,
+            "--output", "/output"
+        ]
 
         custom_args = params.get("custom_args", "").strip()
         if custom_args:
@@ -146,7 +146,6 @@ def build_command(scraper_type, params):
 
     else:
         raise ValueError(f"Unknown scraper type: {scraper_type}")
-
 
 def run_scraper(scraper_type, params, job_id=None, label=None):
     """Spawn a scraper process in the background and track its logs."""
