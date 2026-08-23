@@ -198,6 +198,13 @@ def start_background_services(http_port):
 
     threading.Thread(target=_init_p2p_background, daemon=True, name="p2p-init").start()
 
+    # Initialize background scraper scheduler
+    try:
+        from zimi import scrapers as _scrapers
+        _scrapers.start_scheduler()
+    except Exception as e:
+        log.warning("Scraper scheduler startup failed: %s", e)
+
     # Standing maintenance, independent of anyone visiting the site:
     # refresh the offline catalog copy before it goes stale, renew the
     # UPnP mapping at half-lease (24h lease dies silently otherwise),

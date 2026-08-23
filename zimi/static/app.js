@@ -7152,6 +7152,9 @@ function switchManageTab(tab) {
   } else if (tab === 'collections') {
     q.placeholder = t('search_placeholder');
     renderCollectionsTab();
+  } else if (tab === 'scrapers') {
+    q.placeholder = t('search_placeholder');
+    renderScrapersTab();
   } else if (tab === 'history') {
     q.placeholder = t('search_placeholder');
     _histShowAll = false;  // re-entering the tab defaults back to the capped view
@@ -7595,6 +7598,7 @@ async function renderManage() {
       '<button class="manage-tab' + (manageTab === 'installed' ? ' active' : '') + '" data-tab="installed" onclick="switchManageTab(\'installed\')">' + tH('installed_tab') + '</button>' +
       '<button class="manage-tab' + (manageTab === 'collections' ? ' active' : '') + '" data-tab="collections" onclick="switchManageTab(\'collections\')">' + tH('collections_tab') + '</button>' +
       '<button class="manage-tab' + (manageTab === 'downloads' ? ' active' : '') + '" data-tab="downloads" onclick="switchManageTab(\'downloads\')">' + tH('downloads') + '<span id="dl-tab-badge" class="dl-tab-badge" style="display:none"></span></button>' +
+      '<button class="manage-tab' + (manageTab === 'scrapers' ? ' active' : '') + '" data-tab="scrapers" onclick="switchManageTab(\'scrapers\')">Scrapers</button>' +
       '<button class="manage-tab' + (manageTab === 'history' ? ' active' : '') + '" data-tab="history" onclick="switchManageTab(\'history\')">' + tH('activity_tab') + '</button>' +
     '</div>' +
 '<div id="manage-status" class="manage-settings' + (manageTab === 'settings' ? ' as-tab-active' : '') + '">' +
@@ -7609,6 +7613,7 @@ async function renderManage() {
     '<div id="manage-installed" class="manage-tab-content' + (manageTab === 'installed' ? ' active' : '') + '"></div>' +
     '<div id="manage-downloads" class="manage-tab-content' + (manageTab === 'downloads' ? ' active' : '') + '"></div>' +
     '<div id="manage-collections" class="manage-tab-content' + (manageTab === 'collections' ? ' active' : '') + '"></div>' +
+    '<div id="manage-scrapers" class="manage-tab-content' + (manageTab === 'scrapers' ? ' active' : '') + '"></div>' +
     '<div id="manage-history" class="manage-tab-content' + (manageTab === 'history' ? ' active' : '') + '"></div>' +
     '<div id="manage-browse" class="manage-tab-content' + (manageTab === 'browse' ? ' active' : '') + '">' +
       '<div id="catalog-results"></div>' +
@@ -15914,5 +15919,281 @@ window._nudgeActivityPoll = _nudgeActivityPoll;
 // Kick off the poller on load. Even if nothing is happening, one call
 // confirms the endpoint works; subsequent calls follow active/idle cadence.
 window.addEventListener('load', _startActivityPolling);
+
+// Scraper Studio & Scheduler UI
+
+let _activeScraperLogId = null;
+let _scraperLogTimer = null;
+
+async function renderScrapersTab() {
+  const el = document.getElementById('manage-scrapers');
+  if (!el) return;
+  el.innerHTML = _loadingHtml();
+
+  try {
+    const res = await manageFetch('/manage/scrapers/status');
+    const data = await res.json();
+    const tools = data.tools || {};
+    const schedules = data.schedules || [];
+    const activeRuns = data.active_runs || [];
+    const recentRuns = data.recent_runs || [];
+
+    let h = '';
+
+    // Active Runs Card
+    if (activeRuns.length > 0) {
+      h += '<div class="manage-card" style="border-left: 3px solid var(--amber);">';
+      h += '<h2>Active Scraping Jobs</h2>';
+      for (const run of activeRuns) {
+        const elapsed = Math.round((Date.now() / 1000) - run.started_at);
+        h += '<div class="mc-row" style="align-items: center; justify-content: space-between;">' +
+          '<div>' +
+            '<strong>' + esc(run.label || run.type) + '</strong> ' +
+            '<span style="font-size:12px; color:var(--amber);">Running (' + elapsed + 's)</span>' +
+            '<div style="font-size:11px; color:var(--text2); font-family:monospace; margin-top:2px;">' + esc(run.command) + '</div>' +
+          '</div>' +
+          '<div style="display:flex; gap:8px;">' +
+            '<button class="ms-btn" onclick="openScraperLogs(\'' + escAttr(run.run_id) + '\')">Logs</button>' +
+            '<button class="ms-btn" style="color:var(--error);" onclick="cancelScraperRun(\'' + escAttr(run.run_id) + '\')">Stop</button>' +
+          '</div>' +
+        '</div>';
+      }
+      h += '</div>';
+    }
+
+    // Installed Tools Check
+    h += '<div class="manage-card">';
+    h += '<h2>Offliner Environment</h2><div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:6px;">';
+    for (const [tool, installed] of Object.entries(tools)) {
+      const color = installed ? 'var(--text1)' : 'var(--text2)';
+      const status = installed ? '✓ Ready' : '✗ Missing';
+      const bg = installed ? 'var(--surface2)' : 'transparent';
+      h += '<span style="font-size:12px; padding:4px 8px; border-radius:4px; border:1px solid var(--border); background:' + bg + '; color:' + color + ';">' +
+        '<strong>' + esc(tool) + '</strong>: ' + status + '</span>';
+    }
+    h += '</div></div>';
+
+    // Forms Container
+    h += '<div class="manage-card">';
+    h += '<h2>MediaWiki Offliner (mwoffliner)</h2>';
+    h += '<div style="display:flex; flex-direction:column; gap:8px; margin-top:8px;">' +
+      '<input id="mw-url" type="text" placeholder="MediaWiki URL (e.g. https://en.wikipedia.org or https://www.wikihow.com)" style="padding:8px 12px; background:var(--surface2); border:1px solid var(--border); border-radius:var(--radius); color:var(--text1);" />' +
+      '<div style="display:grid; grid-template-columns: 1fr 1fr; gap:8px;">' +
+        '<input id="mw-email" type="email" placeholder="Admin Email (e.g. you@example.com)" style="padding:8px 12px; background:var(--surface2); border:1px solid var(--border); border-radius:var(--radius); color:var(--text1);" />' +
+        '<select id="mw-format" style="padding:8px 12px; background:var(--surface2); border:1px solid var(--border); border-radius:var(--radius); color:var(--text1);">' +
+          '<option value="full">Full (Text, Images, Video, Audio)</option>' +
+          '<option value="novid">No Video/Audio (Text & Images)</option>' +
+          '<option value="nopic">No Pictures (Text Only / Fast)</option>' +
+          '<option value="mini">Mini (Lead Paragraphs Only)</option>' +
+        '</select>' +
+      '</div>' +
+      '<input id="mw-article-list" type="text" placeholder="Article List URL/Path (Optional)" style="padding:8px 12px; background:var(--surface2); border:1px solid var(--border); border-radius:var(--radius); color:var(--text1);" />' +
+      '<input id="mw-custom-args" type="text" placeholder="Extra Flags (e.g. --keepEmptyParagraphs)" style="padding:8px 12px; background:var(--surface2); border:1px solid var(--border); border-radius:var(--radius); color:var(--text1);" />' +
+      '<div style="display:flex; gap:8px; margin-top:6px;">' +
+        '<button class="manage-btn-action" onclick="submitMwoffliner(false)">Run Now</button>' +
+        '<button class="ms-btn" onclick="submitMwoffliner(true)">Schedule Task…</button>' +
+      '</div>' +
+    '</div>';
+    h += '</div>';
+
+    // YouTube Offliner Card
+    h += '<div class="manage-card">';
+    h += '<h2>YouTube Offliner (youtube2zim)</h2>';
+    h += '<div style="display:flex; flex-direction:column; gap:8px; margin-top:8px;">' +
+      '<div style="display:grid; grid-template-columns: 140px 1fr; gap:8px;">' +
+        '<select id="yt-type" style="padding:8px 12px; background:var(--surface2); border:1px solid var(--border); border-radius:var(--radius); color:var(--text1);">' +
+          '<option value="video">Single Video</option>' +
+          '<option value="playlist">Playlist</option>' +
+          '<option value="channel">Channel</option>' +
+          '<option value="user">User</option>' +
+        '</select>' +
+        '<input id="yt-url" type="text" placeholder="Target URL or ID (e.g. https://www.youtube.com/playlist?list=...)" style="padding:8px 12px; background:var(--surface2); border:1px solid var(--border); border-radius:var(--radius); color:var(--text1);" />' +
+      '</div>' +
+      '<div style="display:grid; grid-template-columns: 1fr 1fr 1fr; gap:8px;">' +
+        '<select id="yt-format" style="padding:8px 12px; background:var(--surface2); border:1px solid var(--border); border-radius:var(--radius); color:var(--text1);">' +
+          '<option value="webm">WebM Format</option>' +
+          '<option value="mp4">MP4 Format</option>' +
+        '</select>' +
+        '<input id="yt-lang" type="text" placeholder="Language (e.g. eng)" value="eng" style="padding:8px 12px; background:var(--surface2); border:1px solid var(--border); border-radius:var(--radius); color:var(--text1);" />' +
+        '<input id="yt-max-videos" type="number" placeholder="Max Videos (Optional)" style="padding:8px 12px; background:var(--surface2); border:1px solid var(--border); border-radius:var(--radius); color:var(--text1);" />' +
+      '</div>' +
+      '<label style="display:flex; align-items:center; gap:8px; font-size:13px; color:var(--text1); cursor:pointer;">' +
+        '<input type="checkbox" id="yt-lowqual"> Aggressive Compression (--lower-quality)' +
+      '</label>' +
+      '<input id="yt-custom-args" type="text" placeholder="Extra Flags (e.g. --video-format=240p)" style="padding:8px 12px; background:var(--surface2); border:1px solid var(--border); border-radius:var(--radius); color:var(--text1);" />' +
+      '<div style="display:flex; gap:8px; margin-top:6px;">' +
+        '<button class="manage-btn-action" onclick="submitYoutube2zim(false)">Run Now</button>' +
+        '<button class="ms-btn" onclick="submitYoutube2zim(true)">Schedule Task…</button>' +
+      '</div>' +
+    '</div>';
+    h += '</div>';
+
+    // Scheduled Tasks List
+    h += '<div class="manage-card">';
+    h += '<h2>Scheduled Recurring Tasks</h2>';
+    if (schedules.length === 0) {
+      h += '<div style="font-size:13px; color:var(--text2); margin-top:6px;">No recurring jobs configured.</div>';
+    } else {
+      for (const s of schedules) {
+        const lastRun = s.last_run ? new Date(s.last_run * 1000).toLocaleString() : 'Never';
+        h += '<div class="mc-row" style="align-items:center; justify-content:space-between;">' +
+          '<div>' +
+            '<strong>' + esc(s.label) + '</strong> ' +
+            '<span class="ms-role-badge" style="margin-left:6px;">' + esc(s.frequency) + '</span>' +
+            '<div style="font-size:11px; color:var(--text2); margin-top:2px;">Last run: ' + esc(lastRun) + '</div>' +
+          '</div>' +
+          '<button class="coll-del" onclick="deleteScraperSchedule(\'' + escAttr(s.id) + '\')" title="Delete Schedule">×</button>' +
+        '</div>';
+      }
+    }
+    h += '</div>';
+
+    // Log Output Modal / Viewer
+    h += '<div id="scraper-log-modal" style="display:none; margin-top:16px; background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); padding:14px;">' +
+      '<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">' +
+        '<strong id="scraper-log-title">Live Log</strong>' +
+        '<button class="ms-btn" onclick="closeScraperLogs()">Close</button>' +
+      '</div>' +
+      '<pre id="scraper-log-box" style="background:#111; color:#0f0; font-family:monospace; font-size:12px; padding:12px; border-radius:4px; max-height:300px; overflow-y:auto; white-space:pre-wrap;"></pre>' +
+    '</div>';
+
+    el.innerHTML = h;
+  } catch(e) {
+    el.innerHTML = '<div class="empty"><p>Could not load scraper control plane.</p></div>';
+  }
+}
+
+async function submitMwoffliner(isSchedule) {
+  const params = {
+    mw_url: (document.getElementById('mw-url').value || '').trim(),
+    admin_email: (document.getElementById('mw-email').value || '').trim(),
+    format: document.getElementById('mw-format').value,
+    article_list: (document.getElementById('mw-article-list').value || '').trim(),
+    custom_args: (document.getElementById('mw-custom-args').value || '').trim()
+  };
+
+  if (!params.mw_url) {
+    alert("MediaWiki URL is required.");
+    return;
+  }
+
+  const label = "MW: " + params.mw_url;
+  if (isSchedule) {
+    const freq = prompt("Enter recurrence frequency: hourly, daily, weekly, or monthly", "weekly");
+    if (!freq) return;
+    await manageFetch('/manage/scrapers/schedule', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ job: { type: 'mwoffliner', label, frequency: freq, params } })
+    });
+    renderScrapersTab();
+  } else {
+    const res = await manageFetch('/manage/scrapers/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type: 'mwoffliner', params, label })
+    });
+    const d = await res.json();
+    if (d.run) {
+      renderScrapersTab();
+      openScraperLogs(d.run.run_id);
+    } else {
+      alert(d.error || "Failed to start scraper.");
+    }
+  }
+}
+
+async function submitYoutube2zim(isSchedule) {
+  const params = {
+    target_type: document.getElementById('yt-type').value,
+    target_url: (document.getElementById('yt-url').value || '').trim(),
+    format: document.getElementById('yt-format').value,
+    language: (document.getElementById('yt-lang').value || 'eng').trim(),
+    max_videos: document.getElementById('yt-max-videos').value || null,
+    lower_quality: document.getElementById('yt-lowqual').checked,
+    custom_args: (document.getElementById('yt-custom-args').value || '').trim()
+  };
+
+  if (!params.target_url) {
+    alert("YouTube URL or ID is required.");
+    return;
+  }
+
+  const label = "YT (" + params.target_type + "): " + params.target_url;
+  if (isSchedule) {
+    const freq = prompt("Enter recurrence frequency: hourly, daily, weekly, or monthly", "weekly");
+    if (!freq) return;
+    await manageFetch('/manage/scrapers/schedule', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ job: { type: 'youtube2zim', label, frequency: freq, params } })
+    });
+    renderScrapersTab();
+  } else {
+    const res = await manageFetch('/manage/scrapers/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type: 'youtube2zim', params, label })
+    });
+    const d = await res.json();
+    if (d.run) {
+      renderScrapersTab();
+      openScraperLogs(d.run.run_id);
+    } else {
+      alert(d.error || "Failed to start scraper.");
+    }
+  }
+}
+
+async function cancelScraperRun(runId) {
+  await manageFetch('/manage/scrapers/cancel', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ run_id: runId })
+  });
+  renderScrapersTab();
+}
+
+async function deleteScraperSchedule(id) {
+  if (!confirm("Remove this scheduled job?")) return;
+  await manageFetch('/manage/scrapers/delete-schedule', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ id })
+  });
+  renderScrapersTab();
+}
+
+function openScraperLogs(runId) {
+  _activeScraperLogId = runId;
+  const modal = document.getElementById('scraper-log-modal');
+  if (modal) modal.style.display = 'block';
+  _pollScraperLogs();
+}
+
+function closeScraperLogs() {
+  _activeScraperLogId = null;
+  clearTimeout(_scraperLogTimer);
+  const modal = document.getElementById('scraper-log-modal');
+  if (modal) modal.style.display = 'none';
+}
+
+async function _pollScraperLogs() {
+  if (!_activeScraperLogId) return;
+  try {
+    const res = await manageFetch('/manage/scrapers/logs?run_id=' + encodeURIComponent(_activeScraperLogId));
+    if (res.ok) {
+      const data = await res.json();
+      const box = document.getElementById('scraper-log-box');
+      if (box && data.logs) {
+        box.textContent = data.logs.join('\n');
+        box.scrollTop = box.scrollHeight;
+      }
+      if (data.run && data.run.status === 'running') {
+        _scraperLogTimer = setTimeout(_pollScraperLogs, 2000);
+      }
+    }
+  } catch(e) {}
+}
 
 init();

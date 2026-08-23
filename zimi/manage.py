@@ -11,6 +11,7 @@ import os
 import re
 import threading
 import time
+from zimi import scrapers as _scrapers
 
 import zimi.server as _srv
 
@@ -1569,6 +1570,18 @@ def handle_manage_get(handler, parsed, params):
             },
         )
 
+    elif parsed.path == "/manage/scrapers/status":
+        return handler._json(200, _scrapers.get_status_summary())
+
+    elif parsed.path == "/manage/scrapers/logs":
+        run_id = param("run_id", "")
+        if not run_id:
+            return handler._json(400, {"error": "missing ?run_id= parameter"})
+        logs, info = _scrapers.get_logs(run_id)
+        if logs is None:
+            return handler._json(404, {"error": "run_id not found"})
+        return handler._json(200, {"run": info, "logs": logs})
+
     else:
         return handler._json(404, {"error": "not found"})
 
@@ -2588,6 +2601,60 @@ def handle_manage_post(handler, parsed, data):
         if err:
             return handler._json(400, {"error": err})
         return handler._json(200, {"status": "preview", "preview": preview})
+
+    elif parsed.path == "/manage/scrapers/run":
+        scraper_type = data.get("type", "")
+        params = data.get("params", {})
+        label = data.get("label", "")
+        if not scraper_type or not isinstance(params, dict):
+            return handler._json(400, {"error": "type and params object required"})
+        
+        run_info, err = _scrapers.run_scraper(scraper_type, params, label=label)
+        if err:
+            return handler._json(400, {"error": err})
+        return handler._json(200, {"status": "started", "run": run_info})
+
+    elif parsed.path == "/manage/scrapers/cancel":
+        run_id = data.get("run_id", "")
+        if not run_id:
+            return handler._json(400, {"error": "missing 'run_id'"})
+        ok, err = _scrapers.cancel_run(run_id)
+        if not ok:
+            return handler._json(400, {"error": err})
+        return handler._json(200, {"status": "cancelled", "run_id": run_id})
+
+    elif parsed.path == "/manage/scrapers/schedule":
+        job = data.get("job", {})
+        if not isinstance(job, dict) or not job.get("type") or not job.get("params"):
+            return handler._json(400, {"error": "invalid job definition"})
+        
+        import uuid
+        jobs = _scrapers.load_schedules()
+        job_id = job.get("id") or str(uuid.uuid4())[:8]
+        job["id"] = job_id
+        job.setdefault("label", f"{job['type']} scheduled job")
+        job.setdefault("frequency", "weekly")
+        job.setdefault("enabled", True)
+        job.setdefault("last_run", 0)
+
+        # Update existing or append
+        existing = [j for j in jobs if j.get("id") == job_id]
+        if existing:
+            jobs = [job if j.get("id") == job_id else j for j in jobs]
+        else:
+            jobs.append(job)
+
+        _scrapers.save_schedules(jobs)
+        return handler._json(200, {"status": "saved", "job": job})
+
+    elif parsed.path == "/manage/scrapers/delete-schedule":
+        job_id = data.get("id", "")
+        if not job_id:
+            return handler._json(400, {"error": "missing 'id'"})
+        jobs = _scrapers.load_schedules()
+        filtered = [j for j in jobs if j.get("id") != job_id]
+        _scrapers.save_schedules(filtered)
+        return handler._json(200, {"status": "deleted", "id": job_id})
 
     else:
         return handler._json(404, {"error": "not found"})
