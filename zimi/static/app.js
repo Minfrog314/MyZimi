@@ -16160,15 +16160,27 @@ async function renderScrapersTab() {
     h += '</div>';
 
     // Log Output Modal / Viewer
-    h += '<div id="scraper-log-modal" style="display:none; margin-top:16px; background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); padding:14px;">' +
+    const isLogOpen = _activeScraperLogId !== null;
+    const oldBox = document.getElementById('scraper-log-box');
+    const oldTitle = document.getElementById('scraper-log-title');
+    const currentLogs = (isLogOpen && oldBox) ? oldBox.textContent : '';
+    const currentTitleText = (isLogOpen && oldTitle) ? oldTitle.textContent : 'Live Log';
+
+    h += '<div id="scraper-log-modal" style="display:' + (isLogOpen ? 'block' : 'none') + '; margin-top:16px; background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); padding:14px;">' +
       '<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">' +
-        '<strong id="scraper-log-title">Live Log</strong>' +
+        '<strong id="scraper-log-title">' + esc(currentTitleText) + '</strong>' +
         '<button class="ms-btn" onclick="closeScraperLogs()">Close</button>' +
       '</div>' +
-      '<pre id="scraper-log-box" style="background:#111; color:#0f0; font-family:monospace; font-size:12px; padding:12px; border-radius:4px; max-height:300px; overflow-y:auto; white-space:pre-wrap;"></pre>' +
+      '<pre id="scraper-log-box" style="background:#111; color:#0f0; font-family:monospace; font-size:12px; padding:12px; border-radius:4px; max-height:300px; overflow-y:auto; white-space:pre-wrap;">' + esc(currentLogs) + '</pre>' +
     '</div>';
 
     el.innerHTML = h;
+    
+    // Preserve auto-scroll if the modal was open during the refresh
+    if (isLogOpen) {
+      const newBox = document.getElementById('scraper-log-box');
+      if (newBox) newBox.scrollTop = newBox.scrollHeight;
+    }
   } catch(e) {
     el.innerHTML = '<div class="empty"><p>Could not load scraper control plane.</p></div>';
   }
