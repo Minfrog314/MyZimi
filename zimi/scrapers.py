@@ -8,7 +8,7 @@ Manages background execution and recurring schedules for OpenZIM offliners:
   - devdocs2zim (Developer Documentation)
   - ifixit2zim (iFixit Repair Guides)
   - wikihow2zim (WikiHow)
-  - freecodecamp2zim (FreeCodeCamp)
+  - fcc2zim (FreeCodeCamp)
   - wget2zim (Custom static site archiver via wget + warc2zim)
 """
 
@@ -65,7 +65,7 @@ def get_available_tools():
         "devdocs2zim": shutil.which("devdocs2zim") is not None,
         "ifixit2zim": shutil.which("ifixit2zim") is not None,
         "wikihow2zim": shutil.which("wikihow2zim") is not None,
-        "freecodecamp2zim": shutil.which("freecodecamp2zim") is not None,
+        "fcc2zim": shutil.which("fcc2zim") is not None,
         "wget": shutil.which("wget") is not None,
         "warc2zim": shutil.which("warc2zim") is not None,
     }
@@ -74,6 +74,9 @@ def build_command(scraper_type, params, run_id):
     """Build command argument list based on user parameters."""
     output_dir = _srv.ZIM_DIR
     os.makedirs(output_dir, exist_ok=True)
+    
+    custom_args_str = params.get("custom_args", "").strip()
+    custom_args = shlex.split(custom_args_str) if custom_args_str else []
 
     if scraper_type == "youtube2zim":
         target_id = params.get("target_id", "").strip()
@@ -83,34 +86,68 @@ def build_command(scraper_type, params, run_id):
         cmd = ["youtube2zim", "--id", target_id, "--api-key", api_key, "--name", name, "--output", output_dir]
 
         fmt = params.get("format", "webm")
-        if fmt:
-            cmd.extend(["--format", fmt])
+        if fmt: cmd.extend(["--format", fmt])
 
-        if params.get("lower_quality"):
-            cmd.append("--low-quality")
+        if params.get("lower_quality"): cmd.append("--low-quality")
 
         lang = params.get("language", "").strip()
-        if lang:
-            cmd.extend(["--language", lang])
+        if lang: cmd.extend(["--language", lang])
 
         max_videos = params.get("max_videos")
-        if max_videos:
-            cmd.extend(["--max-videos", str(max_videos)])
+        if max_videos: cmd.extend(["--max-videos", str(max_videos)])
 
+        cmd.extend(custom_args)
         return cmd, False
 
     elif scraper_type == "sotoki":
         domain = params.get("domain", "").strip()
         cmd = ["sotoki", "--domain", domain, "--output", output_dir]
+        cmd.extend(custom_args)
         return cmd, False
 
-    elif scraper_type in ["gutenberg2zim", "ted2zim", "ifixit2zim", "wikihow2zim", "freecodecamp2zim"]:
+    elif scraper_type == "ted2zim":
         lang = params.get("lang", "en").strip()
-        cmd = [scraper_type, "--language" if scraper_type in ["ifixit2zim", "wikihow2zim", "freecodecamp2zim"] else "--lang", lang, "--output", output_dir]
-        return cmd, False
+        cmd = ["ted2zim", "--lang", lang, "--output", output_dir]
         
+        topics = params.get("topics", "").strip()
+        if topics: cmd.extend(["--topics", topics])
+        
+        fmt = params.get("format", "webm")
+        if fmt: cmd.extend(["--format", fmt])
+        
+        if params.get("lower_quality"): cmd.append("--low-quality")
+        
+        cmd.extend(custom_args)
+        return cmd, False
+
     elif scraper_type == "devdocs2zim":
         cmd = ["devdocs2zim", "--output", output_dir]
+        mode = params.get("mode", "all")
+        if mode == "slug":
+            slugs = params.get("slugs", "").strip()
+            if slugs: cmd.extend(["--slug", slugs])
+        elif mode == "first":
+            first = params.get("first", "").strip()
+            if first: cmd.extend(["--first", str(first)])
+        else:
+            cmd.append("--all")
+            
+        cmd.extend(custom_args)
+        return cmd, False
+        
+    elif scraper_type == "fcc2zim":
+        lang = params.get("lang", "english").strip()
+        cmd = ["fcc2zim", "--language", lang, "--output", output_dir]
+        course = params.get("course", "").strip()
+        if course: cmd.extend(["--course", course])
+        cmd.extend(custom_args)
+        return cmd, False
+
+    elif scraper_type in ["gutenberg2zim", "ifixit2zim", "wikihow2zim"]:
+        lang = params.get("lang", "en").strip()
+        lang_arg = "--language" if scraper_type in ["ifixit2zim", "wikihow2zim"] else "--lang"
+        cmd = [scraper_type, lang_arg, lang, "--output", output_dir]
+        cmd.extend(custom_args)
         return cmd, False
 
     elif scraper_type == "wget2zim":
@@ -118,11 +155,13 @@ def build_command(scraper_type, params, run_id):
         name = params.get("name", "").strip()
         warc_prefix = f"/tmp/warc_{run_id}"
         
-        # wget natively captures WARC, warc2zim packs it, rm cleans up
+        # Safely requote custom args for execution inside the bash chain
+        bash_custom = " " + shlex.join(custom_args) if custom_args else ""
+        
         bash_cmd = (
             f"wget --no-verbose --mirror --page-requisites --adjust-extension "
             f"--no-parent --warc-file={warc_prefix} {shlex.quote(url)} && "
-            f"warc2zim {warc_prefix}.warc.gz --output {output_dir} --name {shlex.quote(name)} && "
+            f"warc2zim {warc_prefix}.warc.gz --output {output_dir} --name {shlex.quote(name)}{bash_custom} && "
             f"rm -f {warc_prefix}.warc.gz"
         )
         return bash_cmd, True

@@ -15998,6 +15998,7 @@ async function renderScrapersTab() {
       '<label style="display:flex; align-items:center; gap:8px; font-size:13px; color:var(--text1); cursor:pointer;">' +
         '<input type="checkbox" id="yt-lowqual"> Aggressive Compression (--low-quality)' +
       '</label>' +
+      '<input id="yt-custom-args" type="text" placeholder="Extra Flags" style="padding:8px 12px; background:var(--surface2); border:1px solid var(--border); border-radius:var(--radius); color:var(--text1);" />' +
       '<div style="display:flex; gap:8px; margin-top:6px;">' +
         '<button class="manage-btn-action" onclick="submitYoutube2zim(false)">Run Now</button>' +
         '<button class="ms-btn" onclick="submitYoutube2zim(true)">Schedule Task…</button>' +
@@ -16008,8 +16009,11 @@ async function renderScrapersTab() {
     h += '<div class="manage-card">';
     h += '<h2>Static Site Archiver (wget + warc2zim)</h2>';
     h += '<div style="display:flex; flex-direction:column; gap:8px; margin-top:8px;">' +
-      '<input id="wget-url" type="url" placeholder="Target URL (e.g. https://example.com)" style="padding:8px 12px; background:var(--surface2); border:1px solid var(--border); border-radius:var(--radius); color:var(--text1);" />' +
-      '<input id="wget-name" type="text" placeholder="ZIM File Name (e.g. example_site)" style="padding:8px 12px; background:var(--surface2); border:1px solid var(--border); border-radius:var(--radius); color:var(--text1);" />' +
+      '<div style="display:grid; grid-template-columns: 1fr 1fr; gap:8px;">' +
+        '<input id="wget-url" type="url" placeholder="Target URL (e.g. https://example.com)" style="padding:8px 12px; background:var(--surface2); border:1px solid var(--border); border-radius:var(--radius); color:var(--text1);" />' +
+        '<input id="wget-name" type="text" placeholder="ZIM File Name (e.g. example_site)" style="padding:8px 12px; background:var(--surface2); border:1px solid var(--border); border-radius:var(--radius); color:var(--text1);" />' +
+      '</div>' +
+      '<input id="wget-args" type="text" placeholder="Extra warc2zim Flags (e.g. --title=\"My Site\" --language=en)" style="padding:8px 12px; background:var(--surface2); border:1px solid var(--border); border-radius:var(--radius); color:var(--text1);" />' +
       '<div style="display:flex; gap:8px; margin-top:6px;">' +
         '<button class="manage-btn-action" onclick="submitWget(false)">Run Now</button>' +
         '<button class="ms-btn" onclick="submitWget(true)">Schedule Task…</button>' +
@@ -16021,6 +16025,7 @@ async function renderScrapersTab() {
     h += '<h2>Stack Exchange (sotoki)</h2>';
     h += '<div style="display:flex; flex-direction:column; gap:8px; margin-top:8px;">' +
       '<input id="sotoki-domain" type="text" placeholder="Domain (e.g. arduino.stackexchange.com)" style="padding:8px 12px; background:var(--surface2); border:1px solid var(--border); border-radius:var(--radius); color:var(--text1);" />' +
+      '<input id="sotoki-args" type="text" placeholder="Extra Flags (e.g. --no-image)" style="padding:8px 12px; background:var(--surface2); border:1px solid var(--border); border-radius:var(--radius); color:var(--text1);" />' +
       '<div style="display:flex; gap:8px; margin-top:6px;">' +
         '<button class="manage-btn-action" onclick="submitSotoki(false)">Run Now</button>' +
         '<button class="ms-btn" onclick="submitSotoki(true)">Schedule Task…</button>' +
@@ -16032,9 +16037,10 @@ async function renderScrapersTab() {
     h += '<h2>Project Gutenberg (gutenberg2zim)</h2>';
     h += '<div style="display:flex; flex-direction:column; gap:8px; margin-top:8px;">' +
       '<input id="guten-lang" type="text" placeholder="Language (e.g. en)" value="en" style="padding:8px 12px; background:var(--surface2); border:1px solid var(--border); border-radius:var(--radius); color:var(--text1);" />' +
+      '<input id="guten-args" type="text" placeholder="Extra Flags" style="padding:8px 12px; background:var(--surface2); border:1px solid var(--border); border-radius:var(--radius); color:var(--text1);" />' +
       '<div style="display:flex; gap:8px; margin-top:6px;">' +
-        '<button class="manage-btn-action" onclick="submitLangScraper(\'gutenberg2zim\', \'guten-lang\', \'Gutenberg\', false)">Run Now</button>' +
-        '<button class="ms-btn" onclick="submitLangScraper(\'gutenberg2zim\', \'guten-lang\', \'Gutenberg\', true)">Schedule Task…</button>' +
+        '<button class="manage-btn-action" onclick="submitLangScraper(\'gutenberg2zim\', \'guten-lang\', \'guten-args\', \'Gutenberg\', false)">Run Now</button>' +
+        '<button class="ms-btn" onclick="submitLangScraper(\'gutenberg2zim\', \'guten-lang\', \'guten-args\', \'Gutenberg\', true)">Schedule Task…</button>' +
       '</div>' +
     '</div></div>';
     
@@ -16042,10 +16048,21 @@ async function renderScrapersTab() {
     h += '<div class="manage-card">';
     h += '<h2>TED Talks (ted2zim)</h2>';
     h += '<div style="display:flex; flex-direction:column; gap:8px; margin-top:8px;">' +
-      '<input id="ted-lang" type="text" placeholder="Language (e.g. en)" value="en" style="padding:8px 12px; background:var(--surface2); border:1px solid var(--border); border-radius:var(--radius); color:var(--text1);" />' +
+      '<div style="display:grid; grid-template-columns: 1fr 1fr; gap:8px;">' +
+        '<input id="ted-lang" type="text" placeholder="Language (e.g. en)" value="en" style="padding:8px 12px; background:var(--surface2); border:1px solid var(--border); border-radius:var(--radius); color:var(--text1);" />' +
+        '<select id="ted-format" style="padding:8px 12px; background:var(--surface2); border:1px solid var(--border); border-radius:var(--radius); color:var(--text1);">' +
+          '<option value="webm">WebM Format</option>' +
+          '<option value="mp4">MP4 Format</option>' +
+        '</select>' +
+      '</div>' +
+      '<input id="ted-topics" type="text" placeholder="Topics (comma separated, e.g. design,technology)" style="padding:8px 12px; background:var(--surface2); border:1px solid var(--border); border-radius:var(--radius); color:var(--text1);" />' +
+      '<label style="display:flex; align-items:center; gap:8px; font-size:13px; color:var(--text1); cursor:pointer;">' +
+        '<input type="checkbox" id="ted-lowqual"> Aggressive Compression (--low-quality)' +
+      '</label>' +
+      '<input id="ted-args" type="text" placeholder="Extra Flags (e.g. --subtitles=all)" style="padding:8px 12px; background:var(--surface2); border:1px solid var(--border); border-radius:var(--radius); color:var(--text1);" />' +
       '<div style="display:flex; gap:8px; margin-top:6px;">' +
-        '<button class="manage-btn-action" onclick="submitLangScraper(\'ted2zim\', \'ted-lang\', \'TED\', false)">Run Now</button>' +
-        '<button class="ms-btn" onclick="submitLangScraper(\'ted2zim\', \'ted-lang\', \'TED\', true)">Schedule Task…</button>' +
+        '<button class="manage-btn-action" onclick="submitTed(false)">Run Now</button>' +
+        '<button class="ms-btn" onclick="submitTed(true)">Schedule Task…</button>' +
       '</div>' +
     '</div></div>';
 
@@ -16054,9 +16071,10 @@ async function renderScrapersTab() {
     h += '<h2>WikiHow (wikihow2zim)</h2>';
     h += '<div style="display:flex; flex-direction:column; gap:8px; margin-top:8px;">' +
       '<input id="wikihow-lang" type="text" placeholder="Language (e.g. en)" value="en" style="padding:8px 12px; background:var(--surface2); border:1px solid var(--border); border-radius:var(--radius); color:var(--text1);" />' +
+      '<input id="wikihow-args" type="text" placeholder="Extra Flags (e.g. --nopic)" style="padding:8px 12px; background:var(--surface2); border:1px solid var(--border); border-radius:var(--radius); color:var(--text1);" />' +
       '<div style="display:flex; gap:8px; margin-top:6px;">' +
-        '<button class="manage-btn-action" onclick="submitLangScraper(\'wikihow2zim\', \'wikihow-lang\', \'WikiHow\', false)">Run Now</button>' +
-        '<button class="ms-btn" onclick="submitLangScraper(\'wikihow2zim\', \'wikihow-lang\', \'WikiHow\', true)">Schedule Task…</button>' +
+        '<button class="manage-btn-action" onclick="submitLangScraper(\'wikihow2zim\', \'wikihow-lang\', \'wikihow-args\', \'WikiHow\', false)">Run Now</button>' +
+        '<button class="ms-btn" onclick="submitLangScraper(\'wikihow2zim\', \'wikihow-lang\', \'wikihow-args\', \'WikiHow\', true)">Schedule Task…</button>' +
       '</div>' +
     '</div></div>';
 
@@ -16065,20 +16083,23 @@ async function renderScrapersTab() {
     h += '<h2>iFixit (ifixit2zim)</h2>';
     h += '<div style="display:flex; flex-direction:column; gap:8px; margin-top:8px;">' +
       '<input id="ifixit-lang" type="text" placeholder="Language (e.g. en)" value="en" style="padding:8px 12px; background:var(--surface2); border:1px solid var(--border); border-radius:var(--radius); color:var(--text1);" />' +
+      '<input id="ifixit-args" type="text" placeholder="Extra Flags (e.g. --nopic)" style="padding:8px 12px; background:var(--surface2); border:1px solid var(--border); border-radius:var(--radius); color:var(--text1);" />' +
       '<div style="display:flex; gap:8px; margin-top:6px;">' +
-        '<button class="manage-btn-action" onclick="submitLangScraper(\'ifixit2zim\', \'ifixit-lang\', \'iFixit\', false)">Run Now</button>' +
-        '<button class="ms-btn" onclick="submitLangScraper(\'ifixit2zim\', \'ifixit-lang\', \'iFixit\', true)">Schedule Task…</button>' +
+        '<button class="manage-btn-action" onclick="submitLangScraper(\'ifixit2zim\', \'ifixit-lang\', \'ifixit-args\', \'iFixit\', false)">Run Now</button>' +
+        '<button class="ms-btn" onclick="submitLangScraper(\'ifixit2zim\', \'ifixit-lang\', \'ifixit-args\', \'iFixit\', true)">Schedule Task…</button>' +
       '</div>' +
     '</div></div>';
 
-    // FreeCodeCamp (freecodecamp2zim)
+    // FreeCodeCamp (fcc2zim)
     h += '<div class="manage-card">';
-    h += '<h2>FreeCodeCamp (freecodecamp2zim)</h2>';
+    h += '<h2>FreeCodeCamp (fcc2zim)</h2>';
     h += '<div style="display:flex; flex-direction:column; gap:8px; margin-top:8px;">' +
       '<input id="fcc-lang" type="text" placeholder="Language (e.g. english)" value="english" style="padding:8px 12px; background:var(--surface2); border:1px solid var(--border); border-radius:var(--radius); color:var(--text1);" />' +
+      '<input id="fcc-course" type="text" placeholder="Courses (comma separated, e.g. basic-javascript)" style="padding:8px 12px; background:var(--surface2); border:1px solid var(--border); border-radius:var(--radius); color:var(--text1);" />' +
+      '<input id="fcc-args" type="text" placeholder="Extra Flags" style="padding:8px 12px; background:var(--surface2); border:1px solid var(--border); border-radius:var(--radius); color:var(--text1);" />' +
       '<div style="display:flex; gap:8px; margin-top:6px;">' +
-        '<button class="manage-btn-action" onclick="submitLangScraper(\'freecodecamp2zim\', \'fcc-lang\', \'FreeCodeCamp\', false)">Run Now</button>' +
-        '<button class="ms-btn" onclick="submitLangScraper(\'freecodecamp2zim\', \'fcc-lang\', \'FreeCodeCamp\', true)">Schedule Task…</button>' +
+        '<button class="manage-btn-action" onclick="submitFcc(false)">Run Now</button>' +
+        '<button class="ms-btn" onclick="submitFcc(true)">Schedule Task…</button>' +
       '</div>' +
     '</div></div>';
 
@@ -16086,6 +16107,15 @@ async function renderScrapersTab() {
     h += '<div class="manage-card">';
     h += '<h2>Developer Documentation (devdocs2zim)</h2>';
     h += '<div style="display:flex; flex-direction:column; gap:8px; margin-top:8px;">' +
+      '<div style="display:grid; grid-template-columns: 140px 1fr; gap:8px;">' +
+        '<select id="devdocs-mode" style="padding:8px 12px; background:var(--surface2); border:1px solid var(--border); border-radius:var(--radius); color:var(--text1);" onchange="document.getElementById(\'devdocs-param-wrap\').style.display = this.value === \'all\' ? \'none\' : \'block\'; document.getElementById(\'devdocs-param\').placeholder = this.value === \'slug\' ? \'Slugs (e.g. python,javascript)\' : \'Count (e.g. 5)\';">' +
+          '<option value="all">All Docs</option>' +
+          '<option value="slug">Specific Slugs</option>' +
+          '<option value="first">Top N Docs</option>' +
+        '</select>' +
+        '<div id="devdocs-param-wrap" style="display:none;"><input id="devdocs-param" type="text" placeholder="Slugs (e.g. python,javascript)" style="width:100%; padding:8px 12px; background:var(--surface2); border:1px solid var(--border); border-radius:var(--radius); color:var(--text1);" /></div>' +
+      '</div>' +
+      '<input id="devdocs-args" type="text" placeholder="Extra Flags" style="padding:8px 12px; background:var(--surface2); border:1px solid var(--border); border-radius:var(--radius); color:var(--text1);" />' +
       '<div style="display:flex; gap:8px; margin-top:6px;">' +
         '<button class="manage-btn-action" onclick="submitDevdocs(false)">Run Now</button>' +
         '<button class="ms-btn" onclick="submitDevdocs(true)">Schedule Task…</button>' +
@@ -16172,7 +16202,8 @@ async function submitYoutube2zim(isSchedule) {
     format: document.getElementById('yt-format').value,
     language: (document.getElementById('yt-lang').value || 'eng').trim(),
     max_videos: document.getElementById('yt-max-videos').value || null,
-    lower_quality: document.getElementById('yt-lowqual').checked
+    lower_quality: document.getElementById('yt-lowqual').checked,
+    custom_args: (document.getElementById('yt-custom-args').value || '').trim()
   };
 
   if (!params.target_id || !params.api_key || !params.name) {
@@ -16184,24 +16215,53 @@ async function submitYoutube2zim(isSchedule) {
 
 function submitSotoki(isSchedule) {
   const domain = (document.getElementById('sotoki-domain').value || '').trim();
+  const custom_args = (document.getElementById('sotoki-args').value || '').trim();
   if (!domain) { alert("Domain is required."); return; }
-  _submitJob('sotoki', { domain }, "Sotoki: " + domain, isSchedule);
+  _submitJob('sotoki', { domain, custom_args }, "Sotoki: " + domain, isSchedule);
 }
 
-function submitLangScraper(type, inputId, labelPrefix, isSchedule) {
-  const lang = (document.getElementById(inputId).value || 'en').trim();
-  _submitJob(type, { lang }, labelPrefix + " (" + lang + ")", isSchedule);
+function submitLangScraper(type, langInputId, argsInputId, labelPrefix, isSchedule) {
+  const lang = (document.getElementById(langInputId).value || 'en').trim();
+  const custom_args = (document.getElementById(argsInputId).value || '').trim();
+  _submitJob(type, { lang, custom_args }, labelPrefix + " (" + lang + ")", isSchedule);
+}
+
+function submitTed(isSchedule) {
+  const params = {
+    lang: (document.getElementById('ted-lang').value || 'en').trim(),
+    format: document.getElementById('ted-format').value,
+    topics: (document.getElementById('ted-topics').value || '').trim(),
+    lower_quality: document.getElementById('ted-lowqual').checked,
+    custom_args: (document.getElementById('ted-args').value || '').trim()
+  };
+  _submitJob('ted2zim', params, "TED (" + params.lang + ")", isSchedule);
+}
+
+function submitFcc(isSchedule) {
+  const lang = (document.getElementById('fcc-lang').value || 'english').trim();
+  const course = (document.getElementById('fcc-course').value || '').trim();
+  const custom_args = (document.getElementById('fcc-args').value || '').trim();
+  _submitJob('fcc2zim', { lang, course, custom_args }, "FCC (" + lang + ")", isSchedule);
 }
 
 function submitDevdocs(isSchedule) {
-  _submitJob('devdocs2zim', {}, "DevDocs Archive", isSchedule);
+  const mode = document.getElementById('devdocs-mode').value;
+  const paramVal = (document.getElementById('devdocs-param').value || '').trim();
+  const custom_args = (document.getElementById('devdocs-args').value || '').trim();
+  
+  const params = { mode, custom_args };
+  if (mode === 'slug') params.slugs = paramVal;
+  if (mode === 'first') params.first = paramVal;
+  
+  _submitJob('devdocs2zim', params, "DevDocs Archive", isSchedule);
 }
 
 function submitWget(isSchedule) {
   const url = (document.getElementById('wget-url').value || '').trim();
   const name = (document.getElementById('wget-name').value || '').trim();
+  const custom_args = (document.getElementById('wget-args').value || '').trim();
   if (!url || !name) { alert("URL and ZIM Name are required."); return; }
-  _submitJob('wget2zim', { url, name }, "Wget: " + name, isSchedule);
+  _submitJob('wget2zim', { url, name, custom_args }, "Wget: " + name, isSchedule);
 }
 
 async function cancelScraperRun(runId) {
