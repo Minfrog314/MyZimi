@@ -1,6 +1,6 @@
 """Universal Scraper Engine & Scheduler for Zimi.
 
-Manages background execution and recurring schedules for OpenZIM offliners:
+Manages background execution and recurring schedules for OpenZIM offliners wrapped invisibly in Docker:
   - youtube2zim (YouTube channels, playlists, videos)
   - sotoki (Stack Exchange)
   - gutenberg2zim (Project Gutenberg)
@@ -30,7 +30,7 @@ log = logging.getLogger("zimi.scrapers")
 _CONFIG_FILE = "scrapers.json"
 _LOCK = threading.Lock()
 _SCHEDULER_THREAD = None
-_RUNNING_JOBS = {}  # {run_id: {"process": Popen, "info": dict, "logs": deque}}
+_RUNNING_JOBS = {}
 _RECENT_RUNS = collections.deque(maxlen=50)
 
 _INTERVAL_MAP = {
@@ -57,71 +57,87 @@ def save_schedules(jobs):
     _srv._atomic_write_json(_config_path(), jobs, indent=2)
 
 def get_available_tools():
+    has_docker = shutil.which("docker") is not None
     return {
-        "youtube2zim": shutil.which("youtube2zim") is not None,
-        "sotoki": shutil.which("sotoki") is not None,
-        "gutenberg2zim": shutil.which("gutenberg2zim") is not None,
-        "ted2zim": shutil.which("ted2zim") is not None,
-        "devdocs2zim": shutil.which("devdocs2zim") is not None,
-        "ifixit2zim": shutil.which("ifixit2zim") is not None,
-        "wikihow2zim": shutil.which("wikihow2zim") is not None,
-        "fcc2zim": shutil.which("fcc2zim") is not None,
-        "wget": shutil.which("wget") is not None,
-        "warc2zim": shutil.which("warc2zim") is not None,
+        "youtube2zim (Docker)": has_docker,
+        "sotoki (Docker)": has_docker,
+        "gutenberg2zim (Docker)": has_docker,
+        "ted2zim (Docker)": has_docker,
+        "devdocs2zim (Docker)": has_docker,
+        "ifixit2zim (Docker)": has_docker,
+        "wikihow2zim (Docker)": has_docker,
+        "fcc2zim (Docker)": has_docker,
+        "wget (Native)": shutil.which("wget") is not None,
+        "warc2zim (Docker)": has_docker,
     }
 
 def build_command(scraper_type, params, run_id):
-    """Build command argument list based on user parameters."""
+    """Build a docker run command to execute the scraper invisibly."""
     output_dir = _srv.ZIM_DIR
     os.makedirs(output_dir, exist_ok=True)
     
     custom_args_str = params.get("custom_args", "").strip()
     custom_args = shlex.split(custom_args_str) if custom_args_str else []
 
-    if scraper_type == "youtube2zim":
-        target_id = params.get("target_id", "").strip()
-        api_key = params.get("api_key", "").strip()
-        name = params.get("name", "").strip()
-        
-        cmd = ["youtube2zim", "--id", target_id, "--api-key", api_key, "--name", name, "--output", output_dir]
+    # Map scraper tools to their official OpenZIM docker images
+    image_map = {
+        "youtube2zim": "ghcr.io/openzim/youtube",
+        "sotoki": "ghcr.io/openzim/sotoki",
+        "gutenberg2zim": "ghcr.io/openzim/gutenberg",
+        "ted2zim": "ghcr.io/openzim/ted",
+        "devdocs2zim": "ghcr.io/openzim/devdocs",
+        "ifixit2zim": "ghcr.io/openzim/ifixit",
+        "wikihow2zim": "ghcr.io/openzim/wikihow",
+        "fcc2zim": "ghcr.io/openzim/freecodecamp",
+        "warc2zim": "ghcr.io/openzim/warc2zim"
+    }
 
+    if scraper_type == "wget2zim":
+        url = params.get("url", "").strip()
+        name = params.get("name", "").strip()
+        warc_prefix = f"/tmp/warc_{run_id}"
+        
+        # Safely requote custom args for execution inside the bash chain
+        bash_custom = " " + shlex.join(custom_args) if custom_args else ""
+        
+        # Wget runs natively on Debian, warc2zim packs it using Docker
+        bash_cmd = (
+            f"wget --no-verbose --mirror --page-requisites --adjust-extension "
+            f"--no-parent --warc-file={warc_prefix} {shlex.quote(url)} && "
+            f"docker run --rm --entrypoint warc2zim -v {output_dir}:/output -v /tmp:/tmp "
+            f"ghcr.io/openzim/warc2zim {warc_prefix}.warc.gz --output /output --name {shlex.quote(name)}{bash_custom} && "
+            f"rm -f {warc_prefix}.warc.gz"
+        )
+        return bash_cmd, True
+
+    # Base Docker command for all OpenZIM tools
+    image = image_map[scraper_type]
+    cmd = ["docker", "run", "--rm", "--entrypoint", scraper_type, "-v", f"{output_dir}:/output", image]
+
+    # Tool-specific arguments
+    if scraper_type == "youtube2zim":
+        cmd.extend(["--id", params.get("target_id", "").strip(), "--api-key", params.get("api_key", "").strip(), "--name", params.get("name", "").strip(), "--output", "/output"])
         fmt = params.get("format", "webm")
         if fmt: cmd.extend(["--format", fmt])
-
         if params.get("lower_quality"): cmd.append("--low-quality")
-
         lang = params.get("language", "").strip()
         if lang: cmd.extend(["--language", lang])
-
         max_videos = params.get("max_videos")
         if max_videos: cmd.extend(["--max-videos", str(max_videos)])
 
-        cmd.extend(custom_args)
-        return cmd, False
-
     elif scraper_type == "sotoki":
-        domain = params.get("domain", "").strip()
-        cmd = ["sotoki", "--domain", domain, "--output", output_dir]
-        cmd.extend(custom_args)
-        return cmd, False
+        cmd.extend(["--domain", params.get("domain", "").strip(), "--output", "/output"])
 
     elif scraper_type == "ted2zim":
-        lang = params.get("lang", "en").strip()
-        cmd = ["ted2zim", "--lang", lang, "--output", output_dir]
-        
+        cmd.extend(["--lang", params.get("lang", "en").strip(), "--output", "/output"])
         topics = params.get("topics", "").strip()
         if topics: cmd.extend(["--topics", topics])
-        
         fmt = params.get("format", "webm")
         if fmt: cmd.extend(["--format", fmt])
-        
         if params.get("lower_quality"): cmd.append("--low-quality")
-        
-        cmd.extend(custom_args)
-        return cmd, False
 
     elif scraper_type == "devdocs2zim":
-        cmd = ["devdocs2zim", "--output", output_dir]
+        cmd.extend(["--output", "/output"])
         mode = params.get("mode", "all")
         if mode == "slug":
             slugs = params.get("slugs", "").strip()
@@ -131,46 +147,20 @@ def build_command(scraper_type, params, run_id):
             if first: cmd.extend(["--first", str(first)])
         else:
             cmd.append("--all")
-            
-        cmd.extend(custom_args)
-        return cmd, False
-        
+
     elif scraper_type == "fcc2zim":
-        lang = params.get("lang", "english").strip()
-        cmd = ["fcc2zim", "--language", lang, "--output", output_dir]
+        cmd.extend(["--language", params.get("lang", "english").strip(), "--output", "/output"])
         course = params.get("course", "").strip()
         if course: cmd.extend(["--course", course])
-        cmd.extend(custom_args)
-        return cmd, False
 
     elif scraper_type in ["gutenberg2zim", "ifixit2zim", "wikihow2zim"]:
-        lang = params.get("lang", "en").strip()
         lang_arg = "--language" if scraper_type in ["ifixit2zim", "wikihow2zim"] else "--lang"
-        cmd = [scraper_type, lang_arg, lang, "--output", output_dir]
-        cmd.extend(custom_args)
-        return cmd, False
+        cmd.extend([lang_arg, params.get("lang", "en").strip(), "--output", "/output"])
 
-    elif scraper_type == "wget2zim":
-        url = params.get("url", "").strip()
-        name = params.get("name", "").strip()
-        warc_prefix = f"/tmp/warc_{run_id}"
-        
-        # Safely requote custom args for execution inside the bash chain
-        bash_custom = " " + shlex.join(custom_args) if custom_args else ""
-        
-        bash_cmd = (
-            f"wget --no-verbose --mirror --page-requisites --adjust-extension "
-            f"--no-parent --warc-file={warc_prefix} {shlex.quote(url)} && "
-            f"warc2zim {warc_prefix}.warc.gz --output {output_dir} --name {shlex.quote(name)}{bash_custom} && "
-            f"rm -f {warc_prefix}.warc.gz"
-        )
-        return bash_cmd, True
-
-    else:
-        raise ValueError(f"Unknown scraper type: {scraper_type}")
+    cmd.extend(custom_args)
+    return cmd, False
 
 def run_scraper(scraper_type, params, job_id=None, label=None):
-    """Spawn a scraper process in the background and track its logs."""
     run_id = str(uuid.uuid4())[:8]
     try:
         cmd, use_shell = build_command(scraper_type, params, run_id)
@@ -207,8 +197,6 @@ def run_scraper(scraper_type, params, job_id=None, label=None):
             bufsize=1,
             env=env,
         )
-    except FileNotFoundError:
-        return None, "Executable not found in PATH"
     except Exception as e:
         return None, f"Failed to spawn process: {e}"
 
@@ -254,7 +242,6 @@ def run_scraper(scraper_type, params, job_id=None, label=None):
     return run_info, None
 
 def cancel_run(run_id):
-    """Terminate an active scraper subprocess."""
     with _LOCK:
         item = _RUNNING_JOBS.get(run_id)
         if not item:
@@ -267,7 +254,6 @@ def cancel_run(run_id):
             return False, str(e)
 
 def get_logs(run_id):
-    """Retrieve output log lines for an active or completed run."""
     with _LOCK:
         if run_id in _RUNNING_JOBS:
             return list(_RUNNING_JOBS[run_id]["logs"]), _RUNNING_JOBS[run_id]["info"]
@@ -277,7 +263,6 @@ def get_logs(run_id):
     return None, None
 
 def get_status_summary():
-    """Summary of tools, schedules, and active runs for the UI."""
     with _LOCK:
         active = [v["info"] for v in _RUNNING_JOBS.values()]
         recent = list(_RECENT_RUNS)
@@ -289,7 +274,6 @@ def get_status_summary():
     }
 
 def _scheduler_loop():
-    """Background evaluation loop for recurring scrape jobs."""
     log.info("Zimi Scraper Scheduler daemon started")
     while True:
         try:
@@ -319,7 +303,6 @@ def _scheduler_loop():
         time.sleep(60)
 
 def start_scheduler():
-    """Start the background scheduler thread."""
     global _SCHEDULER_THREAD
     if _SCHEDULER_THREAD is None or not _SCHEDULER_THREAD.is_alive():
         _SCHEDULER_THREAD = threading.Thread(target=_scheduler_loop, daemon=True, name="zimi-scraper-scheduler")
